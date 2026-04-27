@@ -7,18 +7,17 @@
 This pipeline processes 250 peer-reviewed veterinary papers (2023–2025) from 5 major journals (JVIM, JAVMA, Vet Surgery, VRU, JFMS). It generates summaries from 3 LLMs, scores them using a **blind LLM-as-a-judge**, and validates the results against human expert scoring (Cohen's Kappa).
 
 ## Project Structure
-├── data/ # PDFs, text, results (gitignored)
+├── data/               # PDFs, text, results (gitignored)
 ├── src/
-│ ├── collect.py # Build paper manifest via CrossRef API
-│ ├── extract.py # PDF → clean text (remove refs, truncate)
-│ ├── summarizer.py # Call GPT, Claude, Gemini (temp=0)
-│ ├── evaluator.py # Blind judge with structured output
-│ ├── pipeline.py # Resilient orchestrator (resume + atomic writes)
-│ ├── human_loop.py # Export 10% blind sample for manual review
-│ ├── stats_engine.py # Cohen's Kappa + covariate analysis
-│ └── utils.py # Budget guard, rate limiter, error logger
-└── tests/ # Golden fixture + pytest suite
-
+│   ├── collect.py      # Build paper manifest via CrossRef API
+│   ├── extract.py      # PDF → clean text (remove refs, truncate)
+│   ├── summarizer.py   # Call GPT, Claude, Gemini (temp=0)
+│   ├── evaluator.py    # Blind judge with structured output
+│   ├── pipeline.py     # Resilient orchestrator (resume + atomic writes)
+│   ├── human_loop.py   # Export 10% blind sample for manual review
+│   ├── stats_engine.py # Cohen's Kappa + covariate analysis
+│   └── utils.py        # Budget guard, rate limiter, error logger
+└── tests/              # Golden fixture + pytest suite
 
 ## Key Features
 - **Budget-safe**: Batch API (50% off), hard stop, dry-run mode  
