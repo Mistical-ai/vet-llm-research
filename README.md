@@ -7,6 +7,7 @@
 This pipeline processes 250 peer-reviewed veterinary papers (2023–2025) from 5 major journals (JVIM, JAVMA, Vet Surgery, VRU, JFMS). It generates summaries from 3 LLMs, scores them using a **blind LLM-as-a-judge**, and validates the results against human expert scoring (Cohen's Kappa).
 
 ## Project Structure
+```text
 ├── data/               # PDFs, text, results (gitignored)
 ├── src/
 │   ├── collect.py      # Build paper manifest via CrossRef API
@@ -18,6 +19,7 @@ This pipeline processes 250 peer-reviewed veterinary papers (2023–2025) from 5
 │   ├── stats_engine.py # Cohen's Kappa + covariate analysis
 │   └── utils.py        # Budget guard, rate limiter, error logger
 └── tests/              # Golden fixture + pytest suite
+```
 
 ## Key Features
 - **Budget-safe**: Batch API (50% off), hard stop, dry-run mode  
