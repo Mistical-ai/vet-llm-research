@@ -9,18 +9,46 @@ summarization using papers from 2023-2025 in major veterinary journals.
 
 Project context: OVC Pet Trust Summer Studentship, 2026.
 
+## Balanced Corpus Design
+
+The pipeline targets **exactly 250 papers — 50 from each of 5 journals**:
+
+| Journal | ISSN | Target |
+|---------|------|--------|
+| Journal of Veterinary Internal Medicine (JVIM) | 1939-1676 | 50 |
+| Journal of the American Veterinary Medical Association (JAVMA) | 0003-1488 | 50 |
+| Veterinary Surgery | 0161-3499 | 50 |
+| Veterinary Radiology & Ultrasound (VRU) | 1058-8183 | 50 |
+| Journal of Feline Medicine and Surgery (JFMS) | 1098-612X | 50 |
+
+Equal-quota sampling is used instead of proportional sampling for two reasons:
+
+1. **Bias prevention**: proportional sampling would over-represent high-OA journals
+   like JVIM and under-represent surgical journals, biasing the LLM's learned
+   writing-style patterns.
+2. **Subgroup analysis power**: 50 papers per journal gives adequate statistical
+   power for per-journal comparisons in Phase 4.
+
+**Date range**: 2023-01-01 to 2025-12-31.  
+**Open-access only**: no paywalled content is ever attempted.  
+**Shortfall handling**: if a journal has fewer than 50 OA papers available,
+the pipeline logs the deficit and generates `data/missing_papers.csv` for
+manual supplementation via `src/supplement.py`.
+
 ## Current Status
 
 The repository currently contains the Phase 2 ingestion and safety pipeline.
 
 Phase 2 can:
 
-- collect paper metadata from CrossRef
+- collect up to 80 DOI candidates per journal from CrossRef (stratified)
 - infer simple covariates such as species, study design, and clinical topic
-- download only legally open-access PDFs
+- download only legally open-access PDFs with per-journal stop-loss at 50 PDFs
+- detect OA shortfalls and generate `data/missing_papers.csv` for manual review
 - extract and clean PDF text
 - remove references before truncating text
 - keep an error log for failed papers
+- merge OA and manually supplemented PDFs into a unified corpus view
 - run in dry-run mode so you can test the pipeline without spending money or
   making live network calls
 
@@ -34,20 +62,24 @@ review, and statistical analysis.
 |-- README.md
 |-- requirements.txt
 |-- .env.template
-|-- data/                    # Created locally; gitignored
-|   |-- manifest.jsonl        # Paper list created by collect.py
-|   |-- raw/                  # Downloaded open-access PDFs
-|   `-- error_log.jsonl       # Pipeline errors
+|-- pipeline.py               # Merges OA + manual PDFs; reports corpus status
+|-- data/                     # Created locally; gitignored
+|   |-- manifest.jsonl         # OA paper list created by collect.py
+|   |-- manual_manifest.jsonl  # Manually added papers (same schema as manifest.jsonl)
+|   |-- raw/                   # All PDFs (OA-downloaded and manually placed)
+|   |-- error_log.jsonl        # Pipeline errors + OA shortfall entries
+|   `-- missing_papers.csv     # Papers needing manual supplementation
 |-- src/
-|   |-- main.py               # Simple startup check
-|   |-- collect.py            # Builds the paper manifest from CrossRef
-|   |-- download.py           # Downloads open-access PDFs
-|   |-- extract.py            # Extracts and cleans PDF text
-|   |-- utils.py              # Budget guard, rate limits, error logging
+|   |-- main.py                # Simple startup check
+|   |-- collect.py             # Stratified CrossRef collection (80 candidates/journal)
+|   |-- download.py            # Balanced OA download (stop-loss at 50 PDFs/journal)
+|   |-- supplement.py          # Manual supplement helper — prints instructions, writes CSV
+|   |-- extract.py             # Extracts and cleans PDF text
+|   |-- utils.py               # Budget guard, rate limits, error logging
 |   `-- utils/
-|       `-- generate_mock.py  # Development helper for mock data
+|       `-- generate_mock.py   # Development helper for mock data
 `-- tests/
-    |-- manual_test_phase2.py # Phase 2 checklist tests
+    |-- manual_test_phase2.py  # Phase 2 checklist tests
     `-- fixtures/
         `-- sample_paper.json
 ```
@@ -168,10 +200,10 @@ If a test fails, read the message in the terminal before continuing.
 
 ### Step 8: Collect The Paper List
 
-This creates `data/manifest.jsonl`.
+This creates `data/manifest.jsonl` with up to 80 OA candidates per journal.
 
-In dry-run mode, it writes fake example papers so you can test the pipeline
-without using the internet.
+In dry-run mode, it writes 2 fake papers per journal (10 total) so you can
+test the pipeline without using the internet.
 
 ```powershell
 python src/collect.py
@@ -180,29 +212,49 @@ python src/collect.py
 Expected result:
 
 ```text
-Collection complete. Manifest contains 8 new entries.
+[collect] DRY_RUN per-journal candidate counts:
+  JVIM                       2 mock candidates  (download target: 50)
+  JAVMA                      2 mock candidates  (download target: 50)
+  Veterinary Surgery         2 mock candidates  (download target: 50)
+  VRU                        2 mock candidates  (download target: 50)
+  JFMS                       2 mock candidates  (download target: 50)
+Collection complete. Manifest contains 10 new entries.
 ```
 
-Important: `collect.py` appends to `data/manifest.jsonl`. If you run it many
-times, it will add the mock papers again. For a fresh start, delete
-`data/manifest.jsonl` before running collection again.
+Important: `collect.py` appends to `data/manifest.jsonl`. For a clean fresh
+run, delete `data/manifest.jsonl` before running collection again.
 
 ### Step 9: Test The Download Step
 
-In dry-run mode, this does not download real PDFs. It only checks that the
-download step can read the manifest and explain what it would do.
+In dry-run mode, this does not download real PDFs. It simulates the balanced
+per-journal scheduling and shows what would happen per journal.
 
 ```powershell
 python src/download.py
 ```
 
-Expected result:
+Expected result (dry-run with 2 mock papers per journal):
 
 ```text
-Download run finished. 8 PDFs acquired, 0 unavailable (OA only).
+[download] DRY_RUN=true — no network calls.
+[download] Simulating balanced download (existing PDFs already counted).
+
+  Journal                   Exist  Would add  Shortfall
+  -------------------------------------------------------
+  JVIM                          0          2          0
+  JAVMA                         0          2          0
+  Veterinary Surgery            0          2          0
+  VRU                           0          2          0
+  JFMS                          0          2          0
+  -------------------------------------------------------
+  TOTAL                         0         10          0
+
+[download] DRY_RUN summary: 10/250 PDFs would be acquired, 0 shortfall.
 ```
 
-In dry-run mode, "acquired" means "would be attempted." No real PDFs are saved.
+In dry-run mode, "would be acquired" means the logic would succeed for those
+DOIs. No real PDFs are saved. The shortfall of 240 (250 - 10) is expected
+because the dry-run manifest only has 2 mock papers per journal.
 
 ### Step 10: Test The Text Extraction Step
 
@@ -261,17 +313,53 @@ This queries CrossRef for papers from the target journals and writes them to
 python src/download.py
 ```
 
-This tries several legal open-access sources:
+This tries several legal open-access sources for each DOI:
 
 1. fulltext-article-downloader, if installed
 2. Unpaywall
 3. Semantic Scholar
 4. PubMed Central
 
-PDFs that are found are saved in `data/raw/`.
+PDFs are saved in `data/raw/`. The download stops at 50 PDFs per journal
+(stop-loss). If a journal falls short, a warning is written to
+`data/error_log.jsonl` and `data/missing_papers.csv` is created.
 
-Papers that are not legally available as open access are skipped and recorded in
-`data/error_log.jsonl`.
+Optional settings in `.env`:
+
+```text
+DOWNLOAD_VERBOSE=false        # suppress per-DOI noise; show summaries only
+MAX_FAILED_PER_JOURNAL=100    # stop a journal after this many OA failures
+```
+
+### Step 4: Check Corpus Status
+
+```powershell
+python pipeline.py
+```
+
+This merges `data/manifest.jsonl` (OA papers) with `data/manual_manifest.jsonl`
+(manually added papers, if any) and prints a per-journal status table.
+
+### Step 5: Handle OA Shortfalls (if needed)
+
+If any journal has fewer than 50 PDFs, run:
+
+```powershell
+python src/supplement.py
+```
+
+This prints per-missing-paper instructions ("Check UoG library" / "Email author")
+and writes `data/missing_papers.csv`. Once you have obtained the PDFs:
+
+1. Place the PDF files in `data/raw/` (using the same filename format as
+   download.py: slashes and dots in the DOI replaced with underscores).
+2. Add entries for each paper to `data/manual_manifest.jsonl` using the same
+   schema as `data/manifest.jsonl`.
+3. Re-run `python pipeline.py` to confirm the updated corpus count.
+
+The pipeline accepts a final corpus of `250 - total_missing` OA papers if at
+least 200 OA PDFs were downloaded. The 200-paper threshold ensures enough data
+for a meaningful Phase 4 analysis even without complete manual supplementation.
 
 ## Useful Commands
 
@@ -295,6 +383,12 @@ python -m pytest tests/manual_test_phase2.py -v
 - The downloader only uses open-access sources. It does not bypass paywalls.
 - Dry-run mode is the safest first step. Use it before every major change.
 - If something fails, check `data/error_log.jsonl`.
+- If a journal has < 50 OA PDFs, `data/error_log.jsonl` will contain entries
+  with `"stage": "insufficient_oa"`. Run `python src/supplement.py` to act on them.
+- `data/manual_manifest.jsonl` must only contain entries whose PDFs are already
+  in `data/raw/`. pipeline.py validates this and will warn about missing PDFs.
+- To avoid duplicate papers: delete `data/manifest.jsonl` before re-running
+  `collect.py` for a fresh corpus build.
 
 ## Troubleshooting
 
@@ -326,3 +420,15 @@ python src/collect.py
 
 If you get duplicate papers in `data/manifest.jsonl`, delete that file and run
 collection again.
+
+If `download.py` reports a shortfall for a journal (fewer than 50 OA PDFs):
+
+```powershell
+python src/supplement.py
+```
+
+This generates `data/missing_papers.csv` and prints acquisition instructions.
+
+If `pipeline.py` warns about manual manifest entries with missing PDFs:
+make sure the PDF file is in `data/raw/` with the correct filename (DOI with
+`/`, `:`, and `.` replaced by `_`, plus `.pdf` extension).
