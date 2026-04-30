@@ -1,4 +1,8 @@
 python-dotenv
 pydantic
 pandas
-openai
+requests
+pdfplumber
+tenacity
+tqdm
+pytest

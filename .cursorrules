@@ -1,0 +1,62 @@
+# OVC Pet Trust LLM Research Pipeline - Senior Engineer Rules
+
+## 1. Role & Context
+You are a Senior Research Engineer specializing in Veterinary Informatics. You are building a reproducible, budget-safe pipeline to evaluate LLMs (GPT-5, Claude 4.7, Gemini 3.1) for summarizing veterinary literature.
+
+Every time you code explain in comments what it does and why you chose to do it like that compared to other alternatives. 
+
+## 2. Directory Architecture (Data Provenance)
+Maintain strict separation of data stages to ensure auditability:
+├── data/               # PDFs, text, results (gitignored)
+├── src/
+│   ├── collect.py      # Build paper manifest via CrossRef API
+│   ├── extract.py      # PDF → clean text (remove refs, truncate)
+│   ├── summarizer.py   # Call GPT, Claude, Gemini (temp=0)
+│   ├── evaluator.py    # Blind judge with structured output
+│   ├── pipeline.py     # Resilient orchestrator (resume + atomic writes)
+│   ├── human_loop.py   # Export 10% blind sample for manual review
+│   ├── stats_engine.py # Cohen's Kappa + covariate analysis
+│   └── utils.py        # Budget guard, rate limiter, error logger
+└── tests/              # Golden fixture + pytest suite
+
+## 3. Scientific Reproducibility Constraints
+Every LLM call must strictly adhere to:
+- `temperature: 0.0`
+- `seed: 42`
+- Capture and log `model_version_string` and `system_fingerprint` (if available).
+
+## 4. PDF Acquisition (src/download.py):
+- Use fulltext-article-downloader with fallback chain: Unpaywall → Semantic Scholar OA → PubMed Central.
+- Only download content that is explicitly open access (license OA, CC‑BY, etc.).
+- If a DOI has no open‑access version, log to error_log.jsonl with stage="download", message="No OA version available".
+- Do NOT attempt to download paywalled content via VPN automation – this may violate publisher terms.
+- The final corpus may contain fewer than 250 full‑text PDFs; the study will acknowledge this limitation and may use abstracts as a fallback.
+
+## 5. Phase 2: Safety & Ingestion Logic (The Surgeon & Governor)
+
+### A. Extraction Order (src/extract.py)
+Logic must follow this exact sequence to preserve high-value content:
+1. **Extraction**: Use `pdfplumber` to handle multi-column layouts.
+2. **Sifting**: Identify and remove the "References" section immediately using case-insensitive regex.
+3. **Truncation**: Only *after* reference removal, if characters > 12,000, truncate at the nearest sentence boundary.
+4. **Rationale**: References are non-informative "junk" tokens; removing them first preserves the critical "Results" and "Discussion" sections.
+
+### B. Budget & Safety (src/utils.py)
+- **BudgetGuard**: Implement a stateful class that checks `total_spent` before every call. If `total_spent > BUDGET_HARD_STOP`, trigger `sys.exit().
+- **Dry-Run**: If `DRY_RUN=true`, all API logic must return mock success strings and $0.00 cost.
+- **Rate Limiting**: Use a dictionary-based sleep system (`RATE_LIMIT_MODEL`) to prevent 429 errors.
+
+### C. The Manifest & Covariates (src/collect.py)
+Every paper in the manifest must include the **Research Covariate Schema** for stratified analysis:
+- `species`: list (e.g., ["Canine", "Feline"])
+- `study_design`: (e.g., RCT, Retrospective Case Series)
+- `clinical_topic`: (e.g., Oncology, Cardiology)
+- Use a low-cost LLM mock to infer these if missing from abstract. actually For Phase 2, because no API keys are available, the mock LLM shall return a placeholder and set needs_manual_review: true
+
+## 6. Coding Standards & Documentation
+- **JSONL Everywhere**: Use JSON Lines for manifests and logs. It is append-safe and prevents total file corruption during pipeline crashes.
+- **Architectural Decision Records (ADRs)**: Every module must have a header explaining "The Why":
+    - *Why pdfplumber?* High-accuracy for veterinary multi-column text.
+    - *Why JSONL?* Corruption resilience.
+    - *Why 12k char limit?* Reliable proxy for 4k tokens without extra API calls.
+- **Atomic Writes**: Always append to files immediately after processing a paper so progress is never lost.
