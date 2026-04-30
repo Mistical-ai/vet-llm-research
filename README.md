@@ -1,44 +1,328 @@
 # Veterinary LLM Research Pipeline
 
-**Evaluating GPT-5.5, Claude Opus 4.7, and Gemini 3.1 Pro on veterinary literature summarization**  
-*OVC Pet Trust Summer Studentship – 2026*
+This project is a research pipeline for collecting veterinary journal papers,
+downloading open-access PDFs, cleaning the text, and preparing the data for
+future LLM summarization and evaluation.
 
-## Quick Summary
-This pipeline processes 250 peer-reviewed veterinary papers (2023–2025) from 5 major journals (JVIM, JAVMA, Vet Surgery, VRU, JFMS). It generates summaries from 3 LLMs, scores them using a **blind LLM-as-a-judge**, and validates the results against human expert scoring (Cohen's Kappa).
+Research goal: evaluate large language models on veterinary literature
+summarization using papers from 2023-2025 in major veterinary journals.
+
+Project context: OVC Pet Trust Summer Studentship, 2026.
+
+## Current Status
+
+The repository currently contains the Phase 2 ingestion and safety pipeline.
+
+Phase 2 can:
+
+- collect paper metadata from CrossRef
+- infer simple covariates such as species, study design, and clinical topic
+- download only legally open-access PDFs
+- extract and clean PDF text
+- remove references before truncating text
+- keep an error log for failed papers
+- run in dry-run mode so you can test the pipeline without spending money or
+  making live network calls
+
+Future phases will add LLM summarization, LLM-as-a-judge evaluation, human
+review, and statistical analysis.
 
 ## Project Structure
+
 ```text
-├── data/               # PDFs, text, results (gitignored)
-├── src/
-│   ├── collect.py      # Build paper manifest via CrossRef API
-│   ├── extract.py      # PDF → clean text (remove refs, truncate)
-│   ├── summarizer.py   # Call GPT, Claude, Gemini (temp=0)
-│   ├── evaluator.py    # Blind judge with structured output
-│   ├── pipeline.py     # Resilient orchestrator (resume + atomic writes)
-│   ├── human_loop.py   # Export 10% blind sample for manual review
-│   ├── stats_engine.py # Cohen's Kappa + covariate analysis
-│   └── utils.py        # Budget guard, rate limiter, error logger
-└── tests/              # Golden fixture + pytest suite
+.
+|-- README.md
+|-- requirements.txt
+|-- .env.template
+|-- data/                    # Created locally; gitignored
+|   |-- manifest.jsonl        # Paper list created by collect.py
+|   |-- raw/                  # Downloaded open-access PDFs
+|   `-- error_log.jsonl       # Pipeline errors
+|-- src/
+|   |-- main.py               # Simple startup check
+|   |-- collect.py            # Builds the paper manifest from CrossRef
+|   |-- download.py           # Downloads open-access PDFs
+|   |-- extract.py            # Extracts and cleans PDF text
+|   |-- utils.py              # Budget guard, rate limits, error logging
+|   `-- utils/
+|       `-- generate_mock.py  # Development helper for mock data
+`-- tests/
+    |-- manual_test_phase2.py # Phase 2 checklist tests
+    `-- fixtures/
+        `-- sample_paper.json
 ```
 
-## Key Features
-- **Budget-safe**: Batch API (50% off), hard stop, dry-run mode  
-- **Reproducible**: Temperature 0.0, seed 42, logs exact model versions  
-- **Scientific**: Blind judge, error ledger, resume after crash  
-- **Human validation**: You grade 25 papers → Cohen's Kappa vs. AI judge  
+## Before You Start
 
-## Summary (CAD)
-| Item | Cost |
-|------|------|
-| APIs (Batch + 2.5× buffer) | ~$220 |
-| Tools (Claude Max, 2 months) | ~$280 |
-| **Total** | **~$500** | Cost
+You need these installed on your computer:
 
-## Quick Start
-```bash
-git clone ...
-cd veterinary-llm-pipeline
-python -m venv venv && source venv/bin/activate
+- Git
+- Python 3.10 or newer
+- A terminal, such as PowerShell on Windows
+- Internet access for live collection and download runs
+
+You do not need paid API keys for the current Phase 2 dry run.
+
+## Quick Start: Run The Pipeline After Cloning
+
+These steps are written for Windows PowerShell. Run each command from the
+terminal, one at a time.
+
+### Step 1: Clone The Project
+
+Cloning means "download a copy of this project onto your computer."
+
+```powershell
+git clone <REPOSITORY_URL>
+```
+
+Replace `<REPOSITORY_URL>` with the real GitHub repository URL.
+
+### Step 2: Go Into The Project Folder
+
+After cloning, move your terminal into the new folder.
+
+```powershell
+cd vet-llm-research
+```
+
+If your cloned folder has a different name, use that folder name instead.
+
+### Step 3: Create A Virtual Environment
+
+A virtual environment is a small, private Python workspace for this project.
+It keeps this project's packages separate from other Python projects.
+
+```powershell
+python -m venv venv
+```
+
+### Step 4: Turn On The Virtual Environment
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+If PowerShell says scripts are blocked, run this once in the same terminal:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+Then try activating again:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+You will know it worked if you see `(venv)` at the start of your terminal line.
+
+### Step 5: Install The Required Packages
+
+Packages are pieces of Python code that this project depends on.
+
+```powershell
 pip install -r requirements.txt
-cp .env.template .env   # add your API keys
-python src/pipeline.py
+```
+
+Wait until the install finishes before moving to the next step.
+
+### Step 6: Create Your Local Settings File
+
+The `.env` file stores settings for your own computer. It is not committed to
+Git because it may later contain private API keys.
+
+```powershell
+Copy-Item .env.template .env
+```
+
+Open `.env` and check these values:
+
+```text
+DRY_RUN=true
+BUDGET_HARD_STOP=0.00
+UNPAYWALL_EMAIL=your.name@uoguelph.ca
+```
+
+For your first run, keep `DRY_RUN=true`. This is the safest mode. It uses mock
+data and avoids real downloads.
+
+Change `UNPAYWALL_EMAIL` to your university email address. This is not a secret;
+it is used by CrossRef and Unpaywall so they know who is making requests.
+
+### Step 7: Run The Phase 2 Checklist
+
+This checks the safety pieces before you run the pipeline.
+
+```powershell
+python tests/manual_test_phase2.py
+```
+
+You want to see:
+
+```text
+ALL TESTS PASSED - Phase 2 is ready.
+```
+
+If a test fails, read the message in the terminal before continuing.
+
+### Step 8: Collect The Paper List
+
+This creates `data/manifest.jsonl`.
+
+In dry-run mode, it writes fake example papers so you can test the pipeline
+without using the internet.
+
+```powershell
+python src/collect.py
+```
+
+Expected result:
+
+```text
+Collection complete. Manifest contains 8 new entries.
+```
+
+Important: `collect.py` appends to `data/manifest.jsonl`. If you run it many
+times, it will add the mock papers again. For a fresh start, delete
+`data/manifest.jsonl` before running collection again.
+
+### Step 9: Test The Download Step
+
+In dry-run mode, this does not download real PDFs. It only checks that the
+download step can read the manifest and explain what it would do.
+
+```powershell
+python src/download.py
+```
+
+Expected result:
+
+```text
+Download run finished. 8 PDFs acquired, 0 unavailable (OA only).
+```
+
+In dry-run mode, "acquired" means "would be attempted." No real PDFs are saved.
+
+### Step 10: Test The Text Extraction Step
+
+This runs a small smoke test using the fixture data in `tests/fixtures`.
+
+```powershell
+python src/extract.py
+```
+
+Expected result:
+
+```text
+Extraction successful.
+```
+
+At this point, the Phase 2 dry-run pipeline is working.
+
+## Running With Real Data
+
+Only do this after the dry run works.
+
+### Step 1: Edit `.env`
+
+Change:
+
+```text
+DRY_RUN=true
+```
+
+to:
+
+```text
+DRY_RUN=false
+```
+
+Keep:
+
+```text
+BUDGET_HARD_STOP=0.00
+```
+
+Phase 2 does not call paid LLM APIs, so the budget should stay at zero.
+
+### Step 2: Collect Real Metadata
+
+```powershell
+python src/collect.py
+```
+
+This queries CrossRef for papers from the target journals and writes them to
+`data/manifest.jsonl`.
+
+### Step 3: Download Open-Access PDFs
+
+```powershell
+python src/download.py
+```
+
+This tries several legal open-access sources:
+
+1. fulltext-article-downloader, if installed
+2. Unpaywall
+3. Semantic Scholar
+4. PubMed Central
+
+PDFs that are found are saved in `data/raw/`.
+
+Papers that are not legally available as open access are skipped and recorded in
+`data/error_log.jsonl`.
+
+## Useful Commands
+
+Run the simple startup check:
+
+```powershell
+python src/main.py
+```
+
+Run the Phase 2 tests with pytest:
+
+```powershell
+python -m pytest tests/manual_test_phase2.py -v
+```
+
+## Important Notes
+
+- Keep `.env` private. Do not commit API keys.
+- The `data/` folder is gitignored because it can contain downloaded papers,
+  generated manifests, and error logs.
+- The downloader only uses open-access sources. It does not bypass paywalls.
+- Dry-run mode is the safest first step. Use it before every major change.
+- If something fails, check `data/error_log.jsonl`.
+
+## Troubleshooting
+
+If `python` is not recognized, try:
+
+```powershell
+py --version
+```
+
+If that works, use `py` instead of `python` in the commands above.
+
+If activation fails in PowerShell, run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+If imports fail, make sure your virtual environment is active and run:
+
+```powershell
+pip install -r requirements.txt
+```
+
+If `download.py` says the manifest is missing, run:
+
+```powershell
+python src/collect.py
+```
+
+If you get duplicate papers in `data/manifest.jsonl`, delete that file and run
+collection again.
