@@ -35,22 +35,59 @@ Equal-quota sampling is used instead of proportional sampling for two reasons:
 the pipeline logs the deficit and generates `data/missing_papers.csv` for
 manual supplementation via `src/supplement.py`.
 
-## Current Status
+## Current Status — Phase 2.1 Validation
 
-The repository currently contains the Phase 2 ingestion and safety pipeline.
+This branch is the Phase 2.1 validation iteration.  The baseline Phase 2
+pipeline has been significantly hardened with a production-safe OA downloader.
 
-Phase 2 can:
+### What is new in Phase 2.1
+
+**Expanded OA fallback chain (6 sources, in order):**
+
+1. `fulltext-article-downloader` CLI — queries Unpaywall, BASE, and CORE
+2. Unpaywall API — now tries every `oa_locations` entry, not just `best_oa_location`
+3. Semantic Scholar API — returns `openAccessPdf` URL when known
+4. PubMed Central (NCBI E-utils) — DOI → PMCID → PDF or OA tar.gz package
+5. Publisher-direct PDF URL — Wiley (`10.1111/`), AVMA (`10.2460/`), SAGE (`10.1177/`)
+6. Article-page HTML scraping — follows DOI redirect, reads `citation_pdf_url` meta tag
+
+**Publisher-safe throttling:**
+
+- API requests use a short fixed delay (`DOWNLOAD_DELAY_SECONDS`)
+- Publisher website requests use a separate configurable random jitter
+  (`PUBLISHER_DELAY_MIN_SECONDS` / `PUBLISHER_DELAY_MAX_SECONDS`)
+- HTTP 429 rate-limit responses are respected via `Retry-After` header
+
+**Structured failure diagnostics:**
+
+- Every attempted URL now records HTTP status code, final redirect URL,
+  `Content-Type`, and the first 200 bytes of the response body
+- `MIME_TYPE_MISMATCH`, `HTTP_403`, `HTTP_429`, `PDF_MAGIC_MISMATCH`,
+  `NO_PDF_URL`, and `REQUEST_TIMEOUT` are distinct failure codes
+- `data/error_log.jsonl` now includes the best failure detail per DOI,
+  not just a generic "all fallbacks failed" message
+
+**NCBI OA package support:**
+
+- When PMC's browser-facing PDF URL returns a JavaScript challenge page,
+  the pipeline falls back to NCBI's official `oa.fcgi` OA package service,
+  downloads the `tar.gz`, and extracts the PDF from it
+
+**All downloads validated by `%PDF` magic bytes:**
+
+- HTML pages, login walls, bot-challenge pages, and empty files are all
+  rejected before saving, regardless of HTTP status or Content-Type header
+
+**The pipeline can now:**
 
 - collect up to 80 DOI candidates per journal from CrossRef (stratified)
-- infer simple covariates such as species, study design, and clinical topic
-- download only legally open-access PDFs with per-journal stop-loss at 50 PDFs
-- detect OA shortfalls and generate `data/missing_papers.csv` for manual review
-- extract and clean PDF text
-- remove references before truncating text
-- keep an error log for failed papers
+- infer covariates: species, study design, clinical topic
+- download only legally open-access PDFs through a 6-source fallback chain
+- detect and log OA shortfalls; generate `data/missing_papers.csv`
+- extract and clean PDF text, remove references before truncating
+- keep a structured error ledger with per-attempt diagnostic detail
 - merge OA and manually supplemented PDFs into a unified corpus view
-- run in dry-run mode so you can test the pipeline without spending money or
-  making live network calls
+- run in dry-run mode with no network calls
 
 Future phases will add LLM summarization, LLM-as-a-judge evaluation, human
 review, and statistical analysis.
@@ -126,13 +163,13 @@ A virtual environment is a small, private Python workspace for this project.
 It keeps this project's packages separate from other Python projects.
 
 ```powershell
-python -m venv venv
+python -m venv .venv
 ```
 
 ### Step 4: Turn On The Virtual Environment
 
 ```powershell
-.\venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 ```
 
 If PowerShell says scripts are blocked, run this once in the same terminal:
@@ -144,10 +181,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Then try activating again:
 
 ```powershell
-.\venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 ```
 
-You will know it worked if you see `(venv)` at the start of your terminal line.
+You will know it worked if you see `(.venv)` at the start of your terminal line.
 
 ### Step 5: Install The Required Packages
 
@@ -157,7 +194,10 @@ Packages are pieces of Python code that this project depends on.
 pip install -r requirements.txt
 ```
 
-Wait until the install finishes before moving to the next step.
+This installs all dependencies, including `beautifulsoup4` (for HTML parsing
+in the downloader) and `fulltext-article-downloader` (for the first fallback
+in the OA acquisition chain). Wait until the install finishes before moving
+to the next step.
 
 ### Step 6: Create Your Local Settings File
 
@@ -174,13 +214,34 @@ Open `.env` and check these values:
 DRY_RUN=true
 BUDGET_HARD_STOP=0.00
 UNPAYWALL_EMAIL=your.name@uoguelph.ca
+
+# -- Downloader settings (safe production defaults) --
+DOWNLOAD_VERBOSE=false
+DOWNLOAD_DELAY_SECONDS=1
+PUBLISHER_DELAY_MIN_SECONDS=10
+PUBLISHER_DELAY_MAX_SECONDS=25
+RATE_LIMIT_BACKOFF_SECONDS=60
 ```
 
 For your first run, keep `DRY_RUN=true`. This is the safest mode. It uses mock
 data and avoids real downloads.
 
-Change `UNPAYWALL_EMAIL` to your university email address. This is not a secret;
-it is used by CrossRef and Unpaywall so they know who is making requests.
+Change `UNPAYWALL_EMAIL` to your university email address (no leading space).
+This is not a secret; it is used by CrossRef and Unpaywall to identify the
+requesting institution.
+
+The downloader variables control throttling for publisher-facing requests:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOWNLOAD_VERBOSE` | `false` | Print per-URL debug info (status, Content-Type, body start) |
+| `DOWNLOAD_DELAY_SECONDS` | `1` | Pause between API calls (Unpaywall, Semantic Scholar, PMC) |
+| `PUBLISHER_DELAY_MIN_SECONDS` | `10` | Minimum random jitter before a publisher URL request |
+| `PUBLISHER_DELAY_MAX_SECONDS` | `25` | Maximum random jitter before a publisher URL request |
+| `RATE_LIMIT_BACKOFF_SECONDS` | `60` | Fallback sleep when a server returns HTTP 429 with no `Retry-After` |
+
+Set all delay values to `0` only during single-DOI debugging. Leave them at
+their defaults for real collection runs to respect publisher rate limits.
 
 ### Step 7: Run The Phase 2 Checklist
 
@@ -313,22 +374,40 @@ This queries CrossRef for papers from the target journals and writes them to
 python src/download.py
 ```
 
-This tries several legal open-access sources for each DOI:
+The downloader tries **six sources** for each DOI, in order:
 
-1. fulltext-article-downloader, if installed
-2. Unpaywall
-3. Semantic Scholar
-4. PubMed Central
+1. `fulltext-article-downloader` CLI (Unpaywall + BASE + CORE)
+2. Unpaywall API — all `oa_locations`, not just the best one
+3. Semantic Scholar API — `openAccessPdf` URL
+4. PubMed Central — DOI → PMCID → direct PDF, then NCBI OA tar.gz package
+5. Publisher-direct PDF URL — Wiley, AVMA, SAGE heuristics
+6. Article-page HTML scraping — `citation_pdf_url` meta tag or `<a>` links
+
+Every downloaded file is validated against PDF magic bytes (`%PDF`) before
+being saved. HTML bot-challenge pages, login walls, and empty responses are all
+rejected. Failure details (HTTP status, Content-Type, final redirect URL,
+body preview) are recorded in `data/error_log.jsonl`.
 
 PDFs are saved in `data/raw/`. The download stops at 50 PDFs per journal
 (stop-loss). If a journal falls short, a warning is written to
 `data/error_log.jsonl` and `data/missing_papers.csv` is created.
 
-Optional settings in `.env`:
+Optional settings in `.env` that affect live runs:
 
 ```text
-DOWNLOAD_VERBOSE=false        # suppress per-DOI noise; show summaries only
-MAX_FAILED_PER_JOURNAL=100    # stop a journal after this many OA failures
+DOWNLOAD_VERBOSE=false           # set to true to print per-URL debug info
+DOWNLOAD_DELAY_SECONDS=1         # pause between API calls
+PUBLISHER_DELAY_MIN_SECONDS=10   # random jitter floor before publisher URLs
+PUBLISHER_DELAY_MAX_SECONDS=25   # random jitter ceiling before publisher URLs
+RATE_LIMIT_BACKOFF_SECONDS=60    # fallback sleep on HTTP 429 with no Retry-After
+MAX_FAILED_PER_JOURNAL=100       # stop a journal after this many OA failures
+```
+
+To debug a single DOI with full diagnostic output:
+
+```powershell
+$env:DOWNLOAD_VERBOSE="true"; $env:PUBLISHER_DELAY_MIN_SECONDS="0"; $env:PUBLISHER_DELAY_MAX_SECONDS="0"
+python -c "import sys; sys.path.insert(0,'src'); from download import download_paper; download_paper('10.1111/jvim.70254')"
 ```
 
 ### Step 4: Check Corpus Status
@@ -377,16 +456,25 @@ python -m pytest tests/manual_test_phase2.py -v
 
 ## Important Notes
 
-- Keep `.env` private. Do not commit API keys.
+- Keep `.env` private. Do not commit API keys or your email address.
 - The `data/` folder is gitignored because it can contain downloaded papers,
   generated manifests, and error logs.
-- The downloader only uses open-access sources. It does not bypass paywalls.
+- The downloader only uses open-access sources. It does not bypass paywalls,
+  use institutional proxies, or attempt login. This is intentional and required
+  by research ethics and University of Guelph policy.
+- Some publishers (Wiley, SAGE) use Cloudflare bot-detection and will return
+  `403 Forbidden` even for genuinely OA papers. The script logs the specific
+  failure reason rather than silently skipping the paper.
+- `UNPAYWALL_EMAIL` must have no leading or trailing space. A space causes
+  Unpaywall to treat your address as invalid and return no OA locations.
 - Dry-run mode is the safest first step. Use it before every major change.
-- If something fails, check `data/error_log.jsonl`.
+- If something fails, check `data/error_log.jsonl`. Each failed DOI now
+  includes the most informative failure code (`HTTP_403`, `MIME_TYPE_MISMATCH`,
+  `NO_PDF_URL`, etc.) rather than a generic message.
 - If a journal has < 50 OA PDFs, `data/error_log.jsonl` will contain entries
   with `"stage": "insufficient_oa"`. Run `python src/supplement.py` to act on them.
 - `data/manual_manifest.jsonl` must only contain entries whose PDFs are already
-  in `data/raw/`. pipeline.py validates this and will warn about missing PDFs.
+  in `data/raw/`. `pipeline.py` validates this and will warn about missing PDFs.
 - To avoid duplicate papers: delete `data/manifest.jsonl` before re-running
   `collect.py` for a fresh corpus build.
 
@@ -432,3 +520,29 @@ This generates `data/missing_papers.csv` and prints acquisition instructions.
 If `pipeline.py` warns about manual manifest entries with missing PDFs:
 make sure the PDF file is in `data/raw/` with the correct filename (DOI with
 `/`, `:`, and `.` replaced by `_`, plus `.pdf` extension).
+
+If `download.py` says `ModuleNotFoundError: No module named 'bs4'`:
+your virtual environment is not active, or you ran `pip install` in the wrong
+Python. Re-activate `.venv` and run `pip install -r requirements.txt` again.
+Then invoke the script through the virtual environment explicitly:
+
+```powershell
+& ".\.venv\Scripts\python.exe" src/download.py
+```
+
+If every DOI fails with `HTTP_403` or `MIME_TYPE_MISMATCH`:
+the publisher is blocking automated requests with Cloudflare or a similar CDN.
+This is expected for some journals. Check `data/error_log.jsonl` for the
+`body_start` field — it will show the exact HTML the server returned (e.g.,
+"Just a moment..."). No script change can legally bypass this; use the manual
+supplement workflow for those papers.
+
+If a PMC paper returns "Preparing to download..." HTML:
+the NCBI viewer requires JavaScript to start the download. The script handles
+this automatically by falling back to NCBI's official OA package service
+(`oa.fcgi`). If the package is also unavailable (FTP 550), that paper must be
+obtained manually.
+
+If you get `UnicodeEncodeError` in the PowerShell terminal:
+set `DOWNLOAD_VERBOSE=false` to suppress the diagnostic body-start output,
+which may contain non-ASCII characters from publisher HTML pages.

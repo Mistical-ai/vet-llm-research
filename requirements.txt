@@ -2,7 +2,10 @@ python-dotenv
 pydantic
 pandas
 requests
+urllib3
 pdfplumber
 tenacity
 tqdm
 pytest
+beautifulsoup4
+fulltext-article-downloader
