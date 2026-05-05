@@ -31,12 +31,13 @@ sampling for two reasons:
 
 CANDIDATE BUFFER
 -----------------
-We collect COLLECT_CANDIDATES_PER_JOURNAL (80) DOIs per journal even though
-the download quota is 50.  Not every CrossRef DOI will have a freely
+We collect COLLECT_CANDIDATES_PER_JOURNAL (default: 200) DOIs per journal even
+though the download quota is 50.  Not every CrossRef DOI will have a freely
 downloadable PDF — publisher embargo, broken links, and PMC deposit lag all
-reduce the OA hit rate.  The extra 30 candidates give download.py a fallback
-pool so transient OA gaps do not cause the corpus to fall short of 50 PDFs
-per journal.  80 candidates at a ~40% paywall rate still yields 48 OA PDFs.
+reduce the OA hit rate.  The extra 150 candidates give download.py a deeper
+fallback pool so transient OA gaps do not cause the corpus to fall short of
+50 PDFs per journal.  The larger pool is intentional: real download runs have
+shown that many candidates fail legal OA or text-quality validation.
 
 ARCHITECTURAL DECISIONS
 ------------------------
@@ -60,10 +61,10 @@ ARCHITECTURAL DECISIONS
     wasted API pages.  The real legal gate is the download step (Unpaywall
     `is_oa` check, Semantic Scholar `isOpenAccess` flag, PMC availability).
 
-- WHY sort=published desc?
-    Newer papers are more likely to comply with modern OA mandates (e.g. NIH
-    2023 policy, cOAlition S plan).  Sorting newest-first biases the candidate
-    pool toward higher OA availability, increasing the expected download yield.
+- WHY YEAR-BALANCED, THEN sort=published desc?
+    The study window is 2023-2025, so live collection queries each year
+    separately by default.  Within each year, sorting newest-first keeps the
+    candidate pool recent without letting 2025 crowd out 2024/2023.
 
 - WHY DRY_RUN MODE?
     Lets the researcher test the entire pipeline end-to-end without network
@@ -101,6 +102,7 @@ the canonical field name used by the balanced-corpus workflow.
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -140,12 +142,32 @@ TARGET_JOURNALS: dict[str, str] = {
     "JFMS":               "1098-612X",   # corrected from former typo 1098-632X
 }
 
-# WHY 80 CANDIDATES FOR A 50-PDF QUOTA?
+# WHY 200 CANDIDATES FOR A 50-PDF QUOTA?
 # Not every CrossRef DOI will resolve to a freely downloadable PDF.
-# Collecting 80 candidates gives download.py a 30-paper buffer.
-# Even at a 40% paywall rate, 48 OA PDFs are reachable — close enough for
-# manual supplementation via src/supplement.py.
-COLLECT_CANDIDATES_PER_JOURNAL: int = 80
+# Collecting 200 candidates gives download.py a much deeper fallback pool while
+# the balanced downloader still stops at 50 accepted PDFs per journal.
+# Override in .env when you need a smaller test run or a larger live run.
+COLLECT_CANDIDATES_PER_JOURNAL: int = int(
+    os.getenv("COLLECT_CANDIDATES_PER_JOURNAL", "200")
+)
+
+COLLECT_YEAR_BALANCED: bool = os.getenv("COLLECT_YEAR_BALANCED", "true").lower() == "true"
+COLLECT_YEARS: list[int] = [
+    int(year.strip())
+    for year in os.getenv("COLLECT_YEARS", "2023,2024,2025").split(",")
+    if year.strip()
+]
+
+COLLECT_PREFLIGHT_UNPAYWALL: bool = (
+    os.getenv("COLLECT_PREFLIGHT_UNPAYWALL", "false").lower() == "true"
+)
+COLLECT_REQUIRE_UNPAYWALL_OA: bool = (
+    os.getenv("COLLECT_REQUIRE_UNPAYWALL_OA", "false").lower() == "true"
+)
+COLLECT_MIN_OA_LOCATIONS: int = int(os.getenv("COLLECT_MIN_OA_LOCATIONS", "1"))
+COLLECT_PREFER_DIRECT_PDF: bool = (
+    os.getenv("COLLECT_PREFER_DIRECT_PDF", "true").lower() == "true"
+)
 
 # Publication window for the study.
 DATE_FROM = "2023-01-01"
@@ -280,14 +302,22 @@ def _mock_covariate_llm(doi: str) -> dict:
 # CrossRef API helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_crossref_page(issn: str, offset: int) -> list[dict]:
+def _fetch_crossref_page(
+    issn: str,
+    offset: int,
+    *,
+    date_from: str = DATE_FROM,
+    date_to: str = DATE_TO,
+) -> list[dict]:
     """
     Fetch one page of CrossRef results for a single ISSN.
 
     Parameters
     ----------
-    issn   : str — Journal ISSN, e.g. "1939-1676".
-    offset : int — Number of records to skip (for pagination).
+    issn      : str — Journal ISSN, e.g. "1939-1676".
+    offset    : int — Number of records to skip (for pagination).
+    date_from : str — Start of the CrossRef publication-date window.
+    date_to   : str — End of the CrossRef publication-date window.
 
     FILTER RATIONALE
     -----------------
@@ -304,19 +334,19 @@ def _fetch_crossref_page(issn: str, offset: int) -> list[dict]:
         of OA-eligible papers in the candidate pool.
 
     - sort=published / order=desc
-        Newest papers first.  Recent papers are more likely to comply with
-        modern OA mandates (NIH 2023 policy, cOAlition S plan), so newest-first
-        biases the candidate pool toward higher download yield.
+        Newest papers first within the requested date window.  Live collection
+        normally calls this once per year, so the overall manifest still covers
+        2023, 2024, and 2025.
 
     WHY OFFSET PAGINATION (not cursor)?
         CrossRef supports both.  Offset is simpler to reason about and safe for
-        our scale (~80 candidates per journal = one or two pages).
+        our scale (~200 candidates per journal = a few pages).
     """
     params = {
         "filter": (
             f"issn:{issn},"
-            f"from-pub-date:{DATE_FROM},"
-            f"until-pub-date:{DATE_TO},"
+            f"from-pub-date:{date_from},"
+            f"until-pub-date:{date_to},"
             "type:journal-article,"
             # has-license:true is an OA pre-filter, not a legal guarantee.
             # It improves the OA hit rate in the candidate pool, but the
@@ -342,6 +372,115 @@ def _fetch_crossref_page(issn: str, offset: int) -> list[dict]:
     except requests.RequestException as exc:
         print(f"[collect] CrossRef request failed for ISSN {issn}: {exc}")
         return []
+
+
+NON_ARTICLE_TITLE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"^\s*correction\s+to\b",
+        r"^\s*corrigendum\b",
+        r"^\s*erratum\b",
+        r"^\s*retraction\b",
+        r"\bexpression\s+of\s+concern\b",
+        r"\bissue\s+information\b",
+        r"^\s*contents?\s*$",
+        r"\btable\s+of\s+contents\b",
+        r"\bfront\s+matter\b",
+        r"\bresearch\s+abstract\s+program\b",
+        r"\bresearch\s+report\s+program\b",
+        r"\bconference\s+abstracts?\b",
+        r"\bproceedings\b",
+        r"\beditorial\b",
+        r"\bletter\s+to\s+the\s+editor\b",
+        r"\bbook\s+review\b",
+        r"\bcommentary\b",
+    ]
+)
+
+
+def _plain_text(value: str) -> str:
+    """Collapse CrossRef/JATS markup into plain text for filtering."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", value or "")).strip()
+
+
+def _candidate_rejection_reason(record: dict) -> str | None:
+    """
+    Return a reason if a manifest candidate is not a useful full-paper target.
+    """
+    title = _plain_text(str(record.get("title", "")))
+    abstract = _plain_text(str(record.get("abstract", "")))
+    authors = record.get("authors") or []
+
+    if not title or title.lower() == "no title available":
+        return "missing title"
+
+    for pattern in NON_ARTICLE_TITLE_PATTERNS:
+        if pattern.search(title):
+            return f"non-article title pattern: {pattern.pattern}"
+
+    if not authors and not abstract:
+        return "missing authors and abstract"
+
+    return None
+
+
+def _fetch_unpaywall_metadata(doi: str) -> dict:
+    """
+    Optionally annotate a candidate with lightweight OA availability metadata.
+    """
+    metadata = {
+        "is_oa": False,
+        "oa_locations_count": 0,
+        "has_direct_pdf_url": False,
+        "candidate_quality_score": 0,
+    }
+    if not COLLECT_PREFLIGHT_UNPAYWALL and not COLLECT_REQUIRE_UNPAYWALL_OA:
+        return metadata
+
+    url = f"https://api.unpaywall.org/v2/{doi}"
+    params = {"email": os.getenv("UNPAYWALL_EMAIL", "researcher@example.com")}
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        if response.status_code == 404:
+            return metadata
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        print(f"[collect] Unpaywall preflight failed for {doi}: {exc}")
+        return metadata
+
+    locations = data.get("oa_locations") or []
+    has_direct_pdf = any(bool(loc.get("url_for_pdf")) for loc in locations)
+    score = 0
+    if data.get("is_oa"):
+        score += 50
+    score += min(len(locations), 10) * 5
+    if has_direct_pdf:
+        score += 25
+
+    metadata.update({
+        "is_oa": bool(data.get("is_oa")),
+        "oa_locations_count": len(locations),
+        "has_direct_pdf_url": has_direct_pdf,
+        "candidate_quality_score": score,
+    })
+    return metadata
+
+
+def _passes_oa_preflight(record: dict) -> bool:
+    """
+    Return whether a candidate is allowed under optional OA strict mode.
+    """
+    if not COLLECT_REQUIRE_UNPAYWALL_OA:
+        return True
+
+    if not record.get("is_oa"):
+        return False
+    if int(record.get("oa_locations_count") or 0) < COLLECT_MIN_OA_LOCATIONS:
+        return False
+    if COLLECT_PREFER_DIRECT_PDF and not record.get("has_direct_pdf_url"):
+        return False
+    return True
 
 
 def _parse_crossref_item(item: dict, journal_name: str, issn: str) -> dict | None:
@@ -410,7 +549,7 @@ def _parse_crossref_item(item: dict, journal_name: str, issn: str) -> dict | Non
 # WHY TWO PER JOURNAL (not one, not eighty)?
 #   - One per journal would not demonstrate the per-journal queue that
 #     download.py needs to simulate the balanced scheduling logic.
-#   - Eighty per journal (the live candidate count) would slow tests for no
+#   - Two hundred per journal (the live candidate count) would slow tests for no
 #     extra coverage value.
 #   - Two per journal is the minimum that shows "queue has multiple candidates"
 #     while keeping the dry-run instant.
@@ -565,6 +704,23 @@ MOCK_PAPERS: list[dict] = [
 ]
 
 
+def _collection_windows() -> list[tuple[str, str, str, int]]:
+    """
+    Return date windows and per-window candidate targets for live collection.
+    """
+    if not COLLECT_YEAR_BALANCED or not COLLECT_YEARS:
+        return [("all", DATE_FROM, DATE_TO, COLLECT_CANDIDATES_PER_JOURNAL)]
+
+    years = sorted(COLLECT_YEARS)
+    base = COLLECT_CANDIDATES_PER_JOURNAL // len(years)
+    remainder = COLLECT_CANDIDATES_PER_JOURNAL % len(years)
+    windows: list[tuple[str, str, str, int]] = []
+    for index, year in enumerate(years):
+        quota = base + (1 if index < remainder else 0)
+        windows.append((str(year), f"{year}-01-01", f"{year}-12-31", quota))
+    return windows
+
+
 # ---------------------------------------------------------------------------
 # Core collection function
 # ---------------------------------------------------------------------------
@@ -576,8 +732,8 @@ def run_collection() -> int:
     STRATIFIED SAMPLING LOGIC
     --------------------------
     For each of the five target journals, we query CrossRef until we have
-    COLLECT_CANDIDATES_PER_JOURNAL (80) candidate DOIs or the API returns no
-    more results.  A DOI deduplication set prevents the same paper from
+    COLLECT_CANDIDATES_PER_JOURNAL (default: 200) candidate DOIs or the API
+    returns no more results.  A DOI deduplication set prevents the same paper from
     appearing twice in a single run (rare with CrossRef offset pagination, but
     possible if the same DOI is returned on multiple pages).
 
@@ -641,48 +797,88 @@ def run_collection() -> int:
     #   cross-run deduplication is handled by deleting the manifest before re-run.
     seen_dois: set[str] = set()
 
+    windows = _collection_windows()
+
     for journal_name, issn in TARGET_JOURNALS.items():
         print(f"\n[collect] Fetching '{journal_name}' (ISSN {issn})...")
         journal_count = 0
-        offset = 0
+        skipped_count = 0
+        year_counts: dict[str, int] = {}
 
         with open(MANIFEST_PATH, "a", encoding="utf-8") as manifest_file:
-            while journal_count < COLLECT_CANDIDATES_PER_JOURNAL:
-                items = _fetch_crossref_page(issn, offset)
-
-                if not items:
-                    # API returned an empty page — no more results for this journal.
+            for fill_mode in (False, True):
+                if fill_mode and journal_count >= COLLECT_CANDIDATES_PER_JOURNAL:
                     break
 
-                for item in tqdm(
-                    items,
-                    desc=f"  {journal_name} offset={offset}",
-                    leave=False,
-                ):
+                for label, date_from, date_to, quota in windows:
                     if journal_count >= COLLECT_CANDIDATES_PER_JOURNAL:
-                        # Reached this journal's candidate quota; stop consuming
-                        # the current page (avoids a partial page fetch waste).
                         break
 
-                    parsed = _parse_crossref_item(item, journal_name, issn)
-                    if parsed is None:
-                        log_error("N/A", "collect", f"Skipped item without DOI in {journal_name}")
+                    if not fill_mode and year_counts.get(label, 0) >= quota:
                         continue
 
-                    doi = parsed["doi"]
-                    if doi in seen_dois:
-                        # Duplicate DOI within this run — skip silently.
-                        continue
+                    offset = 0
+                    while journal_count < COLLECT_CANDIDATES_PER_JOURNAL:
+                        if not fill_mode and year_counts.get(label, 0) >= quota:
+                            break
 
-                    seen_dois.add(doi)
-                    manifest_file.write(json.dumps(parsed) + "\n")
-                    journal_count += 1
-                    papers_written += 1
+                        items = _fetch_crossref_page(
+                            issn,
+                            offset,
+                            date_from=date_from,
+                            date_to=date_to,
+                        )
 
-                offset += PAGE_SIZE
+                        if not items:
+                            # API returned an empty page — no more results for this window.
+                            break
 
-                # CrossRef polite-pool rate limit: ≤ 1 request per second.
-                time.sleep(1.0)
+                        for item in tqdm(
+                            items,
+                            desc=f"  {journal_name} {label} offset={offset}",
+                            leave=False,
+                        ):
+                            if journal_count >= COLLECT_CANDIDATES_PER_JOURNAL:
+                                break
+                            if not fill_mode and year_counts.get(label, 0) >= quota:
+                                break
+
+                            parsed = _parse_crossref_item(item, journal_name, issn)
+                            if parsed is None:
+                                log_error("N/A", "collect", f"Skipped item without DOI in {journal_name}")
+                                skipped_count += 1
+                                continue
+
+                            doi = parsed["doi"]
+                            if doi in seen_dois:
+                                # Duplicate DOI within this run — skip silently.
+                                continue
+
+                            rejection_reason = _candidate_rejection_reason(parsed)
+                            if rejection_reason is not None:
+                                _v = parsed.get("title", doi)
+                                log_error(doi, "collect_filter", f"Skipped '{_v}': {rejection_reason}")
+                                skipped_count += 1
+                                seen_dois.add(doi)
+                                continue
+
+                            parsed.update(_fetch_unpaywall_metadata(doi))
+                            if not _passes_oa_preflight(parsed):
+                                log_error(doi, "collect_oa_preflight", "Skipped candidate without sufficient OA metadata")
+                                skipped_count += 1
+                                seen_dois.add(doi)
+                                continue
+
+                            seen_dois.add(doi)
+                            manifest_file.write(json.dumps(parsed) + "\n")
+                            journal_count += 1
+                            year_counts[label] = year_counts.get(label, 0) + 1
+                            papers_written += 1
+
+                        offset += PAGE_SIZE
+
+                        # CrossRef polite-pool rate limit: ≤ 1 request per second.
+                        time.sleep(1.0)
 
         target = JOURNAL_TARGETS.get(journal_name, 50)
         if journal_count >= COLLECT_CANDIDATES_PER_JOURNAL:
@@ -695,7 +891,14 @@ def run_collection() -> int:
                 f"{journal_count} candidates "
                 f"(API exhausted before reaching {COLLECT_CANDIDATES_PER_JOURNAL})"
             )
-        print(f"[collect] {journal_name}: {status}  (download target: {target})")
+        year_summary = ", ".join(
+            f"{label}: {year_counts.get(label, 0)}"
+            for label, *_ in windows
+        )
+        print(
+            f"[collect] {journal_name}: {status}  (download target: {target}; "
+            f"years: {year_summary}; skipped: {skipped_count})"
+        )
 
     print(f"\n[collect] Done. Total candidates written to manifest: {papers_written}")
     return papers_written

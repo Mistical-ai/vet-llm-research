@@ -4,7 +4,7 @@ src/supplement.py — Manual Supplement Helper
 
 WHY DOES THIS MODULE EXIST?
 -----------------------------
-Even with 80 OA candidates per journal, some journals may fall short of the
+Even with 200 OA candidates per journal, some journals may fall short of the
 50-PDF quota because their content is predominantly paywalled, embargoed, or
 not yet deposited in PMC.  This module helps the researcher manually fill
 those gaps without automating any access to paywalled content.
@@ -49,6 +49,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from collect import JOURNAL_TARGETS
+from file_paths import legacy_doi_filename, resolve_existing_pdf_path
 from utils import log_error
 
 load_dotenv()
@@ -81,18 +82,9 @@ SUPPLEMENT_ACTIONS: list[str] = [
 
 def _doi_to_filename(doi: str) -> str:
     """
-    Convert a DOI to the same safe filename used by download.py.
-
-    WHY DUPLICATE THIS (not import from download.py)?
-        Importing download.py from supplement.py would create a circular
-        import: download → supplement → download.  Duplicating this tiny
-        pure function (no logic, no state) is cheaper than the circular-import
-        workaround, and the function is trivial enough that divergence is
-        extremely unlikely.  The two implementations are kept identical by a
-        comment in both files.
+    Return the legacy DOI-only filename for backward compatibility.
     """
-    safe = doi.replace("/", "_").replace(":", "_").replace(".", "_")
-    return f"{safe}.pdf"
+    return legacy_doi_filename(doi)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +201,7 @@ def generate_supplement_report() -> list[dict]:
         # Determine which DOIs from this journal already have a PDF on disk.
         downloaded_dois: set[str] = {
             r["doi"] for r in records
-            if (RAW_DIR / _doi_to_filename(r["doi"])).exists()
+            if resolve_existing_pdf_path(RAW_DIR, r) is not None
         }
 
         have    = len(downloaded_dois)

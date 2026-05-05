@@ -69,6 +69,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from file_paths import preferred_pdf_path
 from utils import log_error
 
 load_dotenv()
@@ -86,6 +87,7 @@ MAX_CHARS = 12_000
 FIXTURE_PATH = Path("tests") / "fixtures" / "sample_paper.json"
 
 RAW_DIR = Path("data") / "raw"
+MANIFEST_PATH = Path("data") / "manifest.jsonl"
 
 # ---------------------------------------------------------------------------
 # Reference section removal
@@ -232,6 +234,32 @@ def extract_text_from_pdf(pdf_path: Path) -> str | None:
 # Core public function
 # ---------------------------------------------------------------------------
 
+def _manifest_record_for_doi(doi: str) -> dict:
+    """
+    Return manifest metadata for a DOI when available.
+
+    Descriptive filenames include journal and title, so extraction needs the
+    same metadata-aware path resolver as download.py.  If the manifest is not
+    available, we fall back to DOI-only lookup for older/manual use.
+    """
+    if not MANIFEST_PATH.exists():
+        return {"doi": doi}
+
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(record.get("doi", "")).strip().lower() == doi.lower():
+                return record
+
+    return {"doi": doi}
+
+
 def extract_clean_text(doi: str) -> str | None:
     """
     Return cleaned, truncated text for a paper identified by its DOI.
@@ -298,11 +326,11 @@ def _extract_live(doi: str) -> str | None:
     """
     Live path: find PDF in data/raw/, extract, clean, truncate.
 
-    The PDF filename is derived from the DOI using the same sanitisation
-    function used by download.py, so the names will always match.
+    The PDF path is resolved from manifest metadata when available so both new
+    descriptive filenames and legacy DOI-only filenames work.
     """
-    safe_name = doi.replace("/", "_").replace(":", "_").replace(".", "_") + ".pdf"
-    pdf_path  = RAW_DIR / safe_name
+    record = _manifest_record_for_doi(doi)
+    pdf_path = preferred_pdf_path(RAW_DIR, record)
 
     if not pdf_path.exists():
         log_error(doi, "extract", f"PDF not found: {pdf_path}")

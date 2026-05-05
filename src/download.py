@@ -26,6 +26,25 @@ HOW WE VERIFY A RESPONSE IS REALLY A PDF (NOT A PAYWALLED PAGE):
     publisher's direct PDF URL is completely safe — the worst outcome is we
     save nothing.
 
+HOW WE VERIFY A PDF IS USEFUL FOR LLM SUMMARISATION:
+    A file can be a real PDF and still be the wrong kind of paper for this
+    project.  Examples: a one-page abstract, a correction notice, an image-only
+    scanned PDF, or a publisher placeholder.  Those files pass the %PDF check
+    but do not give the LLM enough usable article text.
+
+    So the downloader now applies a second gate before a PDF is accepted:
+      1. Write the candidate bytes to a temporary PDF file.
+      2. Open that temporary file with pdfplumber, the same extractor used by
+         src/extract.py.
+      3. Extract text from every page.
+      4. Remove anything after a References/Bibliography heading.
+      5. Count words with a simple whitespace split.
+      6. Accept only if the useful pre-references text has at least
+         MIN_EXTRACTED_WORDS words (default: 3000).
+
+    This makes "download success" mean "we have a real PDF with enough text for
+    summarisation", not merely "we received bytes that look like a PDF".
+
 Violating publisher terms of service could jeopardise the University of Guelph's
 institutional access agreements.  The study will acknowledge in its limitations
 section that the full-text corpus may be smaller than 250 papers because not all
@@ -90,8 +109,8 @@ through three mechanisms:
 
   2. MAX_FAILED_PER_JOURNAL: If a journal exhausts its failure budget before
      reaching 50 PDFs, it is marked for manual supplementation rather than
-     burning through all 80 candidates pointlessly.  Default = 100 (set via
-     .env to override).
+     burning through all candidates pointlessly.  Default = 250 (set via
+     .env to override), which effectively lets a 200-candidate pool be exhausted.
 
   3. SHORTFALL LOGGING: If any journal ends below 50 PDFs, a structured entry
      is written to data/error_log.jsonl (stage="insufficient_oa") and
@@ -118,6 +137,15 @@ WHY CHECK data/raw/ BEFORE DOWNLOADING?
     If the pipeline crashes mid-run and is restarted, we don't want to re-download
     papers that were already saved.  Checking `if pdf_path.exists(): skip` makes
     the download step safe to re-run as many times as needed.
+
+WHY REVALIDATE EXISTING PDFs?
+    Older runs may have saved PDFs before the text-length gate existed.  If we
+    blindly count those files, a one-page PDF could permanently occupy one of
+    the 50 journal quota slots.  At the start of each live download run, existing
+    manifest PDFs in data/raw/ are rechecked.  Any bad file is moved to
+    data/quarantine/ with a JSON sidecar instead of being deleted.  After that,
+    the DOI is treated as not downloaded, so the normal fallback chain can try
+    to find a better OA copy.
 """
 
 # json lets us read and write JSON/JSONL records.
@@ -136,6 +164,13 @@ import os
 # We use it for publisher jitter so requests are slow and less bursty.
 import random
 
+# re provides deterministic text cleanup for validation.
+# We use it to remove references and count words/tokens from extracted PDF text.
+import re
+
+# shutil moves validated/quarantined PDFs without loading them back into memory.
+import shutil
+
 # subprocess lets Python run an external command-line program.
 # We use it to call fulltext-download as one fallback source.
 import subprocess
@@ -147,6 +182,9 @@ import sys
 # tarfile opens .tar.gz archive packages.
 # NCBI OA packages are tarballs, so this is how we inspect them for PDFs.
 import tarfile
+
+# tempfile lets us validate downloaded bytes before they enter data/raw/.
+import tempfile
 
 # time provides sleep().
 # We use it for rate-limit backoff and polite delays between fallback attempts.
@@ -205,6 +243,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from utils import log_error, ERROR_LOG_PATH
 from collect import JOURNAL_TARGETS
+from file_paths import (
+    legacy_doi_filename,
+    preferred_pdf_path,
+    resolve_existing_pdf_path,
+)
 from supplement import write_missing_report
 
 load_dotenv()
@@ -215,6 +258,7 @@ load_dotenv()
 
 MANIFEST_PATH = Path("data") / "manifest.jsonl"
 RAW_DIR       = Path("data") / "raw"
+QUARANTINE_DIR = Path("data") / "quarantine"
 
 # Email for Unpaywall and CrossRef polite-pool requests.
 # Not a secret — just our contact email so the API provider can reach us.
@@ -232,6 +276,37 @@ MAX_PDF_BYTES = 25 * 1024 * 1024  # 25 MB
 # packages but low enough to avoid accidentally downloading huge bulk archives.
 MAX_OA_PACKAGE_BYTES = 100 * 1024 * 1024  # 100 MB
 
+# Minimum extractable text quality gate for LLM summarisation.
+#
+# The downloader used to accept a file as soon as it was a valid PDF.  That was
+# not strict enough: a one-page abstract, a correction notice, or an image-only
+# scan can all be valid PDFs while still being useless for LLM summarisation.
+#
+# MIN_EXTRACTED_WORDS is therefore the hard acceptance rule.  A candidate PDF
+# must produce at least this many useful words after the References section is
+# removed.  Word count is intentionally simple: it is deterministic, easy to
+# explain in a methods section, and does not depend on a specific LLM tokenizer.
+MIN_EXTRACTED_WORDS: int = int(os.getenv("MIN_EXTRACTED_WORDS", "3000"))
+TARGET_EXTRACTED_WORDS: int = int(os.getenv("TARGET_EXTRACTED_WORDS", "4500"))
+
+# Token count is recorded as a diagnostic only.
+#
+# Why not enforce it as a second hard gate?  GPT, Claude, Gemini, and other
+# models do not all split text into tokens the same way.  A local regex estimate
+# is good enough for cost awareness in logs, but it is not reproducible enough
+# to reject papers.  The word threshold above remains the actual rule.
+MIN_EXTRACTED_TOKENS: int = int(os.getenv("MIN_EXTRACTED_TOKENS", "4000"))
+
+# Escape hatch for unit tests that need to exercise network/save plumbing
+# without building real PDFs.
+#
+# Normal research runs should leave this false.  If this is true, invalid PDFs
+# can be accepted, so it exists only for narrow tests that are not about text
+# extraction or validation.
+SKIP_VALIDATION_FOR_TESTING: bool = (
+    os.getenv("SKIP_VALIDATION_FOR_TESTING", "false").lower() == "true"
+)
+
 # WHY A VERBOSE FLAG?
 # Per-DOI "Trying OA sources..." messages can flood the terminal during a long
 # run, hiding the per-journal summaries that actually matter.
@@ -243,14 +318,14 @@ MAX_OA_PACKAGE_BYTES = 100 * 1024 * 1024  # 100 MB
 VERBOSE: bool = os.getenv("DOWNLOAD_VERBOSE", "false").lower() == "true"
 
 # WHY MAX_FAILED_PER_JOURNAL?
-# Without a per-journal failure cap, a journal whose 80 candidates are mostly
-# paywalled would exhaust all 80 attempts before surfacing a shortfall.  Capping
-# failures early lets us detect a low-OA journal and pivot to manual
-# supplementation instead of making 80+ fruitless network requests.
-# Default 100 = 1.25 × the 80-candidate pool, effectively meaning "exhaust the
-# pool" unless you set a tighter value (e.g. 40 to save time at the cost of
+# Without a per-journal failure cap, a journal whose candidates are mostly
+# paywalled would burn through the full queue before surfacing a shortfall.
+# Capping failures lets us detect a low-OA journal and pivot to manual
+# supplementation if needed.
+# Default 250 = 1.25 x the 200-candidate pool, effectively meaning "exhaust the
+# pool" unless you set a tighter value (e.g. 100 to save time at the cost of
 # potentially missing a few late-pool OA papers).
-MAX_FAILED_PER_JOURNAL: int = int(os.getenv("MAX_FAILED_PER_JOURNAL", "100"))
+MAX_FAILED_PER_JOURNAL: int = int(os.getenv("MAX_FAILED_PER_JOURNAL", "250"))
 
 # Pause between each fallback attempt for a single DOI.
 # WHY A DELAY?
@@ -396,10 +471,48 @@ class DownloadAttempt:
     body_start: str | None = None
 
 
+@dataclass
+class PdfValidationResult:
+    """
+    Result of checking whether a PDF contains enough extractable text.
+
+    The downloader needs more than True/False so rejected files can be logged
+    reproducibly: why they failed, how many words were extracted, and which
+    threshold was applied.
+    """
+
+    is_valid: bool
+    word_count: int
+    reason: str
+    error_type: str | None = None
+    token_count: int | None = None
+
+
+@dataclass
+class PdfSaveResult:
+    """
+    Result of validating and saving a candidate PDF.
+
+    This keeps `_save_pdf()` readable while preserving the old caller pattern:
+    HTTP fallbacks still get one object that can be converted into a
+    DownloadAttempt when a candidate fails.
+    """
+
+    ok: bool
+    failure_code: str | None = None
+    message: str | None = None
+    validation: PdfValidationResult | None = None
+
+
 # Each download_paper() call resets this list.  All fallback helpers append to
 # it as they try URLs.  When every fallback fails, the most useful attempt is
 # copied into data/error_log.jsonl so failures are debuggable after the run.
 _CURRENT_DOWNLOAD_ATTEMPTS: list[DownloadAttempt] = []
+
+# Run-level validation counters printed at the end of a live download run.
+_VALIDATION_REJECTED_COUNT = 0
+_VALIDATION_QUARANTINED_COUNT = 0
+_VALIDATION_QUARANTINED_BY_JOURNAL: dict[str, int] = {}
 
 
 def _remember_attempt(attempt: DownloadAttempt) -> DownloadAttempt:
@@ -425,10 +538,13 @@ def _best_failure_attempt() -> DownloadAttempt | None:
         "HTTP_403": 1,
         "MIME_TYPE_MISMATCH": 2,
         "PDF_MAGIC_MISMATCH": 3,
-        "HTTP_ERROR": 4,
-        "REQUEST_TIMEOUT": 5,
-        "REQUEST_ERROR": 6,
-        "NO_PDF_URL": 7,
+        "PDF_CORRUPT": 4,
+        "NO_EXTRACTABLE_TEXT": 5,
+        "TEXT_TOO_SHORT": 6,
+        "HTTP_ERROR": 7,
+        "REQUEST_TIMEOUT": 8,
+        "REQUEST_ERROR": 9,
+        "NO_PDF_URL": 10,
     }
     return min(
         _CURRENT_DOWNLOAD_ATTEMPTS,
@@ -676,29 +792,505 @@ def _log_insufficient_oa(journal: str, obtained: int, missing: int) -> None:
 
 def _doi_to_filename(doi: str) -> str:
     """
-    Convert a DOI like '10.1111/jvim.12345' to a safe filename.
+    Return the legacy DOI-only filename for backward compatibility.
 
-    WHY?
-        DOIs contain forward slashes, which are illegal in file paths on all
-        operating systems.  We also replace colons and dots to keep filenames
-        shell-friendly and unambiguous.
-
-    NOTE: supplement.py contains an identical copy of this function.  They are
-    intentionally kept in sync to avoid a circular import: download → supplement.
+    New downloads use file_paths.preferred_pdf_path(record), which includes the
+    journal and title when manifest metadata is available.  This wrapper remains
+    for older callers and tests that still pass a bare DOI.
     """
-    safe = doi.replace("/", "_").replace(":", "_").replace(".", "_")
-    return f"{safe}.pdf"
+    return legacy_doi_filename(doi)
+
+
+# Keep this pattern aligned with src/extract.py.
+#
+# Beginner explanation:
+#   A full research article usually ends with a References or Bibliography
+#   section.  That section can be very long, but it is not useful content for
+#   summarising the paper's clinical findings.  If we counted references, a
+#   short article plus a long bibliography could look "long enough" even though
+#   the LLM would mostly receive citation text.  This regex finds the start of
+#   common reference headings so validation counts only the useful article body.
+VALIDATION_REFERENCES_PATTERN = re.compile(
+    r"\n\s*(?:references?|bibliography|works\s+cited|literature\s+cited)\s*(?:\n|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _validation_is_disabled() -> bool:
+    """
+    Return True when validation should be bypassed.
+
+    DRY_RUN means "do not touch the real world".  In that mode the downloader
+    should not open, move, delete, quarantine, or validate real PDFs.
+
+    SKIP_VALIDATION_FOR_TESTING is different: it is a narrow escape hatch for
+    tests that need to exercise save/download plumbing without constructing a
+    real PDF.  It should stay false for real research runs.
+    """
+    return (
+        os.getenv("DRY_RUN", "true").lower() == "true"
+        or SKIP_VALIDATION_FOR_TESTING
+    )
+
+
+def _remove_references_for_validation(text: str) -> str:
+    """
+    Remove references/bibliography from extracted text before counting words.
+
+    This mirrors the cleaning order in src/extract.py.  The validation gate
+    should measure the same kind of text that will later be sent to the LLM:
+    article content first, references excluded.
+    """
+    match = VALIDATION_REFERENCES_PATTERN.search(text)
+    if not match:
+        return text
+    return text[:match.start()]
+
+
+def _word_count(text: str) -> int:
+    """
+    Count non-empty whitespace-delimited words.
+
+    This deliberately uses Python's normal split() instead of a complex NLP
+    tokenizer.  For this gate we only need a stable, understandable length
+    check: if the extracted article body has thousands of whitespace-separated
+    words, it is long enough to summarise.
+    """
+    return len([word for word in text.split() if word])
+
+
+def _estimate_token_count(text: str) -> int:
+    """
+    Estimate token count for diagnostics without adding tokenizer dependencies.
+
+    This intentionally does not gate acceptance.  Model-specific tokenizers vary,
+    while the word-count threshold is stable and reproducible.
+
+    The regex counts either word-like runs or punctuation marks.  That makes the
+    number closer to an LLM token count than plain word count, but it is still
+    only an estimate.
+    """
+    return len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
+
+
+def _validation_failure_result(
+    error_type: str,
+    reason: str,
+    *,
+    word_count: int = 0,
+    token_count: int | None = None,
+) -> PdfValidationResult:
+    """
+    Build a failed PdfValidationResult in one consistent format.
+
+    Many different problems can reject a PDF: unreadable file, no text, too few
+    words, password protection, and so on.  Returning one dataclass shape for
+    all failures keeps the logging and quarantine code simple.
+    """
+    return PdfValidationResult(
+        is_valid=False,
+        word_count=word_count,
+        reason=reason,
+        error_type=error_type,
+        token_count=token_count,
+    )
+
+
+def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
+    """
+    Validate that a PDF contains enough extractable text for LLM summarisation.
+
+    The hard gate is MIN_EXTRACTED_WORDS.  References are removed first so a
+    long bibliography cannot make a short article appear acceptable.
+
+    Step-by-step:
+      1. Skip immediately in DRY_RUN/testing modes.
+      2. Reject missing, zero-byte, or non-PDF files before pdfplumber sees them.
+      3. Open the PDF with pdfplumber and collect text from every page.
+      4. Remove references/bibliography from the combined text.
+      5. Normalize whitespace so line breaks and columns do not affect counts.
+      6. Reject empty text or text below MIN_EXTRACTED_WORDS.
+      7. Return a successful result with the word count and token estimate.
+    """
+    if _validation_is_disabled():
+        # In dry-run mode we return a fake pass instead of touching files.  The
+        # values are set near the configured targets so summaries remain
+        # understandable, but no real PDF has been inspected.
+        return PdfValidationResult(
+            is_valid=True,
+            word_count=TARGET_EXTRACTED_WORDS,
+            reason="validation_skipped",
+            token_count=MIN_EXTRACTED_TOKENS,
+        )
+
+    if not pdf_path.exists():
+        return _validation_failure_result("PDF_CORRUPT", "PDF file does not exist")
+
+    try:
+        # These cheap checks catch the most obvious bad files before importing
+        # or running pdfplumber.  That keeps errors easier to understand.
+        if pdf_path.stat().st_size == 0:
+            return _validation_failure_result("PDF_CORRUPT", "PDF file is zero bytes")
+        with open(pdf_path, "rb") as f:
+            if not f.read(4).startswith(b"%PDF"):
+                return _validation_failure_result(
+                    "PDF_CORRUPT",
+                    "File does not start with %PDF",
+                )
+    except OSError as exc:
+        return _validation_failure_result("PDF_CORRUPT", f"Could not read PDF: {exc}")
+
+    try:
+        import pdfplumber  # Imported lazily to match extract.py behavior.
+    except ImportError:
+        return _validation_failure_result(
+            "PDF_CORRUPT",
+            "pdfplumber is not installed",
+        )
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pages: list[str] = []
+            for page in pdf.pages:
+                # page.extract_text() can return None for scanned/image-only
+                # pages.  Treat None as an empty string so one bad page does not
+                # crash validation for the whole file.
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    pages.append(page_text)
+    except Exception as exc:
+        message = str(exc)
+        reason = f"pdfplumber could not extract text: {message}"
+        return _validation_failure_result("PDF_CORRUPT", reason)
+
+    # Join pages with newlines before reference removal.  The regex expects
+    # section headings to start on a line, so preserving page/line boundaries
+    # makes "References" easier to detect.
+    raw_text = "\n".join(pages)
+
+    # Remove references before counting.  This prevents a short paper with a
+    # long bibliography from passing the useful-text gate.
+    useful_text = _remove_references_for_validation(raw_text)
+
+    # Collapse repeated spaces/newlines/tabs into single spaces.  PDF extraction
+    # often creates strange spacing, especially in two-column articles, and this
+    # keeps the word count stable.
+    normalized_text = " ".join(useful_text.split())
+    words = _word_count(normalized_text)
+    tokens = _estimate_token_count(normalized_text) if normalized_text else 0
+
+    if words == 0:
+        # This catches scanned PDFs and image-only PDFs.  They may contain pages
+        # a human can read visually, but the LLM pipeline cannot use them unless
+        # OCR is added later.
+        return _validation_failure_result(
+            "NO_EXTRACTABLE_TEXT",
+            "PDF has no extractable text after references removal",
+            word_count=words,
+            token_count=tokens,
+        )
+
+    if words < MIN_EXTRACTED_WORDS:
+        # The PDF has some text, but not enough to be treated as a full paper.
+        # We still log the exact count so the threshold can be audited later.
+        return _validation_failure_result(
+            "TEXT_TOO_SHORT",
+            f"PDF extracted {words} words; minimum is {MIN_EXTRACTED_WORDS}",
+            word_count=words,
+            token_count=tokens,
+        )
+
+    return PdfValidationResult(
+        is_valid=True,
+        word_count=words,
+        reason="ok",
+        token_count=tokens,
+    )
+
+
+def validate_pdf_text(pdf_path: Path) -> tuple[bool, int, str]:
+    """
+    Public validation helper used by tests and manual checks.
+
+    Returns (is_valid, word_count, reason) as requested, while the downloader
+    uses the richer internal PdfValidationResult for structured logging.
+
+    This wrapper is intentionally simple.  If a researcher wants to check one
+    PDF manually from a Python shell, they do not need to understand the internal
+    dataclasses:
+
+        is_valid, words, reason = validate_pdf_text(Path("data/raw/example.pdf"))
+    """
+    result = _validate_pdf_text(pdf_path)
+    return result.is_valid, result.word_count, result.reason
+
+
+def _log_validation_failure(
+    doi: str,
+    result: PdfValidationResult,
+    *,
+    source: str,
+    pdf_path: Path | None = None,
+) -> None:
+    """
+    Write one structured validation failure entry to data/error_log.jsonl.
+
+    A validation failure is different from a network failure.  The downloader
+    successfully received a candidate PDF, but the file was not useful enough to
+    enter the corpus.  Logging it with stage="validation" makes later auditing
+    straightforward: you can count how many papers failed because no OA PDF was
+    found versus how many failed because the PDF was too short or unreadable.
+    """
+    global _VALIDATION_REJECTED_COUNT
+
+    _VALIDATION_REJECTED_COUNT += 1
+    ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Details stores machine-readable numbers, not just a sentence.  That makes
+    # it easy to analyze the JSONL file later with pandas or another script.
+    details = {
+        "word_count": result.word_count,
+        "threshold": MIN_EXTRACTED_WORDS,
+        "target_words": TARGET_EXTRACTED_WORDS,
+        "token_count": result.token_count,
+        "token_threshold": MIN_EXTRACTED_TOKENS,
+        "source": source,
+    }
+    if pdf_path is not None:
+        details["pdf_path"] = str(pdf_path)
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "doi": doi,
+        "stage": "validation",
+        "error_type": result.error_type or "PDF_CORRUPT",
+        "message": result.reason,
+        "details": details,
+    }
+    with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    print(
+        f"  [validation] Rejected {doi}: {result.reason} "
+        f"({result.word_count:,} words; minimum {MIN_EXTRACTED_WORDS:,})."
+    )
+
+
+def _validate_saved_pdf(path: Path, doi: str, *, source: str) -> PdfSaveResult:
+    """
+    Validate a PDF already present on disk and log text-quality failures.
+
+    This helper is used in two places:
+      1. Temporary files created by _save_pdf().
+      2. PDFs written directly by the external fulltext-downloader CLI.
+
+    Keeping both paths here ensures that every source follows the same rule.
+    """
+    validation = _validate_pdf_text(path)
+    if validation.is_valid:
+        return PdfSaveResult(ok=True, validation=validation)
+
+    _log_validation_failure(doi, validation, source=source, pdf_path=path)
+    return PdfSaveResult(
+        ok=False,
+        failure_code=validation.error_type or "PDF_CORRUPT",
+        message=validation.reason,
+        validation=validation,
+    )
+
+
+def _unique_quarantine_path(pdf_path: Path) -> Path:
+    """
+    Build a timestamped quarantine path without overwriting prior evidence.
+
+    The original filename is preserved after the timestamp so a researcher can
+    still map the file back to its DOI at a glance.
+
+    Example:
+        data/raw/10_2460_example.pdf
+        -> data/quarantine/20260505T164000Z_10_2460_example.pdf
+
+    If two files are quarantined in the same second with the same name, the
+    counter avoids collisions by adding _1_, _2_, etc.
+    """
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = QUARANTINE_DIR / f"{timestamp}_{pdf_path.name}"
+    counter = 1
+    while candidate.exists() or Path(f"{candidate}.json").exists():
+        candidate = QUARANTINE_DIR / f"{timestamp}_{counter}_{pdf_path.name}"
+        counter += 1
+    return candidate
+
+
+def _write_quarantine_sidecar(
+    quarantine_path: Path,
+    *,
+    doi: str,
+    result: PdfValidationResult,
+) -> None:
+    """
+    Write JSON metadata next to a quarantined PDF for auditability.
+
+    The sidecar answers the most important reproducibility questions without
+    reopening the PDF:
+      - Which DOI was this?
+      - How many words did pdfplumber extract?
+      - What threshold was applied?
+      - Why was it rejected?
+      - When was it moved?
+    """
+    metadata = {
+        "doi": doi,
+        "word_count": result.word_count,
+        "token_count": result.token_count,
+        "reason": result.reason,
+        "error_type": result.error_type,
+        "threshold": MIN_EXTRACTED_WORDS,
+        "target_words": TARGET_EXTRACTED_WORDS,
+        "date": datetime.now(timezone.utc).isoformat(),
+        "quarantined_pdf": str(quarantine_path),
+    }
+    sidecar_path = Path(f"{quarantine_path}.json")
+    with open(sidecar_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def _log_quarantine(
+    doi: str,
+    result: PdfValidationResult,
+    *,
+    original_path: Path,
+    quarantine_path: Path,
+) -> None:
+    """
+    Record that an existing raw PDF was moved out of the accepted corpus.
+
+    This writes to the same JSONL ledger as other pipeline failures.  The PDF
+    itself is preserved in data/quarantine/, and this log entry records where it
+    came from and where it went.
+    """
+    ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "doi": doi,
+        "stage": "validation",
+        "error_type": result.error_type or "PDF_CORRUPT",
+        "message": f"Existing PDF quarantined: {result.reason}",
+        "details": {
+            "word_count": result.word_count,
+            "threshold": MIN_EXTRACTED_WORDS,
+            "target_words": TARGET_EXTRACTED_WORDS,
+            "token_count": result.token_count,
+            "token_threshold": MIN_EXTRACTED_TOKENS,
+            "original_path": str(original_path),
+            "quarantine_path": str(quarantine_path),
+        },
+    }
+    with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _quarantine_pdf(
+    pdf_path: Path,
+    *,
+    doi: str,
+    result: PdfValidationResult,
+) -> Path:
+    """
+    Move a bad existing PDF to data/quarantine/ and preserve metadata.
+
+    Important: this does not permanently delete the file.  Quarantine means
+    "remove from the accepted corpus, but keep the evidence."  That is safer for
+    research reproducibility because you can inspect the rejected PDF later.
+    """
+    quarantine_path = _unique_quarantine_path(pdf_path)
+    shutil.move(str(pdf_path), str(quarantine_path))
+    _write_quarantine_sidecar(quarantine_path, doi=doi, result=result)
+    _log_quarantine(
+        doi,
+        result,
+        original_path=pdf_path,
+        quarantine_path=quarantine_path,
+    )
+    print(
+        f"[download] WARNING: quarantined {pdf_path.name} "
+        f"({result.word_count:,} words; minimum {MIN_EXTRACTED_WORDS:,}) -> "
+        f"{quarantine_path}"
+    )
+    return quarantine_path
+
+
+def revalidate_existing_pdfs(manifest_records: list[dict]) -> int:
+    """
+    Re-check existing data/raw PDFs before they count toward journal quotas.
+
+    Any existing manifest PDF that fails the same text gate as new downloads is
+    moved to data/quarantine/ so the DOI can be retried by the normal pipeline.
+
+    Why this must happen before counting quotas:
+        The balanced downloader stops each journal once it reaches 50 PDFs.  If
+        bad old PDFs were counted first, a journal could appear complete even
+        though some of its "PDFs" are too short for summarisation.  Revalidation
+        removes those files before journal_success is calculated.
+    """
+    global _VALIDATION_QUARANTINED_COUNT
+
+    if _validation_is_disabled():
+        return 0
+
+    quarantined = 0
+
+    # The manifest can be append-only, so the same DOI may appear more than
+    # once if collection was run repeatedly.  seen_dois prevents us from
+    # validating/quarantining the same file twice in one run.
+    seen_dois: set[str] = set()
+    for record in manifest_records:
+        doi = str(record.get("doi", "")).strip()
+        if not doi or doi in seen_dois:
+            continue
+        seen_dois.add(doi)
+
+        pdf_path = resolve_existing_pdf_path(RAW_DIR, record)
+        if pdf_path is None:
+            continue
+
+        result = _validate_pdf_text(pdf_path)
+        if result.is_valid:
+            continue
+
+        # Once the file is moved out of data/raw/, the normal idempotency check
+        # later in run_downloads() will no longer skip this DOI.  That is what
+        # makes the pipeline retry it.
+        _quarantine_pdf(pdf_path, doi=doi, result=result)
+        journal = str(record.get("journal", "")).strip()
+        if journal:
+            _VALIDATION_QUARANTINED_BY_JOURNAL[journal] = (
+                _VALIDATION_QUARANTINED_BY_JOURNAL.get(journal, 0) + 1
+            )
+        quarantined += 1
+
+    _VALIDATION_QUARANTINED_COUNT += quarantined
+    return quarantined
 
 
 # ---------------------------------------------------------------------------
 # Helper: write bytes to disk only if they look like a real PDF
 # ---------------------------------------------------------------------------
 
-def _save_pdf(content: bytes, path: Path) -> bool:
+def _save_pdf(
+    content: bytes,
+    path: Path,
+    *,
+    doi: str,
+    source: str,
+) -> PdfSaveResult:
     """
-    Save `content` to `path` only if it starts with the PDF magic bytes (%PDF).
+    Save `content` to `path` only if it is a real, useful PDF.
 
-    Returns True on success, False if the content is not a valid PDF.
+    The PDF bytes are written to a temporary file first.  Only after the temp
+    file passes extraction/word-count validation do we move it into data/raw/.
+    This prevents one-page or image-only PDFs from being counted as successful
+    corpus papers.
 
     WHY CHECK MAGIC BYTES?
         Some OA repositories and publishers return an HTML error page (with
@@ -715,14 +1307,55 @@ def _save_pdf(content: bytes, path: Path) -> bool:
         try and save nothing if the paper isn't freely accessible.
     """
     if not content.startswith(b"%PDF"):
-        return False
+        return PdfSaveResult(
+            ok=False,
+            failure_code="PDF_MAGIC_MISMATCH",
+            message="Response did not start with %PDF",
+        )
 
     if len(content) > MAX_PDF_BYTES:
-        return False
+        return PdfSaveResult(
+            ok=False,
+            failure_code="PDF_MAGIC_MISMATCH",
+            message="PDF exceeded maximum allowed size",
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-    return True
+    temp_path: Path | None = None
+    try:
+        # Write into the same folder as the final PDF.  On most filesystems,
+        # moving a file within the same folder is atomic: other code will either
+        # see no final file or a complete final file, never a half-written PDF.
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=".tmp.pdf",
+            prefix=f".{path.stem}.",
+            dir=path.parent,
+            delete=False,
+        ) as tmp:
+            tmp.write(content)
+            temp_path = Path(tmp.name)
+
+        # Validate the temporary file before it gets the official DOI-derived
+        # filename.  If validation fails, data/raw/ remains clean.
+        result = _validate_saved_pdf(temp_path, doi, source=source)
+        if not result.ok:
+            temp_path.unlink(missing_ok=True)
+            return result
+
+        # Only this line admits a PDF into the accepted raw corpus.
+        temp_path.replace(path)
+        return result
+    except OSError as exc:
+        # If writing or moving fails, clean up the temporary file so future runs
+        # do not mistake it for a real downloaded paper.
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return PdfSaveResult(
+            ok=False,
+            failure_code="PDF_CORRUPT",
+            message=f"Could not write validated PDF: {exc}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +1366,7 @@ def _download_pdf_url(
     url: str,
     dest_path: Path,
     *,
+    doi: str,
     session: requests.Session | None = None,
     source: str = "unknown",
     referer: str | None = None,
@@ -890,6 +1524,7 @@ def _download_pdf_url(
                 linked_attempt = _download_pdf_url(
                     html_pdf_url,
                     dest_path,
+                    doi=doi,
                     session=session,
                     source=f"{source}_html_pdf_link",
                     referer=resp.url,
@@ -910,17 +1545,18 @@ def _download_pdf_url(
                 body_start=body_preview,
             ))
 
-        saved = _save_pdf(resp.content, dest_path)
+        saved = _save_pdf(resp.content, dest_path, doi=doi, source=source)
 
         # If the download succeeded but _save_pdf rejected the content (not a real
-        # PDF), log that too so we know it was a content problem, not a network one.
-        if not saved:
-            _vprint(f"    -> Response received but failed %PDF magic-byte check — not a real PDF.")
+        # PDF or not enough extractable text), log that too so we know it was a
+        # content problem, not a network one.
+        if not saved.ok:
+            _vprint(f"    -> Response received but failed PDF validation: {saved.message}")
             return _remember_attempt(DownloadAttempt(
                 source=source,
                 url=url,
-                failure_code="PDF_MAGIC_MISMATCH",
-                message="Response did not start with %PDF",
+                failure_code=saved.failure_code,
+                message=saved.message,
                 http_status=resp.status_code,
                 content_type=content_type,
                 final_url=resp.url,
@@ -1017,7 +1653,7 @@ def _download_oa_package_bytes(url: str) -> tuple[bytes | None, str | None]:
         return None, str(exc)
 
 
-def _try_pubmed_oa_package(pmcid: str, dest_path: Path) -> bool:
+def _try_pubmed_oa_package(doi: str, pmcid: str, dest_path: Path) -> bool:
     """
     Download a PMC article through NCBI's official Open Access package service.
 
@@ -1116,7 +1752,12 @@ def _try_pubmed_oa_package(pmcid: str, dest_path: Path) -> bool:
         if fmt == "pdf":
             for package_url in package_urls:
                 _vprint(f"  [PMC OA] Trying direct PDF link: {package_url}")
-                attempt = _download_pdf_url(package_url, dest_path, source="pubmed_oa_pdf")
+                attempt = _download_pdf_url(
+                    package_url,
+                    dest_path,
+                    doi=doi,
+                    source="pubmed_oa_pdf",
+                )
                 if attempt.ok:
                     print(f"  [PMC OA] Saved {dest_path.name} from OA PDF link")
                     return True
@@ -1183,7 +1824,13 @@ def _try_pubmed_oa_package(pmcid: str, dest_path: Path) -> bool:
             ))
             continue
 
-        if _save_pdf(pdf_bytes, dest_path):
+        saved = _save_pdf(
+            pdf_bytes,
+            dest_path,
+            doi=doi,
+            source="pubmed_oa_package",
+        )
+        if saved.ok:
             print(f"  [PMC OA] Saved {dest_path.name} from OA package")
             _remember_attempt(DownloadAttempt(
                 source="pubmed_oa_package",
@@ -1197,8 +1844,8 @@ def _try_pubmed_oa_package(pmcid: str, dest_path: Path) -> bool:
         _remember_attempt(DownloadAttempt(
             source="pubmed_oa_package",
             url=package_url_used,
-            failure_code="PDF_MAGIC_MISMATCH",
-            message="PDF extracted from OA package failed %PDF validation",
+            failure_code=saved.failure_code,
+            message=saved.message or "PDF extracted from OA package failed validation",
             final_url=package_url_used,
             body_start=_safe_body_preview(pdf_bytes),
         ))
@@ -1259,8 +1906,21 @@ def _try_fulltext_downloader(doi: str, dest_path: Path) -> bool:
         if result.returncode == 0 and dest_path.exists():
             content = dest_path.read_bytes()
             if content.startswith(b"%PDF") and len(content) <= MAX_PDF_BYTES:
-                print(f"  [fulltext-downloader] Saved {dest_path.name}")
-                return True
+                save_result = _validate_saved_pdf(
+                    dest_path,
+                    doi,
+                    source="fulltext_downloader",
+                )
+                if save_result.ok:
+                    print(f"  [fulltext-downloader] Saved {dest_path.name}")
+                    return True
+
+                _vprint(
+                    f"  [fulltext-downloader] Created {dest_path.name}, "
+                    f"but validation failed: {save_result.message}; deleting it."
+                )
+                dest_path.unlink(missing_ok=True)
+                return False
 
             _vprint(
                 f"  [fulltext-downloader] Created {dest_path.name}, "
@@ -1358,6 +2018,29 @@ def _try_unpaywall(doi: str, dest_path: Path) -> bool:
         ))
         return False
 
+    def _location_priority(loc: dict) -> tuple[int, int, int]:
+        candidate_url = str(loc.get("url_for_pdf") or loc.get("url") or "").lower()
+        has_direct_pdf = bool(loc.get("url_for_pdf"))
+        is_repository = any(
+            host in candidate_url
+            for host in (
+                "pmc.ncbi.nlm.nih.gov",
+                "ncbi.nlm.nih.gov",
+                "doaj.org",
+                "biblio.",
+                "repository",
+                "archive",
+            )
+        )
+        is_doi_landing = "doi.org/" in candidate_url
+        return (
+            0 if has_direct_pdf else 1,
+            0 if is_repository else 1,
+            1 if is_doi_landing else 0,
+        )
+
+    all_locs.sort(key=_location_priority)
+
     for i, loc in enumerate(all_locs, 1):
         # url_for_pdf is a direct link to the PDF file.  url may be a landing
         # page — we prefer url_for_pdf but fall back to url if that's all we have.
@@ -1373,7 +2056,7 @@ def _try_unpaywall(doi: str, dest_path: Path) -> bool:
             continue
 
         _vprint(f"  [Unpaywall] Location {i}/{len(all_locs)}: {pdf_url}")
-        attempt = _download_pdf_url(pdf_url, dest_path, source="unpaywall")
+        attempt = _download_pdf_url(pdf_url, dest_path, doi=doi, source="unpaywall")
         if attempt.ok:
             license_str = (loc.get("license") or "OA").lower()
             print(f"  [Unpaywall] Saved {dest_path.name} (license: {license_str})")
@@ -1445,7 +2128,12 @@ def _try_semantic_scholar(doi: str, dest_path: Path) -> bool:
         return False
 
     _vprint(f"  [S2] Trying PDF URL: {pdf_url}")
-    attempt = _download_pdf_url(pdf_url, dest_path, source="semantic_scholar")
+    attempt = _download_pdf_url(
+        pdf_url,
+        dest_path,
+        doi=doi,
+        source="semantic_scholar",
+    )
     if attempt.ok:
         print(f"  [Semantic Scholar] Saved {dest_path.name}")
         return True
@@ -1520,14 +2208,19 @@ def _try_pubmed_central(doi: str, dest_path: Path) -> bool:
     pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmcid}/pdf/"
     _vprint(f"  [PMC] Trying: {pdf_url}")
 
-    attempt = _download_pdf_url(pdf_url, dest_path, source="pubmed_central")
+    attempt = _download_pdf_url(
+        pdf_url,
+        dest_path,
+        doi=doi,
+        source="pubmed_central",
+    )
     if attempt.ok:
         print(f"  [PubMed Central] Saved {dest_path.name} (PMC{pmcid})")
         return True
 
     _vprint(f"    -> Did not yield valid PDF bytes for PMC{pmcid}.")
     _vprint("  [PMC OA] Direct PDF did not work; trying official OA package service.")
-    if _try_pubmed_oa_package(pmcid, dest_path):
+    if _try_pubmed_oa_package(doi, pmcid, dest_path):
         return True
 
     return False
@@ -1572,7 +2265,12 @@ def _try_publisher_pdf(doi: str, dest_path: Path) -> bool:
         for template in templates:
             url = template.format(doi=doi)
             _vprint(f"  [publisher] Trying: {url}")
-            attempt = _download_pdf_url(url, dest_path, source="publisher_direct")
+            attempt = _download_pdf_url(
+                url,
+                dest_path,
+                doi=doi,
+                source="publisher_direct",
+            )
             if attempt.ok:
                 print(f"  [publisher] Saved {dest_path.name} ({url})")
                 return True
@@ -1745,6 +2443,7 @@ def _try_scrape_article_page(doi: str, dest_path: Path) -> bool:
     attempt = _download_pdf_url(
         pdf_url,
         dest_path,
+        doi=doi,
         session=session,
         source="scrape_article_page",
         referer=page_resp.url,
@@ -1761,7 +2460,7 @@ def _try_scrape_article_page(doi: str, dest_path: Path) -> bool:
 # Core single-paper download function
 # ---------------------------------------------------------------------------
 
-def download_paper(doi: str) -> bool:
+def download_paper(record_or_doi: dict | str) -> bool:
     """
     Attempt to download the OA PDF for a single paper through the fallback chain.
 
@@ -1775,42 +2474,50 @@ def download_paper(doi: str) -> bool:
     Returns True if a PDF is available in data/raw/ at the end of the call,
     False otherwise.
     """
+    record = {"doi": record_or_doi} if isinstance(record_or_doi, str) else record_or_doi
+    doi = str(record.get("doi", "")).strip()
+    if not doi:
+        return False
+
     _CURRENT_DOWNLOAD_ATTEMPTS.clear()
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    dest_path = RAW_DIR / _doi_to_filename(doi)
+    dest_path = preferred_pdf_path(RAW_DIR, record)
 
     # Idempotency check: skip papers already downloaded in a previous run.
     # This makes the download step safe to restart after a crash.
-    if dest_path.exists():
-        _vprint(f"  [download] Already exists, skipping: {dest_path.name}")
+    existing_path = resolve_existing_pdf_path(RAW_DIR, record)
+    if existing_path is not None:
+        _vprint(f"  [download] Already exists, skipping: {existing_path.name}")
         return True
 
     _vprint(f"  [download] Starting fallback chain for DOI: {doi}")
 
-    # Fallback 1: fulltext-article-downloader CLI
-    # Best single-step option when installed — queries many OA repositories.
-    if _try_fulltext_downloader(doi, dest_path):
+    # Fallback 1: Unpaywall
+    # Covers ~50% of recent articles; now tries ALL oa_locations so one broken
+    # URL doesn't block access to other valid copies of the same paper.  Direct
+    # PDF/repository URLs are prioritized ahead of DOI landing pages.
+    if _try_unpaywall(doi, dest_path):
         return True
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
-    # Fallback 2: Unpaywall
-    # Covers ~50% of recent articles; now tries ALL oa_locations so one broken
-    # URL doesn't block access to other valid copies of the same paper.
-    if _try_unpaywall(doi, dest_path):
+    # Fallback 2: PubMed Central
+    # Many vet journal papers are deposited in PMC under NIH/UKRI OA mandates.
+    # Reliable once found via the PMCID lookup step.
+    if _try_pubmed_central(doi, dest_path):
         return True
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
     # Fallback 3: Semantic Scholar
     # Good coverage for biomedical content; weaker for purely veterinary journals
-    # but still catches many PMC-indexed papers.
+    # but still catches many repository-indexed papers.
     if _try_semantic_scholar(doi, dest_path):
         return True
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
-    # Fallback 4: PubMed Central
-    # Many vet journal papers are deposited in PMC under NIH/UKRI OA mandates.
-    # Reliable once found via the PMCID lookup step.
-    if _try_pubmed_central(doi, dest_path):
+    # Fallback 4: fulltext-article-downloader CLI
+    # Useful when installed, but it can spend time on the same metadata services,
+    # so we try our direct repository/PMC paths first.
+    if _try_fulltext_downloader(doi, dest_path):
         return True
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
@@ -1902,6 +2609,16 @@ def _load_manifest_by_journal() -> dict[str, list[dict]]:
             else:
                 _vprint(f"[download] Unknown journal '{journal}' on line {line_num}, skipping.")
 
+    for queue in journal_queues.values():
+        queue.sort(
+            key=lambda record: (
+                int(record.get("candidate_quality_score") or 0),
+                int(bool(record.get("has_direct_pdf_url"))),
+                int(bool(record.get("is_oa"))),
+            ),
+            reverse=True,
+        )
+
     print("[download] Manifest loaded.  Per-journal candidate counts:")
     for journal, queue in journal_queues.items():
         target = JOURNAL_TARGETS.get(journal, 50)
@@ -1940,6 +2657,16 @@ def run_downloads() -> tuple[int, int]:
         (total_success, total_shortfall) — total PDFs acquired and total
         papers that remain unavailable as OA.
     """
+    global _VALIDATION_REJECTED_COUNT, _VALIDATION_QUARANTINED_COUNT
+
+    # These counters are module-level because validation can happen deep inside
+    # fallback helper functions.  Reset them at the beginning of each top-level
+    # run so the final summary describes only this run, not previous imports or
+    # earlier tests in the same Python process.
+    _VALIDATION_REJECTED_COUNT = 0
+    _VALIDATION_QUARANTINED_COUNT = 0
+    _VALIDATION_QUARANTINED_BY_JOURNAL.clear()
+
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
 
     if not MANIFEST_PATH.exists():
@@ -1948,15 +2675,34 @@ def run_downloads() -> tuple[int, int]:
 
     journal_queues = _load_manifest_by_journal()
 
+    # Flatten the per-journal queues only for revalidation.  The main download
+    # loop still uses journal_queues so the 50-per-journal stop-loss behavior is
+    # unchanged.
+    manifest_records = [
+        record
+        for queue in journal_queues.values()
+        for record in queue
+    ]
+
     total_target = sum(JOURNAL_TARGETS.values())
 
-    # Pre-count PDFs already in data/raw/ — these count toward the quota even
-    # in dry-run mode, so a re-run after a partial live run shows correct counts.
+    quarantined = revalidate_existing_pdfs(manifest_records)
+    if quarantined:
+        print(
+            f"[download] Revalidated existing PDFs: "
+            f"{quarantined} quarantined and will be retried."
+        )
+
+    # Pre-count PDFs already in data/raw/.
+    #
+    # This happens after revalidation.  That ordering is critical: quarantined
+    # PDFs have been moved out of data/raw/, so they do not count toward the 50
+    # PDF quota and their DOI can be retried below.
     journal_success: dict[str, int] = {}
     for journal, queue in journal_queues.items():
         journal_success[journal] = sum(
             1 for r in queue
-            if (RAW_DIR / _doi_to_filename(r["doi"])).exists()
+            if resolve_existing_pdf_path(RAW_DIR, r) is not None
         )
 
     initial_success = sum(journal_success.values())
@@ -2032,7 +2778,11 @@ def run_downloads() -> tuple[int, int]:
 
         for journal, queue in journal_queues.items():
             target        = JOURNAL_TARGETS.get(journal, 50)
-            failure_count = 0
+
+            # Quarantined PDFs are treated as failed attempts for the journal.
+            # That keeps the fail-cap honest: repeatedly bad PDFs still count as
+            # evidence that this journal may need manual supplementation.
+            failure_count = _VALIDATION_QUARANTINED_BY_JOURNAL.get(journal, 0)
 
             if journal_success[journal] >= target:
                 _vprint(f"[download] {journal}: already at quota ({target} PDFs), skipping.")
@@ -2060,10 +2810,13 @@ def run_downloads() -> tuple[int, int]:
                     break
 
                 # Idempotency: already counted in journal_success above.
-                if (RAW_DIR / _doi_to_filename(doi)).exists():
+                #
+                # Because revalidation already ran, an existing file here means
+                # "valid enough to keep", not just "some PDF-shaped file exists".
+                if resolve_existing_pdf_path(RAW_DIR, record) is not None:
                     continue
 
-                ok = download_paper(doi)
+                ok = download_paper(record)
                 if ok:
                     journal_success[journal] += 1
                     pbar.update(1)
@@ -2083,7 +2836,7 @@ def run_downloads() -> tuple[int, int]:
                 # Collect un-downloaded records for the CSV report.
                 downloaded_dois = {
                     r["doi"] for r in queue
-                    if (RAW_DIR / _doi_to_filename(r["doi"])).exists()
+                    if resolve_existing_pdf_path(RAW_DIR, r) is not None
                 }
                 for record in queue:
                     if record["doi"] not in downloaded_dois:
@@ -2098,6 +2851,11 @@ def run_downloads() -> tuple[int, int]:
 
     print(f"\n[download] Complete.")
     print(f"  Total PDFs acquired : {total_success} / {total_target}")
+    print(
+        f"  Validation summary  : Valid PDFs: {total_success}, "
+        f"Rejected: {_VALIDATION_REJECTED_COUNT}, "
+        f"Quarantined: {_VALIDATION_QUARANTINED_COUNT}"
+    )
 
     if total_shortfall > 0:
         print(f"  OA shortfall       : {total_shortfall} papers unavailable as OA")

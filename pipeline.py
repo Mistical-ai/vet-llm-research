@@ -66,6 +66,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from collect import JOURNAL_TARGETS   # noqa: E402 (after sys.path insert)
+from file_paths import legacy_doi_filename, resolve_existing_pdf_path  # noqa: E402
 from utils import log_error           # noqa: E402
 
 load_dotenv()
@@ -92,17 +93,9 @@ OA_THRESHOLD: int = 200
 
 def _doi_to_filename(doi: str) -> str:
     """
-    Convert a DOI to the same safe filename as download.py uses.
-
-    WHY DUPLICATE (not import from download.py)?
-        Importing download.py would transitively import supplement.py and
-        collect.py, executing all their module-level code including load_dotenv
-        calls and constant definitions.  For a thin orchestration script that
-        only needs one utility function, a local copy is less surprising and
-        avoids side effects at import time.
+    Return the legacy DOI-only filename for backward compatibility.
     """
-    safe = doi.replace("/", "_").replace(":", "_").replace(".", "_")
-    return f"{safe}.pdf"
+    return legacy_doi_filename(doi)
 
 
 # ---------------------------------------------------------------------------
@@ -187,12 +180,12 @@ def load_corpus() -> dict:
                     #   contain entries added before the PDF was copied, or with
                     #   a typo in the DOI.  Counting an entry without a PDF would
                     #   silently inflate the corpus size metric.
-                    pdf_path = RAW_DIR / _doi_to_filename(doi)
-                    if not pdf_path.exists():
+                    pdf_path = resolve_existing_pdf_path(RAW_DIR, record)
+                    if pdf_path is None:
                         invalid_manual.append({
                             "doi":    doi,
                             "title":  record.get("title", ""),
-                            "reason": f"PDF not found at {pdf_path}",
+                            "reason": "PDF not found in data/raw/",
                         })
                         continue
 
@@ -228,7 +221,7 @@ def load_corpus() -> dict:
 
     for record in records:
         doi = record["doi"]
-        if (RAW_DIR / _doi_to_filename(doi)).exists():
+        if resolve_existing_pdf_path(RAW_DIR, record) is not None:
             downloaded.append(doi)
         else:
             missing_pdfs.append(doi)
@@ -288,7 +281,7 @@ def report_corpus_status(corpus: dict) -> None:
         if j not in journal_counts:
             journal_counts[j] = {"total": 0, "have_pdf": 0, "source": set()}
         journal_counts[j]["total"] += 1
-        if (RAW_DIR / _doi_to_filename(record["doi"])).exists():
+        if resolve_existing_pdf_path(RAW_DIR, record) is not None:
             journal_counts[j]["have_pdf"] += 1
         journal_counts[j]["source"].add(record.get("_source", "oa"))
 
