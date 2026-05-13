@@ -97,10 +97,13 @@ pipeline has been significantly hardened with a production-safe OA downloader.
   example, it might be a one-page abstract, a correction notice, an image-only
   scan, or a publisher placeholder page.
 - After the basic `%PDF` file-format check, `src/download.py` opens the PDF
-  with `pdfplumber`, extracts text from every page, removes anything after a
-  References/Bibliography heading, and counts words.
-- The hard acceptance rule is `MIN_EXTRACTED_WORDS=3000` by default. A PDF with
-  fewer words is rejected and does not count toward the 50-paper journal quota.
+  with `pdfplumber`, counts pages (`MIN_PAGES`, default `3`; reject with
+  `TOO_FEW_PAGES` if shorter), extracts text from every page, removes anything after a
+  References/Bibliography heading, then checks IMRAD-style headings
+  (`MIN_SECTIONS`, default `3` matches among introduction / methods /
+  materials-and-methods / results / discussion; reject with `MISSING_SECTIONS`).
+- The final acceptance rule remains `MIN_EXTRACTED_WORDS=3000` by default. A PDF with
+  fewer useful words after that pipeline is rejected and does not count toward the 50-paper journal quota.
 - `TARGET_EXTRACTED_WORDS=4500` documents the desired paper length used for
   budgeting, while `MIN_EXTRACTED_TOKENS=4000` is kept as a diagnostic estimate.
   The pipeline does not reject by token count because exact token counts depend
@@ -111,7 +114,7 @@ pipeline has been significantly hardened with a production-safe OA downloader.
 
 **The pipeline can now:**
 
-- collect up to 200 DOI candidates per journal from CrossRef (stratified across 2023-2025)
+- collect up to 2000 DOI candidates per journal from CrossRef (stratified across 2023-2025)
 - skip obvious non-paper records such as corrections, errata, issue information, and abstract programs
 - optionally annotate candidates with Unpaywall OA metadata before downloading
 - infer covariates: species, study design, clinical topic
@@ -333,7 +336,7 @@ If a test fails, read the message in the terminal before continuing.
 
 ### Step 8: Collect The Paper List
 
-This creates `data/manifest.jsonl` with up to 200 OA candidates per journal.
+This creates `data/manifest.jsonl` with up to `COLLECT_CANDIDATES_PER_JOURNAL` OA candidates per journal (default **2000**).
 Live collection queries 2023, 2024, and 2025 separately by default so the
 manifest does not fill only from the newest CrossRef results. It also skips
 obvious non-paper records such as corrections, errata, issue information, and
@@ -462,25 +465,33 @@ The downloader tries **six sources** for each DOI, in order:
 5. Publisher-direct PDF URL — Wiley, AVMA, SAGE heuristics
 6. Article-page HTML scraping — `citation_pdf_url` meta tag or `<a>` links
 
-Every downloaded file goes through two validation layers before it is counted:
+Every downloaded file goes through chained validation layers before it is counted:
 
 1. **Format validation** checks that the response really starts with `%PDF`.
    This rejects HTML bot-challenge pages, login walls, and empty responses.
-2. **Text validation** writes the candidate PDF to a temporary file, opens it
-   with `pdfplumber`, extracts text from every page, removes the References
-   section, and requires at least `MIN_EXTRACTED_WORDS` useful words.
+2. **Page-count validation** opens the temporary PDF with `pdfplumber` and
+   rejects PDFs shorter than `MIN_PAGES` (`TOO_FEW_PAGES`); extraction is skipped
+   for failures at this step.
+3. **Text extraction** reads every page, then strips the References/Bibliography
+   tail using the same rules as downstream extraction.
+4. **Section-heading validation** requires at least `MIN_SECTIONS` distinct hits
+   among canonical headings (introduction, methods/materials-and-methods,
+   results, discussion). Failures log `MISSING_SECTIONS`.
+5. **Word-count validation** applies the final gate: at least `MIN_EXTRACTED_WORDS`
+   useful words (`TEXT_TOO_SHORT` / related types if extraction failed earlier).
 
-This matters because a one-page abstract can be a real PDF but still not be a
-full paper. Only PDFs that pass both layers are moved into `data/raw/` and
+Short PDFs or front-matter stubs can satisfy `%PDF` but still fail IMRAD-ish
+signals or length. Only PDFs that pass the chain are moved into `data/raw/` and
 counted toward the 50-per-journal quota.
 
 If validation fails during a new download, the temporary file is deleted and the
 pipeline tries the next legal OA source for that DOI. The failure is recorded in
 `data/error_log.jsonl` with `"stage": "validation"` and an `error_type` such as
-`TEXT_TOO_SHORT`, `NO_EXTRACTABLE_TEXT`, or `PDF_CORRUPT`.
+`TOO_FEW_PAGES`, `MISSING_SECTIONS`, `TEXT_TOO_SHORT`, `NO_EXTRACTABLE_TEXT`, or
+`PDF_CORRUPT`.
 
 At the start of a live download run, the pipeline also revalidates PDFs that
-already exist in `data/raw/`. If an old PDF is now found to be too short, it is
+already exist in `data/raw/`. If an older PDF now fails any validation gate, it is
 moved to `data/quarantine/` with a timestamped filename and a matching `.json`
 metadata file. It is not permanently deleted. After quarantine, that DOI is no
 longer counted as already downloaded, so the normal fallback chain can try to
@@ -496,7 +507,7 @@ Optional settings in `.env` that affect live runs:
 
 ```text
 DOWNLOAD_VERBOSE=false           # set to true to print per-URL debug info
-COLLECT_CANDIDATES_PER_JOURNAL=200  # DOI candidates to collect per journal
+COLLECT_CANDIDATES_PER_JOURNAL=2000  # DOI candidates to collect per journal
 COLLECT_YEAR_BALANCED=true       # collect across 2023, 2024, and 2025
 COLLECT_YEARS=2023,2024,2025     # publication years to query separately
 COLLECT_PREFLIGHT_UNPAYWALL=false # add OA metadata during collection
@@ -508,6 +519,8 @@ PUBLISHER_DELAY_MIN_SECONDS=10   # random jitter floor before publisher URLs
 PUBLISHER_DELAY_MAX_SECONDS=25   # random jitter ceiling before publisher URLs
 RATE_LIMIT_BACKOFF_SECONDS=60    # fallback sleep on HTTP 429 with no Retry-After
 MAX_FAILED_PER_JOURNAL=250       # stop a journal after this many OA failures
+MIN_PAGES=3                      # reject PDFs shorter than this before extraction
+MIN_SECTIONS=3                   # min distinct heading matches among IMRAD-ish set
 MIN_EXTRACTED_WORDS=3000         # hard minimum useful words after references
 TARGET_EXTRACTED_WORDS=4500      # planning target for paper length/budget
 MIN_EXTRACTED_TOKENS=4000        # diagnostic token estimate, not hard gate

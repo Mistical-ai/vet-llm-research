@@ -32,14 +32,14 @@ HOW WE VERIFY A PDF IS USEFUL FOR LLM SUMMARISATION:
     scanned PDF, or a publisher placeholder.  Those files pass the %PDF check
     but do not give the LLM enough usable article text.
 
-    So the downloader now applies a second gate before a PDF is accepted:
+    After the `%PDF` check the downloader validates usefulness in order:
       1. Write the candidate bytes to a temporary PDF file.
-      2. Open that temporary file with pdfplumber, the same extractor used by
-         src/extract.py.
-      3. Extract text from every page.
+      2. Open it with pdfplumber and count pages; reject if fewer than MIN_PAGES.
+      3. Extract text from every page (same extractor as ``src/extract.py``).
       4. Remove anything after a References/Bibliography heading.
-      5. Count words with a simple whitespace split.
-      6. Accept only if the useful pre-references text has at least
+      5. Require section-heading signals (introduction, methods/materials-and-methods,
+         results, discussion): at least MIN_SECTIONS distinct matches.
+      6. Count words; accept only if the useful pre-references text has at least
          MIN_EXTRACTED_WORDS words (default: 3000).
 
     This makes "download success" mean "we have a real PDF with enough text for
@@ -101,7 +101,7 @@ behind login forms.  The magic byte check ensures we only keep real PDFs.
 BALANCED CORPUS DOWNLOAD LOGIC
 ---------------------------------
 This step enforces per-journal PDF quotas (50 PDFs per journal, 250 total)
-through three mechanisms:
+through four mechanisms:
 
   1. STOP-LOSS: Once a journal reaches its 50-PDF quota, remaining candidates
      for that journal are skipped.  This prevents over-downloading from high-OA
@@ -109,10 +109,16 @@ through three mechanisms:
 
   2. MAX_FAILED_PER_JOURNAL: If a journal exhausts its failure budget before
      reaching 50 PDFs, it is marked for manual supplementation rather than
-     burning through all candidates pointlessly.  Default = 250 (set via
-     .env to override), which effectively lets a 200-candidate pool be exhausted.
+     burning through all candidates pointlessly.  Default = 300 (set via
+     .env to override).
 
-  3. SHORTFALL LOGGING: If any journal ends below 50 PDFs, a structured entry
+  3. MANUAL_ONLY_THRESHOLD / CLOUDFLARE: Persistent HTTP 403 / CDN blocks are
+     counted per journal (including entries replayed from data/error_log.jsonl).
+     Once the count reaches MANUAL_ONLY_THRESHOLD, remaining manifest rows for
+     that journal skip automated downloads and are recorded as CLOUDFLARE_BLOCKED
+     in data/missing_papers.csv.
+
+  4. SHORTFALL LOGGING: If any journal ends below 50 PDFs, a structured entry
      is written to data/error_log.jsonl (stage="insufficient_oa") and
      data/missing_papers.csv is generated for manual supplementation.
 
@@ -200,6 +206,7 @@ import xml.etree.ElementTree as ET
 
 # dataclass reduces boilerplate for small data containers.
 # DownloadAttempt is a dataclass that stores what happened during one URL try.
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 
 # datetime and timezone create precise UTC timestamps.
@@ -297,6 +304,12 @@ TARGET_EXTRACTED_WORDS: int = int(os.getenv("TARGET_EXTRACTED_WORDS", "4500"))
 # to reject papers.  The word threshold above remains the actual rule.
 MIN_EXTRACTED_TOKENS: int = int(os.getenv("MIN_EXTRACTED_TOKENS", "4000"))
 
+# Reject flyers, letters, or one-page stubs before extracting full text.
+MIN_PAGES: int = int(os.getenv("MIN_PAGES", "3"))
+
+# Require common article section headings before the word-count gate.
+MIN_SECTIONS: int = int(os.getenv("MIN_SECTIONS", "3"))
+
 # Escape hatch for unit tests that need to exercise network/save plumbing
 # without building real PDFs.
 #
@@ -322,10 +335,14 @@ VERBOSE: bool = os.getenv("DOWNLOAD_VERBOSE", "false").lower() == "true"
 # paywalled would burn through the full queue before surfacing a shortfall.
 # Capping failures lets us detect a low-OA journal and pivot to manual
 # supplementation if needed.
-# Default 250 = 1.25 x the 200-candidate pool, effectively meaning "exhaust the
-# pool" unless you set a tighter value (e.g. 100 to save time at the cost of
-# potentially missing a few late-pool OA papers).
-MAX_FAILED_PER_JOURNAL: int = int(os.getenv("MAX_FAILED_PER_JOURNAL", "250"))
+# Default 300 caps worst-case runtime when many candidates fail while still
+# allowing a meaningful attempt before manual supplementation.
+MAX_FAILED_PER_JOURNAL: int = int(os.getenv("MAX_FAILED_PER_JOURNAL", "300"))
+
+# Per-journal tally of HTTP 403 / CDN (Cloudflare-style) blocks.  Loaded from
+# data/error_log.jsonl at startup and incremented live.  When >= threshold,
+# automated downloads for that journal stop and candidates go to missing_papers.csv.
+MANUAL_ONLY_THRESHOLD: int = int(os.getenv("MANUAL_ONLY_THRESHOLD", "10"))
 
 # Pause between each fallback attempt for a single DOI.
 # WHY A DELAY?
@@ -486,6 +503,8 @@ class PdfValidationResult:
     reason: str
     error_type: str | None = None
     token_count: int | None = None
+    page_count: int | None = None
+    section_headers_found: list[str] | None = None
 
 
 @dataclass
@@ -550,6 +569,84 @@ def _best_failure_attempt() -> DownloadAttempt | None:
         _CURRENT_DOWNLOAD_ATTEMPTS,
         key=lambda a: priority.get(a.failure_code or "", 99),
     )
+
+
+def _attempt_indicates_cloudflare_or_403(attempt: DownloadAttempt | None) -> bool:
+    """Return True if this attempt resembles HTTP 403 or a Cloudflare / CDN bot wall."""
+    if attempt is None:
+        return False
+    if attempt.http_status == 403:
+        return True
+    if attempt.failure_code == "HTTP_403":
+        return True
+    blob = " ".join(
+        [
+            attempt.body_start or "",
+            attempt.message or "",
+            attempt.final_url or "",
+        ]
+    ).lower()
+    if "cloudflare" in blob or "cf-ray" in blob:
+        return True
+    if "just a moment" in blob:
+        return True
+    return False
+
+
+def _scan_error_log_for_download_blocks(
+    doi_to_journal: dict[str, str],
+) -> tuple[dict[str, int], set[str]]:
+    """
+    Replay data/error_log.jsonl to seed Cloudflare / HTTP 403 tallies.
+
+    Returns
+    -------
+    cloudflare_failures_by_journal
+        Count of logged ``download`` failures with HTTP status 403 per journal.
+    dois_prior_403
+        DOIs that already have at least one logged HTTP 403 download failure.
+        Automated download is skipped for these rows on this run.
+    """
+    tallies: defaultdict[str, int] = defaultdict(int)
+    dois_prior_403: set[str] = set()
+    if not ERROR_LOG_PATH.exists():
+        return dict(tallies), dois_prior_403
+
+    try:
+        with open(ERROR_LOG_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("stage") != "download":
+                    continue
+                doi = str(entry.get("doi", "")).strip()
+                if not doi or doi == "N/A":
+                    continue
+
+                is403 = entry.get("failure_code") == "HTTP_403"
+                hs = entry.get("http_status")
+                if not is403 and hs is not None:
+                    try:
+                        is403 = int(hs) == 403
+                    except (TypeError, ValueError):
+                        pass
+
+                if not is403:
+                    continue
+
+                dois_prior_403.add(doi)
+                journal_key = doi_to_journal.get(doi)
+                if journal_key:
+                    tallies[journal_key] += 1
+    except OSError:
+        pass
+
+    return dict(tallies), dois_prior_403
 
 
 def _retry_after_seconds(value: str | None) -> float | None:
@@ -815,6 +912,51 @@ VALIDATION_REFERENCES_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# IMRAD-ish headings (after References strip).  "Materials and methods" is
+# counted as its own label; standalone "methods" only counts when the long
+# phrase is absent so embedded "methods" is not double-counted.
+_SECTION_HEADER_GROUPS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("introduction", re.compile(r"\bintroduction\b", re.I)),
+    (
+        "materials and methods",
+        re.compile(r"\bmaterials\s+and\s+methods\b", re.I),
+    ),
+    ("methods", re.compile(r"\bmethods\b", re.I)),
+    ("results", re.compile(r"\bresults\b", re.I)),
+    ("discussion", re.compile(r"\bdiscussion\b", re.I)),
+)
+
+
+def _detect_article_section_headers(text: str) -> list[str]:
+    """
+    Return which canonical section headings appear in ``text``.
+
+    Caller compares ``len(found) >= MIN_SECTIONS``.
+    """
+    _, intro_p = _SECTION_HEADER_GROUPS[0]
+    _, mam_p = _SECTION_HEADER_GROUPS[1]
+    _, meth_p = _SECTION_HEADER_GROUPS[2]
+    _, res_p = _SECTION_HEADER_GROUPS[3]
+    _, disc_p = _SECTION_HEADER_GROUPS[4]
+
+    found: list[str] = []
+
+    if intro_p.search(text):
+        found.append("introduction")
+
+    if mam_p.search(text):
+        found.append("materials and methods")
+    elif meth_p.search(text):
+        found.append("methods")
+
+    if res_p.search(text):
+        found.append("results")
+
+    if disc_p.search(text):
+        found.append("discussion")
+
+    return found
+
 
 def _validation_is_disabled() -> bool:
     """
@@ -879,6 +1021,8 @@ def _validation_failure_result(
     *,
     word_count: int = 0,
     token_count: int | None = None,
+    page_count: int | None = None,
+    section_headers_found: list[str] | None = None,
 ) -> PdfValidationResult:
     """
     Build a failed PdfValidationResult in one consistent format.
@@ -893,6 +1037,8 @@ def _validation_failure_result(
         reason=reason,
         error_type=error_type,
         token_count=token_count,
+        page_count=page_count,
+        section_headers_found=section_headers_found,
     )
 
 
@@ -900,17 +1046,20 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
     """
     Validate that a PDF contains enough extractable text for LLM summarisation.
 
-    The hard gate is MIN_EXTRACTED_WORDS.  References are removed first so a
-    long bibliography cannot make a short article appear acceptable.
+    Order: ``%PDF`` magic check → minimum page count → extract text with
+    pdfplumber → references strip → IMRAD-ish section headings → word count /
+    MIN_EXTRACTED_WORDS hard gate → token diagnostic.
 
-    Step-by-step:
+    The hard acceptance rule remains ``MIN_EXTRACTED_WORDS`` after references are
+    removed so a short article cannot hide behind a long bibliography.
+
+    Steps:
       1. Skip immediately in DRY_RUN/testing modes.
-      2. Reject missing, zero-byte, or non-PDF files before pdfplumber sees them.
-      3. Open the PDF with pdfplumber and collect text from every page.
-      4. Remove references/bibliography from the combined text.
-      5. Normalize whitespace so line breaks and columns do not affect counts.
-      6. Reject empty text or text below MIN_EXTRACTED_WORDS.
-      7. Return a successful result with the word count and token estimate.
+      2. Reject missing, zero-byte, or non-%PDF files.
+      3. Open with pdfplumber; reject ``page_count < MIN_PAGES``.
+      4. Extract text from each page.
+      5. Strip references; require ``MIN_SECTIONS`` section-heading matches.
+      6. Normalize whitespace and enforce ``MIN_EXTRACTED_WORDS``.
     """
     if _validation_is_disabled():
         # In dry-run mode we return a fake pass instead of touching files.  The
@@ -921,6 +1070,8 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
             word_count=TARGET_EXTRACTED_WORDS,
             reason="validation_skipped",
             token_count=MIN_EXTRACTED_TOKENS,
+            page_count=MIN_PAGES,
+            section_headers_found=["introduction", "methods", "results"],
         )
 
     if not pdf_path.exists():
@@ -948,8 +1099,21 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
             "pdfplumber is not installed",
         )
 
+    page_count_live = 0
+    raw_text = ""
     try:
         with pdfplumber.open(pdf_path) as pdf:
+            page_count_live = len(pdf.pages)
+
+            # Low page count rejects before expensive per-page extraction.
+            if page_count_live < MIN_PAGES:
+                return _validation_failure_result(
+                    "TOO_FEW_PAGES",
+                    f"PDF has {page_count_live} pages; minimum is {MIN_PAGES}",
+                    word_count=0,
+                    page_count=page_count_live,
+                )
+
             pages: list[str] = []
             for page in pdf.pages:
                 # page.extract_text() can return None for scanned/image-only
@@ -972,6 +1136,20 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
     # long bibliography from passing the useful-text gate.
     useful_text = _remove_references_for_validation(raw_text)
 
+    section_matches = _detect_article_section_headers(useful_text)
+    if len(section_matches) < MIN_SECTIONS:
+        return _validation_failure_result(
+            "MISSING_SECTIONS",
+            (
+                "Too few manuscript section headings (need "
+                f"{MIN_SECTIONS}, found {len(section_matches)}: "
+                + (", ".join(section_matches) if section_matches else "(none)")
+                + ")"
+            ),
+            section_headers_found=section_matches.copy(),
+            page_count=page_count_live,
+        )
+
     # Collapse repeated spaces/newlines/tabs into single spaces.  PDF extraction
     # often creates strange spacing, especially in two-column articles, and this
     # keeps the word count stable.
@@ -988,6 +1166,7 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
             "PDF has no extractable text after references removal",
             word_count=words,
             token_count=tokens,
+            page_count=page_count_live,
         )
 
     if words < MIN_EXTRACTED_WORDS:
@@ -998,6 +1177,8 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
             f"PDF extracted {words} words; minimum is {MIN_EXTRACTED_WORDS}",
             word_count=words,
             token_count=tokens,
+            page_count=page_count_live,
+            section_headers_found=section_matches.copy(),
         )
 
     return PdfValidationResult(
@@ -1005,6 +1186,8 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
         word_count=words,
         reason="ok",
         token_count=tokens,
+        page_count=page_count_live,
+        section_headers_found=section_matches.copy(),
     )
 
 
@@ -1053,8 +1236,14 @@ def _log_validation_failure(
         "target_words": TARGET_EXTRACTED_WORDS,
         "token_count": result.token_count,
         "token_threshold": MIN_EXTRACTED_TOKENS,
+        "min_pages": MIN_PAGES,
+        "min_sections": MIN_SECTIONS,
         "source": source,
     }
+    if result.page_count is not None:
+        details["page_count"] = result.page_count
+    if result.section_headers_found is not None:
+        details["section_headers_found"] = result.section_headers_found.copy()
     if pdf_path is not None:
         details["pdf_path"] = str(pdf_path)
 
@@ -1069,10 +1258,16 @@ def _log_validation_failure(
     with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
-    print(
-        f"  [validation] Rejected {doi}: {result.reason} "
-        f"({result.word_count:,} words; minimum {MIN_EXTRACTED_WORDS:,})."
-    )
+    err = result.error_type or ""
+    if err == "TOO_FEW_PAGES":
+        diag = f"page_count={result.page_count}; minimum {MIN_PAGES} pages"
+    elif err == "MISSING_SECTIONS":
+        hdrs = ", ".join(result.section_headers_found or []) or "none"
+        diag = f"headers found [{hdrs}] (need ≥{MIN_SECTIONS})"
+    else:
+        diag = f"{result.word_count:,} words; minimum {MIN_EXTRACTED_WORDS:,}"
+
+    print(f"  [validation] Rejected {doi}: {result.reason} ({diag}).")
 
 
 def _validate_saved_pdf(path: Path, doi: str, *, source: str) -> PdfSaveResult:
@@ -1147,6 +1342,10 @@ def _write_quarantine_sidecar(
         "error_type": result.error_type,
         "threshold": MIN_EXTRACTED_WORDS,
         "target_words": TARGET_EXTRACTED_WORDS,
+        "min_pages": MIN_PAGES,
+        "min_sections": MIN_SECTIONS,
+        "page_count": result.page_count,
+        "section_headers_found": result.section_headers_found,
         "date": datetime.now(timezone.utc).isoformat(),
         "quarantined_pdf": str(quarantine_path),
     }
@@ -1182,6 +1381,10 @@ def _log_quarantine(
             "target_words": TARGET_EXTRACTED_WORDS,
             "token_count": result.token_count,
             "token_threshold": MIN_EXTRACTED_TOKENS,
+            "min_pages": MIN_PAGES,
+            "min_sections": MIN_SECTIONS,
+            "page_count": result.page_count,
+            "section_headers_found": result.section_headers_found,
             "original_path": str(original_path),
             "quarantine_path": str(quarantine_path),
         },
@@ -2637,11 +2840,16 @@ def run_downloads() -> tuple[int, int]:
 
     BALANCED DOWNLOAD SCHEDULING
     -----------------------------
-    For each journal, we iterate its manifest queue until one of three
-    conditions is met:
+    For each journal, we iterate its manifest queue until one of these stops
+    forward progress:
       a. journal_success[journal] >= JOURNAL_TARGETS[journal]  → STOP-LOSS
       b. failure_count >= MAX_FAILED_PER_JOURNAL                → FAIL-CAP
       c. The manifest queue is exhausted                        → SHORTFALL
+
+    Within the queue walk, candidates may be skipped without downloading when:
+      • The DOI already logged HTTP 403 in data/error_log.jsonl (PRIOR_HTTP_403).
+      • The journal entered manual-only mode (CLOUDFLARE_BLOCKED) after
+        cloudflare_failures[journal] >= MANUAL_ONLY_THRESHOLD.
 
     WHY SEQUENTIAL (journal-by-journal) NOT ROUND-ROBIN?
         Sequential is simpler to reason about and produces the same balanced
@@ -2761,8 +2969,36 @@ def run_downloads() -> tuple[int, int]:
     if initial_success > 0:
         print(f"[download] {initial_success} PDFs already in data/raw/ — counting toward quotas.")
 
+    doi_to_journal: dict[str, str] = {}
+    for journal_name, queue in journal_queues.items():
+        for rec in queue:
+            dkey = str(rec.get("doi", "")).strip()
+            if dkey:
+                doi_to_journal[dkey] = journal_name
+
+    preload_cf_counts, dois_prior_403 = _scan_error_log_for_download_blocks(doi_to_journal)
+    cloudflare_failures: defaultdict[str, int] = defaultdict(int)
+    for jn, ct in preload_cf_counts.items():
+        cloudflare_failures[jn] = ct
+
+    if preload_cf_counts:
+        summary_cf = ", ".join(
+            f"{jn}:{preload_cf_counts[jn]}" for jn in sorted(preload_cf_counts)
+        )
+        print(
+            "[download] Error-log preload — HTTP 403 download failures counted "
+            f"toward MANUAL_ONLY_THRESHOLD by journal: {summary_cf}"
+        )
+    if dois_prior_403:
+        print(
+            f"[download] Error-log preload — {len(dois_prior_403)} DOI(s) "
+            "with prior HTTP 403 logged; skipping automated retries for those rows."
+        )
+
     total_shortfall = 0
     missing_papers: list[dict] = []
+
+    manual_only_journals: set[str] = set()
 
     # Progress bar: tracks successful PDFs / 250, not DOIs attempted.
     # WHY SUCCESS-ONLY UPDATES?
@@ -2794,6 +3030,14 @@ def run_downloads() -> tuple[int, int]:
                 f"{target - journal_success[journal]} more PDFs)..."
             )
 
+            if cloudflare_failures[journal] >= MANUAL_ONLY_THRESHOLD:
+                manual_only_journals.add(journal)
+                print(
+                    f"[download] {journal}: MANUAL_ONLY_THRESHOLD ({MANUAL_ONLY_THRESHOLD}) "
+                    "already met from error-log history — automated downloads skipped for "
+                    "candidates without PDFs (CLOUDFLARE_BLOCKED)."
+                )
+
             for record in queue:
                 doi = record["doi"]
 
@@ -2816,12 +3060,43 @@ def run_downloads() -> tuple[int, int]:
                 if resolve_existing_pdf_path(RAW_DIR, record) is not None:
                     continue
 
+                if journal in manual_only_journals:
+                    missing_papers.append({
+                        "journal":        journal,
+                        "doi":            doi,
+                        "title":          record.get("title", "No title available"),
+                        "reason_missing": "CLOUDFLARE_BLOCKED",
+                    })
+                    continue
+
+                if doi in dois_prior_403:
+                    missing_papers.append({
+                        "journal":        journal,
+                        "doi":            doi,
+                        "title":          record.get("title", "No title available"),
+                        "reason_missing": "PRIOR_HTTP_403",
+                    })
+                    continue
+
                 ok = download_paper(record)
                 if ok:
                     journal_success[journal] += 1
                     pbar.update(1)
                 else:
                     failure_count += 1
+                    best_fail = _best_failure_attempt()
+                    if _attempt_indicates_cloudflare_or_403(best_fail):
+                        cloudflare_failures[journal] += 1
+                        if (
+                            journal not in manual_only_journals
+                            and cloudflare_failures[journal] >= MANUAL_ONLY_THRESHOLD
+                        ):
+                            manual_only_journals.add(journal)
+                            print(
+                                f"[download] {journal}: MANUAL_ONLY_THRESHOLD "
+                                f"({MANUAL_ONLY_THRESHOLD}) reached — switching to manual-only "
+                                "(CLOUDFLARE_BLOCKED for remaining candidates)."
+                            )
 
             # Per-journal summary (always printed regardless of VERBOSE).
             acquired = journal_success[journal]
@@ -2838,14 +3113,18 @@ def run_downloads() -> tuple[int, int]:
                     r["doi"] for r in queue
                     if resolve_existing_pdf_path(RAW_DIR, r) is not None
                 }
+                already_reported = {row["doi"] for row in missing_papers}
                 for record in queue:
-                    if record["doi"] not in downloaded_dois:
-                        missing_papers.append({
-                            "journal":        journal,
-                            "doi":            record.get("doi", ""),
-                            "title":          record.get("title", "No title available"),
-                            "reason_missing": "No OA version found",
-                        })
+                    rd = record["doi"]
+                    if rd in downloaded_dois or rd in already_reported:
+                        continue
+                    missing_papers.append({
+                        "journal":        journal,
+                        "doi":            rd,
+                        "title":          record.get("title", "No title available"),
+                        "reason_missing": "No OA version found",
+                    })
+                    already_reported.add(rd)
 
     total_success = sum(journal_success.values())
 
@@ -2857,15 +3136,21 @@ def run_downloads() -> tuple[int, int]:
         f"Quarantined: {_VALIDATION_QUARANTINED_COUNT}"
     )
 
+    # WHY CALL supplement.write_missing_report HERE?
+    #   Shortfalls and skipped rows (manual-only / prior HTTP 403) already carry
+    #   metadata in memory — emit CSV immediately after the run without needing
+    #   supplement.py separately.
+    if missing_papers:
+        write_missing_report(missing_papers)
+
     if total_shortfall > 0:
         print(f"  OA shortfall       : {total_shortfall} papers unavailable as OA")
         print(f"  See data/missing_papers.csv for manual supplement instructions.")
-        # WHY CALL supplement.write_missing_report HERE?
-        #   download.py detects the shortfall and already has all the metadata
-        #   (journal, doi, title) in memory.  Calling write_missing_report here
-        #   means the researcher gets the CSV immediately after the download run,
-        #   without needing to run supplement.py separately.
-        write_missing_report(missing_papers)
+    elif missing_papers:
+        print(
+            "  Some manifest rows were skipped (PRIOR_HTTP_403 / CLOUDFLARE_BLOCKED); "
+            "see data/missing_papers.csv."
+        )
     else:
         print(f"  All journal quotas met!")
 

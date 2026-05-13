@@ -31,10 +31,10 @@ sampling for two reasons:
 
 CANDIDATE BUFFER
 -----------------
-We collect COLLECT_CANDIDATES_PER_JOURNAL (default: 200) DOIs per journal even
+We collect COLLECT_CANDIDATES_PER_JOURNAL (default: 2000) DOIs per journal even
 though the download quota is 50.  Not every CrossRef DOI will have a freely
 downloadable PDF — publisher embargo, broken links, and PMC deposit lag all
-reduce the OA hit rate.  The extra 150 candidates give download.py a deeper
+reduce the OA hit rate.  The surplus candidates give download.py a deeper
 fallback pool so transient OA gaps do not cause the corpus to fall short of
 50 PDFs per journal.  The larger pool is intentional: real download runs have
 shown that many candidates fail legal OA or text-quality validation.
@@ -142,13 +142,13 @@ TARGET_JOURNALS: dict[str, str] = {
     "JFMS":               "1098-612X",   # corrected from former typo 1098-632X
 }
 
-# WHY 200 CANDIDATES FOR A 50-PDF QUOTA?
+# WHY 2000 CANDIDATES FOR A 50-PDF QUOTA?
 # Not every CrossRef DOI will resolve to a freely downloadable PDF.
-# Collecting 200 candidates gives download.py a much deeper fallback pool while
-# the balanced downloader still stops at 50 accepted PDFs per journal.
-# Override in .env when you need a smaller test run or a larger live run.
+# Collecting 2000 candidates gives download.py a deeper fallback pool while the
+# balanced downloader still stops at 50 accepted PDFs per journal.
+# Override in .env when you need a smaller test run or a smaller live manifest.
 COLLECT_CANDIDATES_PER_JOURNAL: int = int(
-    os.getenv("COLLECT_CANDIDATES_PER_JOURNAL", "200")
+    os.getenv("COLLECT_CANDIDATES_PER_JOURNAL", "2000")
 )
 
 COLLECT_YEAR_BALANCED: bool = os.getenv("COLLECT_YEAR_BALANCED", "true").lower() == "true"
@@ -340,7 +340,7 @@ def _fetch_crossref_page(
 
     WHY OFFSET PAGINATION (not cursor)?
         CrossRef supports both.  Offset is simpler to reason about and safe for
-        our scale (~200 candidates per journal = a few pages).
+        our scale (~2000 candidates per journal = many API pages).
     """
     params = {
         "filter": (
@@ -732,7 +732,7 @@ def run_collection() -> int:
     STRATIFIED SAMPLING LOGIC
     --------------------------
     For each of the five target journals, we query CrossRef until we have
-    COLLECT_CANDIDATES_PER_JOURNAL (default: 200) candidate DOIs or the API
+    COLLECT_CANDIDATES_PER_JOURNAL (default: 2000) candidate DOIs or the API
     returns no more results.  A DOI deduplication set prevents the same paper from
     appearing twice in a single run (rare with CrossRef offset pagination, but
     possible if the same DOI is returned on multiple pages).
