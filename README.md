@@ -170,6 +170,7 @@ review, and statistical analysis.
 | `python src/download.py` | Walks the manifest, downloads **OA-only** PDFs with validation, writes `data/error_log.jsonl` and possibly `data/missing_papers.csv`. |
 | `python src/extract.py` | **Smoke test only**: forces `DRY_RUN=true`, loads a fixture DOI, prints success and a short preview. Import `extract_clean_text` from code for real extraction. |
 | `python src/supplement.py` | Human-facing report for journals below 50 PDFs; refreshes `data/missing_papers.csv`. |
+| `python src/ingest_manual_pdfs.py` | Moves legal manual PDFs from `data/manual_inbox/` into `data/raw/` with descriptive filenames; appends `data/manual_manifest.jsonl`. Read-only on `manifest.jsonl`. |
 | `python pipeline.py` | Loads OA + `data/manual_manifest.jsonl`, validates PDFs on disk, prints per-journal status. **Exits with code 1** if fewer than **200** confirmed PDFs (for scripts/CI). |
 | `python src/main.py` | Minimal sanity check: loads `.env` and prints that the environment is initialized. |
 | `python src/utils/generate_mock.py` | Developer utility to regenerate rich mock JSON (not required for the normal user workflow). |
@@ -561,12 +562,46 @@ and writes `data/missing_papers.csv`. Once you have obtained the PDFs:
 1. Place the PDF files in `data/raw/`. The pipeline accepts either the new
    descriptive filename format or the legacy DOI-only format.
 2. Add entries for each paper to `data/manual_manifest.jsonl` using the same
-   schema as `data/manifest.jsonl`.
+   schema as `data/manifest.jsonl`. (Alternatively, for many files at once,
+   use **Manually ingesting PDFs** to rename and append automatically.)
 3. Re-run `python pipeline.py` to confirm the updated corpus count.
 
 The pipeline accepts a final corpus of `250 - total_missing` OA papers if at
 least 200 OA PDFs were downloaded. The 200-paper threshold ensures enough data
 for a meaningful Phase 4 analysis even without complete manual supplementation.
+
+### Manually ingesting PDFs
+
+Use this when you already have **legal** OA PDFs on disk under random browser
+download names. The helper **never** touches `data/manifest.jsonl` (CrossRef
+truth stays read-only); it only **reads** it to match DOIs/titles and copies
+the canonical JSON line into `data/manual_manifest.jsonl` when needed.
+
+1. Run `python src/collect.py` at least once so `data/manifest.jsonl` lists the
+   DOIs you care about.
+2. Create `data/manual_inbox/` (the script creates it on first run if missing)
+   and drop the PDFs directly in that folder—do not nest them in subfolders for
+   routine use.
+3. From the project root:
+
+   ```powershell
+   python src/ingest_manual_pdfs.py
+   ```
+
+   Override the folder with `--inbox path\to\folder` if needed.
+
+4. The script uses `pdfplumber` to collect DOIs from document metadata and from
+   the first five pages (pattern `10.xxxx/...`). If no DOI resolves to a manifest
+   row, it tries a **case-insensitive** match of the PDF `/Title` metadata against
+   manifest `title`; ambiguous titles are rejected.
+5. Success moves each file to `data/raw/` using `descriptive_pdf_filename()` from
+   `src/file_paths.py`, **without overwriting** existing corpus files. Duplicate
+   uploads are moved aside to `data/manual_inbox/skipped_existing_in_raw/`.
+6. Failures (unmatched DOI/title, malformed PDF, manifest miss) move to
+   `data/manual_inbox/failed/` and `log_error(..., stage="manual_ingest", ...)`
+   captures details in `data/error_log.jsonl`.
+7. Finish with `python pipeline.py` to merge OA + manual manifests and confirm
+   counts.
 
 ## Useful Commands
 
