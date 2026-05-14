@@ -171,6 +171,7 @@ review, and statistical analysis.
 | `python src/extract.py` | **Smoke test only**: forces `DRY_RUN=true`, loads a fixture DOI, prints success and a short preview. Import `extract_clean_text` from code for real extraction. |
 | `python src/supplement.py` | Human-facing report for journals below 50 PDFs; refreshes `data/missing_papers.csv`. |
 | `python src/ingest_manual_pdfs.py` | Moves legal manual PDFs from `data/manual_inbox/` into `data/raw/` with descriptive filenames; appends `data/manual_manifest.jsonl`. Read-only on `manifest.jsonl`. |
+| `python src/auto_ingest_workflow.py` | End-to-end manual ingest driver: optional supplement refresh, stages `data/incoming_manuals/` → inbox, runs ingest + `pipeline.py`, logs to `data/logs/auto_ingest_workflow.log`. |
 | `python pipeline.py` | Loads OA + `data/manual_manifest.jsonl`, validates PDFs on disk, prints per-journal status. **Exits with code 1** if fewer than **200** confirmed PDFs (for scripts/CI). |
 | `python src/main.py` | Minimal sanity check: loads `.env` and prints that the environment is initialized. |
 | `python src/utils/generate_mock.py` | Developer utility to regenerate rich mock JSON (not required for the normal user workflow). |
@@ -602,6 +603,36 @@ the canonical JSON line into `data/manual_manifest.jsonl` when needed.
    captures details in `data/error_log.jsonl`.
 7. Finish with `python pipeline.py` to merge OA + manual manifests and confirm
    counts.
+
+### Fully automated manual ingestion
+
+When you prefer **only** downloading papers manually and letting scripts handle the
+rest, drive everything through:
+
+```powershell
+python src/auto_ingest_workflow.py
+```
+
+Workflow summary:
+
+1. **Drop PDFs** into `data/incoming_manuals/` (created automatically). Keep files at the folder root—do not nest subfolders for routine batches.
+2. **Optional CSV refresh:** unless `--no-supplement` is passed, the helper runs `python src/supplement.py`, regenerating `data/missing_papers.csv` plus console hints about gaps.
+3. **Staging:** every `*.pdf` in `incoming_manuals/` moves into `data/manual_inbox/` with collision-safe renaming (`__incoming_dupN` suffix when needed).
+4. **Ingest:** invokes `python src/ingest_manual_pdfs.py`, which performs DOI/title matching, descriptive names under `data/raw/`, and duplicate-safe appends to `data/manual_manifest.jsonl`. `manifest.jsonl` stays read-only.
+5. **Reporting:** runs `python pipeline.py`, printing the corpus status table (inherits its exit semantics—exit code **1** until ≥200 confirmed PDFs).
+6. **Cleanup (default):** deletes artifacts under `data/manual_inbox/skipped_existing_in_raw/` and archives anything left in `data/manual_inbox/failed/` into `data/manual_inbox/archive_failed/YYYY-MM-DD/`. Pass `--no-clean` to preserve those folders between runs.
+
+Logging lands in **`data/logs/auto_ingest_workflow.log`** as well as stdout. Flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--incoming PATH` | Alternate drop folder (default `data/incoming_manuals/`). |
+| `--no-supplement` | Skip `supplement.py` when you already refreshed `missing_papers.csv`. |
+| `--no-clean` | Leave skipped/failure staging artifacts untouched after the run. |
+
+Idempotent behaviour: rerunning with an empty incoming folder simply refreshes supplement output (unless skipped), performs an ingest pass over whatever remains in `manual_inbox/`, reruns `pipeline.py`, and repeats cleanup rules—nothing is duplicated inside `manual_manifest.jsonl` thanks to ingest guards.
+
+If `ingest_manual_pdfs.py` exits non-zero (linkage failures remain), the workflow stops **before** `pipeline.py`, logs the situation, and leaves failure PDFs under `manual_inbox/failed/` until you inspect them—your originals are no longer in `incoming_manuals/` because they were staged successfully.
 
 ## Useful Commands
 
