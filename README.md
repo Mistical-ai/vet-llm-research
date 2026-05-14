@@ -551,88 +551,169 @@ fast; it does not mean Python is broken.
 
 ### Step 5: Handle OA Shortfalls (if needed)
 
-If any journal has fewer than 50 PDFs, run:
+Sometimes the automatic downloader cannot reach **50 PDFs per journal** using only
+open-access links. That is normal for paywall-heavy journals.
+
+**See what is missing.** From the project folder (venv on):
 
 ```powershell
 python src/supplement.py
 ```
 
-This prints per-missing-paper instructions ("Check UoG library" / "Email author")
-and writes `data/missing_papers.csv`. Once you have obtained the PDFs:
+That prints plain-language hints per journal and refreshes **`data/missing_papers.csv`**
+(a spreadsheet-friendly checklist you can filter or sort).
 
-1. Place the PDF files in `data/raw/`. The pipeline accepts either the new
-   descriptive filename format or the legacy DOI-only format.
-2. Add entries for each paper to `data/manual_manifest.jsonl` using the same
-   schema as `data/manifest.jsonl`. (Alternatively, for many files at once,
-   use **Manually ingesting PDFs** to rename and append automatically.)
-3. Re-run `python pipeline.py` to confirm the updated corpus count.
+**Add papers you obtained legally** (library access, publisher OA pages, author
+copies—never bypassing paywalls). After you have PDF files on your computer,
+follow **[Guide: Manually adding papers to your corpus](#guide-manually-adding-papers-to-your-corpus)**
+(below) so filenames and manifests stay consistent.
 
-The pipeline accepts a final corpus of `250 - total_missing` OA papers if at
-least 200 OA PDFs were downloaded. The 200-paper threshold ensures enough data
-for a meaningful Phase 4 analysis even without complete manual supplementation.
+The pipeline counts toward **250** papers total when possible; **`pipeline.py`
+also exits with code 1 until at least 200 PDFs are present**, which is expected
+during buildup—not a broken install.
 
-### Manually ingesting PDFs
+---
 
-Use this when you already have **legal** OA PDFs on disk under random browser
-download names. The helper **never** touches `data/manifest.jsonl` (CrossRef
-truth stays read-only); it only **reads** it to match DOIs/titles and copies
-the canonical JSON line into `data/manual_manifest.jsonl` when needed.
+## Guide: Manually adding papers to your corpus
 
-1. Run `python src/collect.py` at least once so `data/manifest.jsonl` lists the
-   DOIs you care about.
-2. Create `data/manual_inbox/` (the script creates it on first run if missing)
-   and drop the PDFs directly in that folder—do not nest them in subfolders for
-   routine use.
-3. From the project root:
+This section is for beginners. Read it once; later you only repeat **Section C**.
 
-   ```powershell
-   python src/ingest_manual_pdfs.py
-   ```
+### What you are doing (in plain English)
 
-   Override the folder with `--inbox path\to\folder` if needed.
+| Idea | Meaning |
+|------|---------|
+| **Manifest** | `data/manifest.jsonl` is the master list of candidate papers from CrossRef (built when you run `collect.py`). Your scripts match downloads to this list. |
+| **Manual PDF** | A PDF **you** saved because automation could not fetch it with OA-only rules. |
+| **Goal** | Put those PDFs into **`data/raw/`** under the same descriptive filenames the pipeline expects, and record them in **`data/manual_manifest.jsonl`**—without editing `manifest.jsonl` by hand. |
 
-4. The script uses `pdfplumber` to collect DOIs from document metadata and from
-   the first five pages (pattern `10.xxxx/...`). If no DOI resolves to a manifest
-   row, it tries a **case-insensitive** match of the PDF `/Title` metadata against
-   manifest `title`; ambiguous titles are rejected.
-5. Success moves each file to `data/raw/` using `descriptive_pdf_filename()` from
-   `src/file_paths.py`, **without overwriting** existing corpus files. Duplicate
-   uploads are moved aside to `data/manual_inbox/skipped_existing_in_raw/`.
-6. Failures (unmatched DOI/title, malformed PDF, manifest miss) move to
-   `data/manual_inbox/failed/` and `log_error(..., stage="manual_ingest", ...)`
-   captures details in `data/error_log.jsonl`.
-7. Finish with `python pipeline.py` to merge OA + manual manifests and confirm
-   counts.
+**Legal rule:** Only ingest papers you are allowed to use (institutional access,
+publisher-granted OA, author-shared copies, etc.). This workflow does not bypass
+subscriptions.
 
-### Fully automated manual ingestion
+---
 
-When you prefer **only** downloading papers manually and letting scripts handle the
-rest, drive everything through:
+### Section A — Before you try this
+
+Work through these checks once:
+
+1. **Terminal location:** Open PowerShell and `cd` into your project folder (the one that contains `pipeline.py` and the `src` folder).
+2. **Virtual environment:** Activate it (`.\.venv\Scripts\Activate.ps1`). You should see `(.venv)` at the start of the prompt.
+3. **Manifest exists:** You must have run `python src/collect.py` at least once so **`data/manifest.jsonl`** exists and lists the DOIs you care about. If that file is missing, run collection before manual ingestion.
+
+---
+
+### Section B — See what still needs a PDF
+
+Optional but helpful:
+
+```powershell
+python src/supplement.py
+```
+
+You get console output plus **`data/missing_papers.csv`**. Use it like a shopping
+list while you download papers from permitted sources.
+
+---
+
+### Section C — Recommended: one command after you drop files
+
+This is the **easiest path**. You only touch one folder yourself.
+
+#### Step C1 — Make sure you have PDF files
+
+Download or save PDFs anywhere temporarily (Downloads folder is fine).
+
+#### Step C2 — Put PDFs in the incoming folder
+
+1. Open **File Explorer** and go to your project folder.
+2. Open **`data`** (create it if needed—it is usually hidden from Git).
+3. Open or create **`incoming_manuals`** inside `data`.
+4. **Drag every PDF into `data/incoming_manuals/` so they sit directly in that folder.**  
+   Do **not** put them inside extra subfolders for normal batches—keep it flat.
+
+#### Step C3 — Run the automation script
+
+In PowerShell (project folder, venv on):
 
 ```powershell
 python src/auto_ingest_workflow.py
 ```
 
-Workflow summary:
+**What this script does for you**, in order:
 
-1. **Drop PDFs** into `data/incoming_manuals/` (created automatically). Keep files at the folder root—do not nest subfolders for routine batches.
-2. **Optional CSV refresh:** unless `--no-supplement` is passed, the helper runs `python src/supplement.py`, regenerating `data/missing_papers.csv` plus console hints about gaps.
-3. **Staging:** every `*.pdf` in `incoming_manuals/` moves into `data/manual_inbox/` with collision-safe renaming (`__incoming_dupN` suffix when needed).
-4. **Ingest:** invokes `python src/ingest_manual_pdfs.py`, which performs DOI/title matching, descriptive names under `data/raw/`, and duplicate-safe appends to `data/manual_manifest.jsonl`. `manifest.jsonl` stays read-only.
-5. **Reporting:** runs `python pipeline.py`, printing the corpus status table (inherits its exit semantics—exit code **1** until ≥200 confirmed PDFs).
-6. **Cleanup (default):** deletes artifacts under `data/manual_inbox/skipped_existing_in_raw/` and archives anything left in `data/manual_inbox/failed/` into `data/manual_inbox/archive_failed/YYYY-MM-DD/`. Pass `--no-clean` to preserve those folders between runs.
+1. Runs **`python src/supplement.py`** (unless you skip it—see flags below) so your missing-paper list stays fresh.
+2. **Moves** every `*.pdf` from **`data/incoming_manuals/`** into **`data/manual_inbox/`** (staging).
+3. Runs **`python src/ingest_manual_pdfs.py`**, which reads each PDF, finds its DOI (or matches title metadata to the manifest), picks the correct descriptive filename, and moves the result into **`data/raw/`**.
+4. **Appends** the matching manifest row to **`data/manual_manifest.jsonl`** when needed (without changing **`manifest.jsonl`**).
+5. Runs **`python pipeline.py`** so you see an updated **per-journal table**.
 
-Logging lands in **`data/logs/auto_ingest_workflow.log`** as well as stdout. Flags:
+#### Step C4 — Read the output
 
-| Flag | Meaning |
-|------|---------|
-| `--incoming PATH` | Alternate drop folder (default `data/incoming_manuals/`). |
-| `--no-supplement` | Skip `supplement.py` when you already refreshed `missing_papers.csv`. |
-| `--no-clean` | Leave skipped/failure staging artifacts untouched after the run. |
+- **Green-light signs:** Lines like `IMPORTED` and a balanced journal table from `pipeline.py`.
+- **Exit code 1 from `pipeline.py`:** Normal until you reach **200** total PDFs in **`data/raw/`**. It does **not** mean the manual step failed.
 
-Idempotent behaviour: rerunning with an empty incoming folder simply refreshes supplement output (unless skipped), performs an ingest pass over whatever remains in `manual_inbox/`, reruns `pipeline.py`, and repeats cleanup rules—nothing is duplicated inside `manual_manifest.jsonl` thanks to ingest guards.
+Logs are also saved to **`data/logs/auto_ingest_workflow.log`** so you can scroll back later.
 
-If `ingest_manual_pdfs.py` exits non-zero (linkage failures remain), the workflow stops **before** `pipeline.py`, logs the situation, and leaves failure PDFs under `manual_inbox/failed/` until you inspect them—your originals are no longer in `incoming_manuals/` because they were staged successfully.
+---
+
+### Section D — What each folder means after a run
+
+| Folder or file | Role |
+|----------------|------|
+| `data/incoming_manuals/` | **Your drop zone.** Empty after a successful staging step—the PDFs moved onward. |
+| `data/manual_inbox/` | **Staging.** Scripts shuffle files here before ingest; usually cleared as ingest runs. |
+| `data/raw/` | **Final accepted PDFs** with descriptive names (`journal__title__doi_suffix.pdf`). |
+| `data/manual_manifest.jsonl` | One JSON line per manually tracked paper that already has a PDF on disk. |
+| `data/manifest.jsonl` | CrossRef-derived candidate list—**do not edit by hand**; ingest only reads it. |
+| `data/manual_inbox/failed/` | PDFs that could not be matched—inspect before deleting. |
+| `data/manual_inbox/skipped_existing_in_raw/` | Duplicate uploads when `data/raw/` already had that paper. |
+| `data/manual_inbox/archive_failed/` | Dated buckets (`YYYY-MM-DD`) where cleaned-up failures are archived. |
+
+---
+
+### Section E — Optional flags (when you already did part of the work)
+
+```powershell
+python src/auto_ingest_workflow.py --help
+```
+
+| Flag | When to use it |
+|------|----------------|
+| `--incoming PATH` | Use a different drop folder instead of `data/incoming_manuals/`. |
+| `--no-supplement` | Skip regenerating `missing_papers.csv` when you already ran `supplement.py` moments ago. |
+| `--no-clean` | Keep skipped/failed staging files between runs instead of deleting skipped PDFs and archiving failures. |
+
+---
+
+### Section F — If something goes wrong
+
+| Symptom | What to try |
+|---------|-------------|
+| Script stops **before** `pipeline.py` | **`ingest_manual_pdfs.py`** returned an error—often an unmatched DOI or title. Open **`data/manual_inbox/failed/`** and **`data/error_log.jsonl`** for clues. Fix metadata or add the paper’s DOI to your manifest via **`collect.py`** first. |
+| PDF landed in **`skipped_existing_in_raw`** | You already had that paper under **`data/raw/`**. Safe to ignore after cleanup. |
+| **`incoming_manuals`** empty but ingest failed | Files were moved to **`manual_inbox`** before ingest ran—they are not deleted from disk; check **`failed/`**. |
+| **`manifest.jsonl` missing** | Run **`python src/collect.py`** before manual ingestion. |
+
+---
+
+### Section G — Advanced: run ingest alone
+
+If you prefer to drop PDFs straight into **`data/manual_inbox/`** without the
+incoming folder:
+
+```powershell
+python src/ingest_manual_pdfs.py
+```
+
+Then run **`python pipeline.py`** yourself. Use **`--inbox`** if your PDFs live in
+another folder. Same matching rules apply (DOI in PDF text/metadata first, then
+PDF `/Title` vs manifest title).
+
+---
+
+### Running the workflow twice
+
+Running **`python src/auto_ingest_workflow.py`** again with an empty incoming folder is safe: supplement may refresh, ingest sees whatever is left to process, and **`manual_manifest.jsonl`** does not get duplicate lines for the same DOI.
 
 ## Useful Commands
 
