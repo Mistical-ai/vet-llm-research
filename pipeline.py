@@ -216,23 +216,38 @@ def load_corpus() -> dict:
             )
 
     # --- Determine which DOIs have PDFs on disk ---
-    downloaded:   list[str] = []
-    missing_pdfs: list[str] = []
+    # WHY SEPARATE PRIMARY AND SECONDARY?
+    #   Files starting with "2_" are secondary research (systematic reviews,
+    #   meta-analyses) tagged by download.py or audit_article_types.py.
+    #   They count toward the total PDF count but NOT toward the per-journal
+    #   quota of 50 primary research papers.  Keeping them separate lets the
+    #   status report show exactly how many primary papers still need to be found.
+    downloaded:            list[str] = []   # All confirmed PDFs (primary + secondary)
+    downloaded_primary:    list[str] = []   # PDFs whose filename does NOT start with "2_"
+    downloaded_secondary:  list[str] = []   # PDFs whose filename starts with "2_"
+    missing_pdfs:          list[str] = []
 
     for record in records:
-        doi = record["doi"]
-        if resolve_existing_pdf_path(RAW_DIR, record) is not None:
-            downloaded.append(doi)
-        else:
+        doi      = record["doi"]
+        pdf_path = resolve_existing_pdf_path(RAW_DIR, record)
+        if pdf_path is None:
             missing_pdfs.append(doi)
+        else:
+            downloaded.append(doi)
+            if pdf_path.name.startswith("2_"):
+                downloaded_secondary.append(doi)
+            else:
+                downloaded_primary.append(doi)
 
     return {
-        "records":        records,
-        "downloaded":     downloaded,
-        "missing_pdfs":   missing_pdfs,
-        "oa_count":       oa_count,
-        "manual_count":   manual_count,
-        "invalid_manual": invalid_manual,
+        "records":               records,
+        "downloaded":            downloaded,
+        "downloaded_primary":    downloaded_primary,
+        "downloaded_secondary":  downloaded_secondary,
+        "missing_pdfs":          missing_pdfs,
+        "oa_count":              oa_count,
+        "manual_count":          manual_count,
+        "invalid_manual":        invalid_manual,
     }
 
 
@@ -244,65 +259,88 @@ def report_corpus_status(corpus: dict) -> None:
     """
     Print a structured summary of the current corpus state.
 
-    Shows per-journal breakdown, total PDFs, missing count, and whether the
-    OA-only run meets the OA_THRESHOLD (200) for manual supplementation to
-    be sufficient.
+    Shows per-journal breakdown against the 50-paper primary-research quota,
+    total PDFs (primary + secondary), and whether the OA-only run meets the
+    OA_THRESHOLD (200) for manual supplementation to be sufficient.
+
+    WHAT IS A PRIMARY vs SECONDARY PDF?
+        Primary  — an original research article (filename does NOT start with "2_").
+                   These count toward the 50-paper quota.
+        Secondary — a systematic review or meta-analysis (filename starts with "2_").
+                   These are kept for reference but do NOT count toward the quota.
 
     Parameters
     ----------
     corpus : dict — Output of load_corpus().
     """
-    records      = corpus["records"]
-    downloaded   = corpus["downloaded"]
-    missing_pdfs = corpus["missing_pdfs"]
-    oa_count     = corpus["oa_count"]
-    manual_count = corpus["manual_count"]
+    records             = corpus["records"]
+    downloaded          = corpus["downloaded"]
+    downloaded_primary  = corpus["downloaded_primary"]
+    downloaded_secondary = corpus["downloaded_secondary"]
+    missing_pdfs        = corpus["missing_pdfs"]
+    oa_count            = corpus["oa_count"]
+    manual_count        = corpus["manual_count"]
 
-    total_with_pdf  = len(downloaded)
-    effective_total = total_with_pdf           # PDFs we actually have
-    total_missing   = max(0, CORPUS_TARGET - total_with_pdf)
+    # The quota is measured against PRIMARY papers only.
+    n_primary    = len(downloaded_primary)
+    n_secondary  = len(downloaded_secondary)
+    n_total      = len(downloaded)
+    total_missing = max(0, CORPUS_TARGET - n_primary)
 
-    print("\n" + "=" * 62)
+    print("\n" + "=" * 68)
     print("  CORPUS STATUS")
-    print("=" * 62)
-    print(f"  Manifest entries (OA):        {oa_count:>5}")
-    print(f"  Manifest entries (manual):    {manual_count:>5}")
-    print(f"  Total unique DOIs:             {len(records):>5}")
-    print(f"  PDFs confirmed in data/raw/:  {total_with_pdf:>5}")
-    print(f"  PDFs still missing:           {len(missing_pdfs):>5}")
-    print(f"  Corpus target:                {CORPUS_TARGET:>5}")
-    print(f"  Effective corpus size:        {effective_total:>5}  ({effective_total}/{CORPUS_TARGET})")
+    print("=" * 68)
+    print(f"  Manifest entries (OA):             {oa_count:>5}")
+    print(f"  Manifest entries (manual):         {manual_count:>5}")
+    print(f"  Total unique DOIs:                 {len(records):>5}")
+    print(f"  PDFs confirmed — primary:          {n_primary:>5}  (count toward quota)")
+    print(f"  PDFs confirmed — secondary (2_):   {n_secondary:>5}  (reviews; not in quota)")
+    print(f"  PDFs confirmed — total:            {n_total:>5}")
+    print(f"  PDFs still missing:                {len(missing_pdfs):>5}")
+    print(f"  Corpus target (primary only):      {CORPUS_TARGET:>5}")
+    print(f"  Primary quota progress:            {n_primary:>5}  ({n_primary}/{CORPUS_TARGET})")
     print()
 
     # --- Per-journal breakdown ---
+    # Count primary and secondary PDFs separately for each journal.
     journal_counts: dict[str, dict] = {}
     for record in records:
         j = record.get("journal", "Unknown")
         if j not in journal_counts:
-            journal_counts[j] = {"total": 0, "have_pdf": 0, "source": set()}
-        journal_counts[j]["total"] += 1
-        if resolve_existing_pdf_path(RAW_DIR, record) is not None:
-            journal_counts[j]["have_pdf"] += 1
+            journal_counts[j] = {"primary": 0, "secondary": 0, "source": set()}
+        pdf_path = resolve_existing_pdf_path(RAW_DIR, record)
+        if pdf_path is not None:
+            if pdf_path.name.startswith("2_"):
+                journal_counts[j]["secondary"] += 1
+            else:
+                journal_counts[j]["primary"] += 1
         journal_counts[j]["source"].add(record.get("_source", "oa"))
 
-    print(f"  {'Journal':<25} {'Target':>6}  {'PDF':>5}  {'Status'}")
-    print("  " + "-" * 57)
+    print(f"  {'Journal':<25} {'Target':>6}  {'Primary':>8}  {'Secondary':>10}  {'Status'}")
+    print("  " + "-" * 70)
     for journal, target in JOURNAL_TARGETS.items():
-        counts   = journal_counts.get(journal, {"total": 0, "have_pdf": 0})
-        have     = counts["have_pdf"]
-        status   = "✓ OK" if have >= target else f"NEED {target - have} MORE"
-        print(f"  {journal:<25} {target:>6}  {have:>5}  {status}")
-    print("=" * 62)
+        counts    = journal_counts.get(journal, {"primary": 0, "secondary": 0})
+        primary   = counts["primary"]
+        secondary = counts["secondary"]
+        if primary >= target:
+            status = "✓ OK"
+        else:
+            need   = target - primary
+            status = f"NEED {need} MORE PRIMARY"
+            if secondary > 0:
+                status += f" ({secondary} secondary available)"
+        print(f"  {journal:<25} {target:>6}  {primary:>8}  {secondary:>10}  {status}")
+    print("=" * 68)
 
-    # --- Overall assessment ---
-    if total_with_pdf >= CORPUS_TARGET:
-        print(f"\n[pipeline] Corpus complete: {total_with_pdf}/{CORPUS_TARGET} PDFs acquired.")
+    # --- Overall assessment (based on primary count only) ---
+    if n_primary >= CORPUS_TARGET:
+        print(f"\n[pipeline] Corpus complete: {n_primary}/{CORPUS_TARGET} primary PDFs acquired.")
 
-    elif total_with_pdf >= OA_THRESHOLD:
-        remaining = CORPUS_TARGET - total_with_pdf
+    elif n_primary >= OA_THRESHOLD:
+        remaining = CORPUS_TARGET - n_primary
         print(
-            f"\n[pipeline] OA corpus acceptable: {total_with_pdf} >= {OA_THRESHOLD} threshold.\n"
-            f"[pipeline] {remaining} papers still needed for full corpus (250 target).\n"
+            f"\n[pipeline] OA corpus acceptable: {n_primary} >= {OA_THRESHOLD} threshold.\n"
+            f"[pipeline] {remaining} primary papers still needed (250 target).\n"
             f"[pipeline] Manual supplementation steps:\n"
             f"  1. Run: python src/supplement.py  → generates data/missing_papers.csv\n"
             f"  2. Acquire PDFs and place in:     data/raw/\n"
@@ -312,10 +350,10 @@ def report_corpus_status(corpus: dict) -> None:
 
     else:
         print(
-            f"\n[pipeline] WARNING: Only {total_with_pdf}/{OA_THRESHOLD} minimum PDFs acquired.\n"
+            f"\n[pipeline] WARNING: Only {n_primary}/{OA_THRESHOLD} minimum primary PDFs acquired.\n"
             f"[pipeline] Possible causes:\n"
             f"  - Network errors during download.py run\n"
-            f"  - Low OA availability for the target journals in 2023-2025\n"
+            f"  - Low OA availability for the target journals in 2023-2026\n"
             f"  - manifest.jsonl is empty or has wrong journal names\n"
             f"[pipeline] Run: python src/supplement.py to diagnose per-journal gaps."
         )
@@ -330,10 +368,13 @@ if __name__ == "__main__":
     corpus = load_corpus()
     report_corpus_status(corpus)
 
-    # Exit with code 1 if below minimum threshold.
+    # Exit with code 1 if primary-research PDFs are below the minimum threshold.
     # WHY sys.exit(1)?
     #   Makes pipeline.py usable in a CI/CD check or a shell script that
     #   should fail fast when the corpus is critically under-populated.
-    n_downloaded = len(corpus["downloaded"])
-    if n_downloaded < OA_THRESHOLD:
+    # WHY CHECK PRIMARY ONLY?
+    #   Secondary PDFs (reviews) are backup material — the corpus health is
+    #   determined by how many primary research articles we have.
+    n_primary = len(corpus["downloaded_primary"])
+    if n_primary < OA_THRESHOLD:
         sys.exit(1)

@@ -331,6 +331,47 @@ def test_new_pdf_imported_after_prior_ingestion(tmp_path: Path, monkeypatch: pyt
     assert _DEDUP_DOI_A in dois and _DEDUP_DOI_B in dois
 
 
+# ─── Article-type classifier tests (_classify_article_type) ──────────────────
+
+import download  # noqa: E402
+
+
+def test_article_type_rejects_case_report(tmp_path: Path) -> None:
+    """A PDF whose first page says 'Case Report' must be classified as excluded."""
+    pdf = tmp_path / "case_report.pdf"
+    _write_pdf(pdf, ["Case Report"] + ["canine"] * 300)
+    classification, matched = download._classify_article_type(pdf)
+    assert classification == "excluded", f"Expected excluded, got {classification!r}"
+    assert "case report" in matched
+
+
+def test_article_type_rejects_short_comm(tmp_path: Path) -> None:
+    """A PDF whose first page says 'Short Communication' must be classified as excluded."""
+    pdf = tmp_path / "short_comm.pdf"
+    _write_pdf(pdf, ["Short Communication"] + ["feline"] * 300)
+    classification, matched = download._classify_article_type(pdf)
+    assert classification == "excluded", f"Expected excluded, got {classification!r}"
+    assert "short communication" in matched
+
+
+def test_article_type_tags_systematic_review(tmp_path: Path) -> None:
+    """A PDF with 'Systematic Review' on the first page must be classified as secondary."""
+    pdf = tmp_path / "sys_review.pdf"
+    _write_pdf(pdf, ["Systematic Review"] + ["equine"] * 300)
+    classification, matched = download._classify_article_type(pdf)
+    assert classification == "secondary", f"Expected secondary, got {classification!r}"
+    assert "systematic review" in matched
+
+
+def test_article_type_passes_primary_research(tmp_path: Path) -> None:
+    """A PDF with only standard research section headings must be classified as primary."""
+    pdf = tmp_path / "primary.pdf"
+    _write_pdf(pdf, ["Introduction", "Methods", "Results", "Discussion"] + ["bovine"] * 300)
+    classification, matched = download._classify_article_type(pdf)
+    assert classification == "primary", f"Expected primary, got {classification!r}"
+    assert matched == ""
+
+
 def test_manual_pdf_lands_in_raw_with_descriptive_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Manual PDFs must arrive in data/raw/ with the same descriptive filename that download.py uses."""
     from file_paths import descriptive_pdf_filename

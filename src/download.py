@@ -372,6 +372,44 @@ PUBLISHER_DELAY_MAX_SECONDS: float = float(os.getenv("PUBLISHER_DELAY_MAX_SECOND
 # conservative backoff, not an attempt to force through a block.
 RATE_LIMIT_BACKOFF_SECONDS: float = float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "60"))
 
+# ── Article-type filtering ────────────────────────────────────────────────────
+# After a PDF is downloaded and passes the text-quality gate, we check whether
+# it is a primary research article.  Non-research types (case reports, short
+# communications) are removed from data/raw/ immediately.  Secondary research
+# types (systematic reviews) are kept but renamed with a "2_" prefix so they
+# are easy to identify and can be optionally excluded from LLM analysis.
+#
+# WHY CHECK THE FIRST PAGES OF THE PDF INSTEAD OF METADATA?
+#   CrossRef sometimes lacks structured article-type metadata, and even when it
+#   is present it does not always map cleanly to our categories.  Checking the
+#   first 1–2 pages of the actual PDF is more reliable because veterinary
+#   journals consistently print the article type as a visible label near the
+#   title (e.g., "Short Communication", "Case Report", "Systematic Review").
+#
+# To customise these lists without editing source code, set the environment
+# variables below in your .env file (comma-separated phrases, case-insensitive).
+
+EXCLUDE_ARTICLE_TYPE_PATTERNS: list[str] = [
+    phrase.strip().lower()
+    for phrase in os.getenv(
+        "EXCLUDE_ARTICLE_TYPE_PATTERNS",
+        "short communication,brief communication,brief report,"
+        "case report,case series,case study,"
+        "imaging diagnosis,imaging findings,"
+        "rapid communication",
+    ).split(",")
+    if phrase.strip()
+]
+
+SECONDARY_ARTICLE_TYPE_PATTERNS: list[str] = [
+    phrase.strip().lower()
+    for phrase in os.getenv(
+        "SECONDARY_ARTICLE_TYPE_PATTERNS",
+        "systematic review,meta-analysis,scoping review,narrative review",
+    ).split(",")
+    if phrase.strip()
+]
+
 
 # ---------------------------------------------------------------------------
 # Browser-like request headers
@@ -964,6 +1002,97 @@ def count_matching_sections(text: str) -> tuple[int, list[str]]:
         if pattern.search(text):
             matched.append(category)
     return len(matched), matched
+
+
+def _classify_article_type(pdf_path: Path) -> tuple[str, str]:
+    """
+    Read the first two pages of a downloaded PDF and decide whether it is
+    primary research, secondary research, or a non-research article.
+
+    Returns a tuple of (classification, matched_phrase) where classification is:
+      "primary"   — original research article; proceed normally
+      "secondary" — systematic review / meta-analysis; keep but rename with 2_ prefix
+      "excluded"  — case report, short communication, etc.; discard the PDF
+
+    HOW DOES THIS WORK?
+        Veterinary journals print the article type as a visible label near the
+        title — for example "Short Communication", "Case Report:", or
+        "Systematic Review and Meta-Analysis".  We extract text from the first
+        two pages (where this label always appears) and search for the phrases
+        configured in EXCLUDE_ARTICLE_TYPE_PATTERNS and SECONDARY_ARTICLE_TYPE_PATTERNS.
+
+    WHY ONLY TWO PAGES?
+        The article-type label is always near the top of the first page.  Reading
+        the full PDF would be slower and wasteful — we only need the header area.
+    """
+    try:
+        import pdfplumber  # Already a project dependency (used in validation too).
+        with pdfplumber.open(pdf_path) as pdf:
+            pages_to_check = min(2, len(pdf.pages))
+            first_pages_text = " ".join(
+                pdf.pages[i].extract_text() or ""
+                for i in range(pages_to_check)
+            ).lower()
+    except Exception:
+        # If pdfplumber can't open the file, let the validation gate handle it.
+        return "primary", ""
+
+    # Check for excluded types first (case reports, short comms, etc.).
+    for phrase in EXCLUDE_ARTICLE_TYPE_PATTERNS:
+        if phrase in first_pages_text:
+            return "excluded", phrase
+
+    # Check for secondary research types (systematic reviews, meta-analyses).
+    for phrase in SECONDARY_ARTICLE_TYPE_PATTERNS:
+        if phrase in first_pages_text:
+            return "secondary", phrase
+
+    return "primary", ""
+
+
+def _post_download_classify(doi: str, dest_path: Path) -> tuple[bool, Path]:
+    """
+    Apply the article-type filter immediately after a PDF is successfully saved.
+
+    This is called inside download_paper() right after any fallback source
+    reports success.  It ensures that even a successfully downloaded PDF is
+    removed if it is a case report or short communication.
+
+    Returns (keep, final_path):
+      keep=True, final_path=dest_path          — primary research, proceed as-is
+      keep=True, final_path=renamed_path       — secondary research, renamed with 2_ prefix
+      keep=False, final_path=original_dest     — excluded type, file has been deleted
+    """
+    # In DRY_RUN or test mode there is no real file on disk to inspect.
+    if _validation_is_disabled():
+        return True, dest_path
+
+    classification, matched_phrase = _classify_article_type(dest_path)
+
+    if classification == "excluded":
+        # Delete the PDF — it is not a primary research article.
+        dest_path.unlink(missing_ok=True)
+        log_error(
+            doi,
+            "article_type_filter",
+            f"Excluded article type detected on first pages: '{matched_phrase}'",
+        )
+        print(f"  [article_type] EXCLUDED doi={doi} — matched '{matched_phrase}'")
+        return False, dest_path
+
+    if classification == "secondary":
+        # Rename the file with "2_" prefix so it is easy to identify.
+        # The 2_ convention signals: valid PDF, but secondary research.
+        new_path = dest_path.parent / ("2_" + dest_path.name)
+        dest_path.rename(new_path)
+        print(
+            f"  [article_type] SECONDARY doi={doi} — matched '{matched_phrase}'"
+            f" → {new_path.name}"
+        )
+        return True, new_path
+
+    # Primary research — no changes needed.
+    return True, dest_path
 
 
 def _validation_is_disabled() -> bool:
@@ -2669,6 +2798,110 @@ def _try_scrape_article_page(doi: str, dest_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Fallback: Europe PMC
+# ---------------------------------------------------------------------------
+
+def _try_europe_pmc(doi: str, dest_path: Path) -> bool:
+    """
+    Search Europe PMC for this DOI and download the PDF if available.
+
+    Europe PMC is a free open-access repository run by EMBL-EBI (European
+    Bioinformatics Institute).  Many veterinary journals deposit papers there
+    automatically under UKRI and EU open-access mandates — especially JVIM,
+    JAVMA, and JFMS papers with NIH or Wellcome Trust funding.
+
+    WHY ADD THIS FALLBACK?
+        Several papers that Unpaywall and Semantic Scholar report as unavailable
+        ARE in Europe PMC because UKRI-funded authors must deposit there.  This
+        fallback captures that overlap without any authentication.
+
+    Returns True on success, False if the paper is not in Europe PMC or has no
+    accessible PDF.
+    """
+    # Query the Europe PMC REST API.
+    # resultType=core includes fullTextUrlList, which lists every available format
+    # (PDF, HTML, XML).  We iterate through the list and try each PDF URL.
+    search_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+    _vprint(f"  [EuropePMC] Querying for DOI: {doi}")
+    try:
+        resp = requests.get(
+            search_url,
+            params={
+                "query": f'DOI:"{doi}"',
+                "format": "json",
+                "resultType": "core",
+            },
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+            verify=False,
+        )
+        if resp.status_code == 429:
+            # Europe PMC is rate-limiting us — record the attempt and move on.
+            attempt = _remember_attempt(DownloadAttempt(
+                source="europe_pmc",
+                url=resp.url,
+                failure_code="HTTP_429",
+                message="Europe PMC rate-limited the request",
+                http_status=resp.status_code,
+                content_type=resp.headers.get("Content-Type", ""),
+                final_url=resp.url,
+                retry_after=resp.headers.get("Retry-After"),
+                body_start=_safe_body_preview(resp.content),
+            ))
+            _respect_retry_after(attempt)
+            return False
+        resp.raise_for_status()
+        results = resp.json().get("resultList", {}).get("result", [])
+    except requests.RequestException as exc:
+        _vprint(f"  [EuropePMC] Search request failed: {exc}")
+        return False
+
+    if not results:
+        _vprint("  [EuropePMC] DOI not found in Europe PMC.")
+        _remember_attempt(DownloadAttempt(
+            source="europe_pmc",
+            url=search_url,
+            failure_code="NO_PDF_URL",
+            message="DOI not found in Europe PMC",
+        ))
+        return False
+
+    # Scan every result's URL list for a direct PDF link.
+    # We look for documentStyle == "pdf" to avoid downloading HTML or XML.
+    for result in results:
+        url_list = (
+            result.get("fullTextUrlList", {}).get("fullTextUrl", [])
+        )
+        for entry in url_list:
+            if entry.get("documentStyle", "").lower() != "pdf":
+                continue  # Skip HTML or XML entries.
+            pdf_url = entry.get("url", "").strip()
+            if not pdf_url:
+                continue
+
+            _vprint(f"  [EuropePMC] Trying PDF URL: {pdf_url}")
+            attempt = _download_pdf_url(
+                pdf_url,
+                dest_path,
+                doi=doi,
+                source="europe_pmc",
+            )
+            if attempt.ok:
+                print(f"  [Europe PMC] Saved {dest_path.name}")
+                return True
+
+    # Found the record but could not download any PDF from it.
+    _vprint("  [EuropePMC] Record found but no accessible PDF URL.")
+    _remember_attempt(DownloadAttempt(
+        source="europe_pmc",
+        url=search_url,
+        failure_code="NO_PDF_URL",
+        message="Europe PMC record present but no accessible PDF",
+    ))
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Core single-paper download function
 # ---------------------------------------------------------------------------
 
@@ -2704,62 +2937,85 @@ def download_paper(record_or_doi: dict | str) -> bool:
 
     _vprint(f"  [download] Starting fallback chain for DOI: {doi}")
 
+    # Each fallback below follows the same pattern:
+    #   1. Try to download the PDF from a specific OA source.
+    #   2. If it succeeds, run _post_download_classify() to check the article
+    #      type from the first two pages.
+    #   3. If the article is excluded (case report, short comm, etc.), the PDF
+    #      is deleted and we return False.  If it is secondary research (review),
+    #      the file is renamed with a "2_" prefix and we return True.
+    #      Primary research passes through unchanged.
+
     # Fallback 1: Unpaywall
     # Covers ~50% of recent articles; now tries ALL oa_locations so one broken
     # URL doesn't block access to other valid copies of the same paper.  Direct
     # PDF/repository URLs are prioritized ahead of DOI landing pages.
     if _try_unpaywall(doi, dest_path):
-        return True
+        keep, dest_path = _post_download_classify(doi, dest_path)
+        return keep
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
     # Fallback 2: PubMed Central
     # Many vet journal papers are deposited in PMC under NIH/UKRI OA mandates.
     # Reliable once found via the PMCID lookup step.
     if _try_pubmed_central(doi, dest_path):
-        return True
+        keep, dest_path = _post_download_classify(doi, dest_path)
+        return keep
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
-    # Fallback 3: Semantic Scholar
+    # Fallback 3: Europe PMC
+    # Free OA repository by EMBL-EBI.  Captures UKRI/EU-mandate deposits not
+    # yet indexed by Unpaywall or Semantic Scholar.
+    if _try_europe_pmc(doi, dest_path):
+        keep, dest_path = _post_download_classify(doi, dest_path)
+        return keep
+    time.sleep(DOWNLOAD_DELAY_SECONDS)
+
+    # Fallback 4: Semantic Scholar
     # Good coverage for biomedical content; weaker for purely veterinary journals
     # but still catches many repository-indexed papers.
     if _try_semantic_scholar(doi, dest_path):
-        return True
+        keep, dest_path = _post_download_classify(doi, dest_path)
+        return keep
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
-    # Fallback 4: fulltext-article-downloader CLI
+    # Fallback 5: fulltext-article-downloader CLI
     # Useful when installed, but it can spend time on the same metadata services,
     # so we try our direct repository/PMC paths first.
     if _try_fulltext_downloader(doi, dest_path):
-        return True
+        keep, dest_path = _post_download_classify(doi, dest_path)
+        return keep
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
-    # Fallback 5: Publisher-direct PDF URL
+    # Fallback 6: Publisher-direct PDF URL
     # Catches recently-published OA papers not yet indexed by metadata APIs.
     # Uses browser-like headers to pass CDN bot-detection.
     # Covers: Wiley (10.1111/*), AVMA (10.2460/*), SAGE (10.1177/*).
     if _try_publisher_pdf(doi, dest_path):
-        return True
+        keep, dest_path = _post_download_classify(doi, dest_path)
+        return keep
     time.sleep(DOWNLOAD_DELAY_SECONDS)
 
-    # Fallback 6: Article-page HTML scraping
+    # Fallback 7: Article-page HTML scraping
     # Last resort: follow the DOI redirect, read the citation_pdf_url meta tag,
     # download with a cookie-carrying Session.  Slowest but most robust — can
     # find PDFs that no metadata API has indexed yet.
     if _try_scrape_article_page(doi, dest_path):
-        return True
+        keep, dest_path = _post_download_classify(doi, dest_path)
+        return keep
 
-    # All six fallbacks exhausted — log the final failure clearly.
+    # All seven fallbacks exhausted — log the final failure clearly.
     # The final ledger entry includes the single most useful failed attempt
     # (for example HTTP_403 from Wiley, HTTP_429 rate limit, text/html cookie
     # wall, or %PDF mismatch) so a full run is diagnosable after it finishes.
     best_attempt = _best_failure_attempt()
     if best_attempt is not None and best_attempt.failure_code:
         message = (
-            "All 6 fallbacks failed — "
+            "All 7 fallbacks failed — "
             f"{best_attempt.source} ended with {best_attempt.failure_code}"
         )
     else:
-        message = "All 6 fallbacks failed — no accessible OA PDF found"
+        message = "All 7 fallbacks failed — no accessible OA PDF found"
     _log_download_failure(doi, message, attempt=best_attempt)
     return False
 

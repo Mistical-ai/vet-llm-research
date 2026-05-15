@@ -154,7 +154,7 @@ COLLECT_CANDIDATES_PER_JOURNAL: int = int(
 COLLECT_YEAR_BALANCED: bool = os.getenv("COLLECT_YEAR_BALANCED", "true").lower() == "true"
 COLLECT_YEARS: list[int] = [
     int(year.strip())
-    for year in os.getenv("COLLECT_YEARS", "2023,2024,2025").split(",")
+    for year in os.getenv("COLLECT_YEARS", "2023,2024,2025,2026").split(",")
     if year.strip()
 ]
 
@@ -169,9 +169,12 @@ COLLECT_PREFER_DIRECT_PDF: bool = (
     os.getenv("COLLECT_PREFER_DIRECT_PDF", "true").lower() == "true"
 )
 
-# Publication window for the study.
+# Publication window for the study: 2023 through end of 2026.
+# WHY 2026?  Including the current year ensures we capture very recent OA
+# deposits — many journals now mandate immediate OA on acceptance, so 2025/2026
+# papers are often already available.
 DATE_FROM = "2023-01-01"
-DATE_TO   = "2025-12-31"
+DATE_TO   = "2026-12-31"
 
 # CrossRef API base URL.  The /works endpoint returns individual articles.
 CROSSREF_BASE = "https://api.crossref.org/works"
@@ -377,25 +380,61 @@ def _fetch_crossref_page(
 NON_ARTICLE_TITLE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in [
-        r"^\s*correction\s+to\b",
-        r"^\s*corrigendum\b",
-        r"^\s*erratum\b",
-        r"^\s*retraction\b",
+        # ── Administrative / housekeeping content ─────────────────────────────
+        # These are not articles at all — they appear in CrossRef results because
+        # journals publish them as separate "works" in the same issue.
+        r"^\s*correction\s+to\b",       # "Correction to: [original title]"
+        r"^\s*corrigendum\b",           # "Corrigendum: ..."
+        r"^\s*erratum\b",               # "Erratum: ..."
+        r"^\s*retraction\b",            # "Retraction: ..."
         r"\bexpression\s+of\s+concern\b",
-        r"\bissue\s+information\b",
-        r"^\s*contents?\s*$",
+        r"\bissue\s+information\b",     # Table of contents pages
+        r"^\s*contents?\s*$",           # Bare "Contents" title
         r"\btable\s+of\s+contents\b",
         r"\bfront\s+matter\b",
         r"\bresearch\s+abstract\s+program\b",
         r"\bresearch\s+report\s+program\b",
         r"\bconference\s+abstracts?\b",
         r"\bproceedings\b",
-        r"\beditorial\b",
+        r"\beditorial\b",               # Editor's notes and opinion pieces
         r"\bletter\s+to\s+the\s+editor\b",
         r"\bbook\s+review\b",
         r"\bcommentary\b",
+
+        # ── Non-original-research article types ───────────────────────────────
+        # Veterinary journals label these types at the START of the title or
+        # immediately before a colon.  A pattern like "Case Report: Treatment
+        # of X" is reliably non-original.
+        #
+        # We use ^\s* (start of title) + optional label separator [\:\-—] so
+        # we do NOT accidentally filter a title like "Results from a case series
+        # of 42 dogs" (where "case series" is embedded in a methods sentence).
+        r"^\s*case\s+report\s*[\:\-—]",    # "Case Report: ..."
+        r"^\s*case\s+series\s*[\:\-—]",    # "Case Series: ..."
+        r"^\s*case\s+study\s*[\:\-—]",     # "Case Study: ..."
+        r"^\s*short\s+communication\b",    # "Short Communication: ..."
+        r"^\s*brief\s+communication\b",    # "Brief Communication: ..."
+        r"^\s*brief\s+report\b",           # "Brief Report: ..."
+        r"^\s*imaging\s+diagnosis\b",      # "Imaging Diagnosis: ..."
+        r"^\s*imaging\s+findings?\b",      # "Imaging Findings: ..."
+        r"^\s*rapid\s+communication\b",    # "Rapid Communication: ..."
     ]
 )
+
+# WHY A SEPARATE COLLECT_EXCLUDE_TYPES ENV VAR?
+# The list above is compiled into immutable regex objects at import time.
+# If a researcher needs to add a project-specific exclusion pattern without
+# editing source code (e.g., for reproducibility), they can add plain-text
+# phrases to COLLECT_EXCLUDE_TYPES in .env.  Each phrase is turned into a
+# case-insensitive word-boundary regex and appended to the tuple above.
+_COLLECT_EXCLUDE_TYPES_RAW: str = os.getenv("COLLECT_EXCLUDE_TYPES", "")
+if _COLLECT_EXCLUDE_TYPES_RAW.strip():
+    _extra_patterns = tuple(
+        re.compile(r"\b" + re.escape(phrase.strip()) + r"\b", re.IGNORECASE)
+        for phrase in _COLLECT_EXCLUDE_TYPES_RAW.split(",")
+        if phrase.strip()
+    )
+    NON_ARTICLE_TITLE_PATTERNS = NON_ARTICLE_TITLE_PATTERNS + _extra_patterns
 
 
 def _plain_text(value: str) -> str:
