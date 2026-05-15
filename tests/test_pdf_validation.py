@@ -8,6 +8,7 @@ reproducible.
 """
 
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,6 +28,7 @@ os.environ.setdefault("MIN_SECTIONS", "3")
 
 pdfplumber = pytest.importorskip("pdfplumber")
 
+# Synthetic headings in fixtures match SECTION_PATTERNS category synonyms.
 import download  # noqa: E402
 
 
@@ -223,3 +225,129 @@ def test_blank_pdf_has_no_extractable_text(tmp_path: Path, monkeypatch: pytest.M
     assert result.is_valid is False
     assert result.word_count == 0
     assert result.error_type == "NO_EXTRACTABLE_TEXT"
+
+
+# ─── Deduplication tests (ingest_manual_pdfs) ────────────────────────────────
+
+import ingest_manual_pdfs  # noqa: E402
+
+_DEDUP_DOI_A = "10.9999/dedup-paper-alpha"
+_DEDUP_DOI_B = "10.9999/dedup-paper-beta"
+_RECORD_A = {"doi": _DEDUP_DOI_A, "title": "Dedup Alpha Paper", "journal": "Test Journal"}
+_RECORD_B = {"doi": _DEDUP_DOI_B, "title": "Dedup Beta Paper", "journal": "Test Journal"}
+
+
+def _setup_dedup_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    records: list[dict],
+) -> tuple[Path, Path, Path]:
+    """Create temp dirs, write corpus manifest, patch module globals.
+
+    Returns (inbox, raw_dir, manual_manifest_path).
+    """
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    manifest = tmp_path / "manifest.jsonl"
+    manual_manifest = tmp_path / "manual_manifest.jsonl"
+
+    with open(manifest, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+    monkeypatch.setattr(ingest_manual_pdfs, "MANIFEST_PATH", manifest)
+    monkeypatch.setattr(ingest_manual_pdfs, "MANUAL_MANIFEST_PATH", manual_manifest)
+    monkeypatch.setattr(ingest_manual_pdfs, "RAW_DIR", raw)
+
+    return inbox, raw, manual_manifest
+
+
+def test_dedup_skips_pdf_already_in_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dropping the same paper twice should import once and skip on the second run."""
+    inbox, _raw, _mm = _setup_dedup_env(tmp_path, monkeypatch, [_RECORD_A])
+    monkeypatch.setattr(
+        ingest_manual_pdfs,
+        "_gather_dois_from_pdf",
+        lambda p: ([_DEDUP_DOI_A], "Dedup Alpha Paper", f"[pdf]={p.name}"),
+    )
+
+    _write_blank_pdf(inbox / "paper_a.pdf")
+    counts1 = ingest_manual_pdfs._process_inbox(inbox)
+    assert counts1["imported"] == 1, f"first run: {dict(counts1)}"
+
+    _write_blank_pdf(inbox / "paper_a_again.pdf")
+    counts2 = ingest_manual_pdfs._process_inbox(inbox)
+    assert counts2.get("skipped_existing_raw", 0) == 1, f"second run: {dict(counts2)}"
+    assert counts2.get("imported", 0) == 0
+
+
+def test_dedup_manifest_no_duplicate_doi_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a DOI is already in manual_manifest.jsonl, ingesting again must not add a second line."""
+    inbox, _raw, manual_manifest = _setup_dedup_env(tmp_path, monkeypatch, [_RECORD_A])
+    monkeypatch.setattr(
+        ingest_manual_pdfs,
+        "_gather_dois_from_pdf",
+        lambda p: ([_DEDUP_DOI_A], "Dedup Alpha Paper", f"[pdf]={p.name}"),
+    )
+
+    with open(manual_manifest, "w", encoding="utf-8") as f:
+        f.write(json.dumps(_RECORD_A) + "\n")
+
+    _write_blank_pdf(inbox / "paper_a.pdf")
+    counts = ingest_manual_pdfs._process_inbox(inbox)
+    assert counts["imported"] == 1
+
+    lines = [ln for ln in manual_manifest.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1, f"Expected exactly 1 manifest line, found {len(lines)}"
+
+
+def test_new_pdf_imported_after_prior_ingestion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuinely new paper must still import correctly on a subsequent run."""
+    inbox, _raw, manual_manifest = _setup_dedup_env(tmp_path, monkeypatch, [_RECORD_A, _RECORD_B])
+
+    monkeypatch.setattr(
+        ingest_manual_pdfs,
+        "_gather_dois_from_pdf",
+        lambda p: ([_DEDUP_DOI_A], "Dedup Alpha Paper", f"[pdf]={p.name}"),
+    )
+    _write_blank_pdf(inbox / "paper_a.pdf")
+    counts1 = ingest_manual_pdfs._process_inbox(inbox)
+    assert counts1["imported"] == 1, f"run 1: {dict(counts1)}"
+
+    monkeypatch.setattr(
+        ingest_manual_pdfs,
+        "_gather_dois_from_pdf",
+        lambda p: ([_DEDUP_DOI_B], "Dedup Beta Paper", f"[pdf]={p.name}"),
+    )
+    _write_blank_pdf(inbox / "paper_b.pdf")
+    counts2 = ingest_manual_pdfs._process_inbox(inbox)
+    assert counts2["imported"] == 1, f"run 2 (paper B): {dict(counts2)}"
+
+    lines = [ln for ln in manual_manifest.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 2
+    dois = {json.loads(ln)["doi"] for ln in lines}
+    assert _DEDUP_DOI_A in dois and _DEDUP_DOI_B in dois
+
+
+def test_manual_pdf_lands_in_raw_with_descriptive_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Manual PDFs must arrive in data/raw/ with the same descriptive filename that download.py uses."""
+    from file_paths import descriptive_pdf_filename
+
+    inbox, raw, _mm = _setup_dedup_env(tmp_path, monkeypatch, [_RECORD_A])
+    monkeypatch.setattr(
+        ingest_manual_pdfs,
+        "_gather_dois_from_pdf",
+        lambda p: ([_DEDUP_DOI_A], "Dedup Alpha Paper", f"[pdf]={p.name}"),
+    )
+
+    _write_blank_pdf(inbox / "arbitrarily_named.pdf")
+    counts = ingest_manual_pdfs._process_inbox(inbox)
+    assert counts["imported"] == 1
+
+    expected_name = descriptive_pdf_filename(_RECORD_A)
+    expected_path = raw / expected_name
+    assert expected_path.exists(), (
+        f"Expected file at raw/{expected_name} but found: {[p.name for p in raw.iterdir()]}"
+    )

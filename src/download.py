@@ -37,8 +37,9 @@ HOW WE VERIFY A PDF IS USEFUL FOR LLM SUMMARISATION:
       2. Open it with pdfplumber and count pages; reject if fewer than MIN_PAGES.
       3. Extract text from every page (same extractor as ``src/extract.py``).
       4. Remove anything after a References/Bibliography heading.
-      5. Require section-heading signals (introduction, methods/materials-and-methods,
-         results, discussion): at least MIN_SECTIONS distinct matches.
+      5. Require section-heading signals (introduction / methods / results /
+         discussion / conclusion categories with synonym regexes): at least MIN_SECTIONS
+         distinct matched categories.
       6. Count words; accept only if the useful pre-references text has at least
          MIN_EXTRACTED_WORDS words (default: 3000).
 
@@ -307,7 +308,8 @@ MIN_EXTRACTED_TOKENS: int = int(os.getenv("MIN_EXTRACTED_TOKENS", "4000"))
 # Reject flyers, letters, or one-page stubs before extracting full text.
 MIN_PAGES: int = int(os.getenv("MIN_PAGES", "3"))
 
-# Require common article section headings before the word-count gate.
+# Require distinct section categories (see SECTION_PATTERNS / count_matching_sections)
+# before the word-count gate—not raw literal header substring counts.
 MIN_SECTIONS: int = int(os.getenv("MIN_SECTIONS", "3"))
 
 # Escape hatch for unit tests that need to exercise network/save plumbing
@@ -912,50 +914,56 @@ VALIDATION_REFERENCES_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# IMRAD-ish headings (after References strip).  "Materials and methods" is
-# counted as its own label; standalone "methods" only counts when the long
-# phrase is absent so embedded "methods" is not double-counted.
-_SECTION_HEADER_GROUPS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("introduction", re.compile(r"\bintroduction\b", re.I)),
-    (
-        "materials and methods",
-        re.compile(r"\bmaterials\s+and\s+methods\b", re.I),
+# Five manuscript categories (each has a synonym-rich pattern).  We count distinct
+# categories matched, not occurrences or raw substring tallies.
+SECTION_PATTERNS: dict[str, re.Pattern[str]] = {
+    "introduction": re.compile(
+        r"(?i)\b(?:"
+        r"introduction|intro|literature\s+review|study\s+rationale|rationale|"
+        r"objectives?|aims?|study\s+aims|purpose|study\s+purpose|"
+        r"background|study\s+background|overview"
+        r")\b"
     ),
-    ("methods", re.compile(r"\bmethods\b", re.I)),
-    ("results", re.compile(r"\bresults\b", re.I)),
-    ("discussion", re.compile(r"\bdiscussion\b", re.I)),
-)
+    "methods": re.compile(
+        r"(?i)\b(?:"
+        r"materials\s+and\s+methods|methods\s+and\s+materials|"
+        r"patients\s+and\s+methods|subjects\s+and\s+methods|"
+        r"research\s+design|study\s+design|experimental\s+design|study\s+protocol|"
+        r"research\s+(?:methods|procedure)|experimental\s+(?:methods|procedure)|"
+        r"study\s+(?:population|cohort|sample)|statistical\s+analysis|"
+        r"statistical\s+methods|methodology|methods"
+        r")\b"
+    ),
+    "results": re.compile(
+        r"(?i)\b(?:results|findings\b|study\s+findings|key\s+findings)\b"
+    ),
+    "discussion": re.compile(
+        r"(?i)\b(?:"
+        r"discussion|general\s+discussion|clinical\s+implications\b|"
+        r"implications\b|interpretation\b|interpretations\b|commentary\b"
+        r")\b"
+    ),
+    "conclusion": re.compile(
+        r"(?i)\b(?:"
+        r"conclusions?|concluding\s+remarks|discussion\s+and\s+conclusions?|"
+        r"clinical\s+impact|clinical\s+relevance|study\s+summary"
+        r")\b"
+    ),
+}
 
 
-def _detect_article_section_headers(text: str) -> list[str]:
+def count_matching_sections(text: str) -> tuple[int, list[str]]:
     """
-    Return which canonical section headings appear in ``text``.
+    Return how many categories match ``text`` and their names (stable dict order).
 
-    Caller compares ``len(found) >= MIN_SECTIONS``.
+    Each category contributes at most one toward the count.  Matching uses
+    pre-compiled ``SECTION_PATTERNS`` synonyms, not equality to a literal header line.
     """
-    _, intro_p = _SECTION_HEADER_GROUPS[0]
-    _, mam_p = _SECTION_HEADER_GROUPS[1]
-    _, meth_p = _SECTION_HEADER_GROUPS[2]
-    _, res_p = _SECTION_HEADER_GROUPS[3]
-    _, disc_p = _SECTION_HEADER_GROUPS[4]
-
-    found: list[str] = []
-
-    if intro_p.search(text):
-        found.append("introduction")
-
-    if mam_p.search(text):
-        found.append("materials and methods")
-    elif meth_p.search(text):
-        found.append("methods")
-
-    if res_p.search(text):
-        found.append("results")
-
-    if disc_p.search(text):
-        found.append("discussion")
-
-    return found
+    matched: list[str] = []
+    for category, pattern in SECTION_PATTERNS.items():
+        if pattern.search(text):
+            matched.append(category)
+    return len(matched), matched
 
 
 def _validation_is_disabled() -> bool:
@@ -1047,7 +1055,7 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
     Validate that a PDF contains enough extractable text for LLM summarisation.
 
     Order: ``%PDF`` magic check → minimum page count → extract text with
-    pdfplumber → references strip → IMRAD-ish section headings → word count /
+    pdfplumber → references strip → section category synonyms → word count /
     MIN_EXTRACTED_WORDS hard gate → token diagnostic.
 
     The hard acceptance rule remains ``MIN_EXTRACTED_WORDS`` after references are
@@ -1058,7 +1066,8 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
       2. Reject missing, zero-byte, or non-%PDF files.
       3. Open with pdfplumber; reject ``page_count < MIN_PAGES``.
       4. Extract text from each page.
-      5. Strip references; require ``MIN_SECTIONS`` section-heading matches.
+      5. Strip references; require ``MIN_SECTIONS`` distinct section categories
+         (synonym patterns in ``SECTION_PATTERNS``).
       6. Normalize whitespace and enforce ``MIN_EXTRACTED_WORDS``.
     """
     if _validation_is_disabled():
@@ -1136,13 +1145,13 @@ def _validate_pdf_text(pdf_path: Path) -> PdfValidationResult:
     # long bibliography from passing the useful-text gate.
     useful_text = _remove_references_for_validation(raw_text)
 
-    section_matches = _detect_article_section_headers(useful_text)
-    if len(section_matches) < MIN_SECTIONS:
+    section_count, section_matches = count_matching_sections(useful_text)
+    if section_count < MIN_SECTIONS:
         return _validation_failure_result(
             "MISSING_SECTIONS",
             (
-                "Too few manuscript section headings (need "
-                f"{MIN_SECTIONS}, found {len(section_matches)}: "
+                "Too few matched section categories (need "
+                f"{MIN_SECTIONS}, found {section_count}: "
                 + (", ".join(section_matches) if section_matches else "(none)")
                 + ")"
             ),
@@ -1263,7 +1272,7 @@ def _log_validation_failure(
         diag = f"page_count={result.page_count}; minimum {MIN_PAGES} pages"
     elif err == "MISSING_SECTIONS":
         hdrs = ", ".join(result.section_headers_found or []) or "none"
-        diag = f"headers found [{hdrs}] (need ≥{MIN_SECTIONS})"
+        diag = f"categories matched [{hdrs}] (need ≥{MIN_SECTIONS})"
     else:
         diag = f"{result.word_count:,} words; minimum {MIN_EXTRACTED_WORDS:,}"
 
