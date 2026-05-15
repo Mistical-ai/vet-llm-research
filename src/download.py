@@ -2831,7 +2831,7 @@ def _try_europe_pmc(doi: str, dest_path: Path) -> bool:
                 "format": "json",
                 "resultType": "core",
             },
-            headers=HEADERS,
+            headers=BROWSER_HEADERS,
             timeout=REQUEST_TIMEOUT,
             verify=False,
         )
