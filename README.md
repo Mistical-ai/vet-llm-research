@@ -1,995 +1,566 @@
 # Veterinary LLM Research Pipeline
 
-This project is a research pipeline for collecting veterinary journal papers,
-downloading open-access PDFs, cleaning the text, and preparing the data for
-future LLM summarization and evaluation.
+**Goal:** Collect 250 veterinary journal papers (50 from each of 5 journals, 2023–2026), download open-access PDFs, clean the text, and prepare for LLM summarization and evaluation.
 
-Research goal: evaluate large language models on veterinary literature
-summarization using papers from 2023-2025 in major veterinary journals.
+**Project context:** OVC Pet Trust Summer Studentship, 2026.
 
-Project context: OVC Pet Trust Summer Studentship, 2026.
+---
 
-## How this fits together (beginner overview)
+## Table of Contents
 
-Think of the pipeline as an assembly line with **four main stations** you usually run in order:
+1. [How the pipeline works (plain English)](#how-the-pipeline-works-plain-english)
+2. [First-time setup](#first-time-setup)
+3. [The 4 commands you need to know](#the-4-commands-you-need-to-know)
+4. [Step-by-step guide](#step-by-step-guide)
+   - [Step 1 — Build the paper list](#step-1--build-the-paper-list)
+   - [Step 2 — Auto-download open-access PDFs](#step-2--auto-download-open-access-pdfs)
+   - [Step 3 — Check your progress](#step-3--check-your-progress)
+   - [Step 4 — Find out what's still missing](#step-4--find-out-whats-still-missing)
+   - [Step 5 — Add papers manually](#step-5--add-papers-manually)
+   - [Step 6 — Repeat until done](#step-6--repeat-until-done)
+5. [Understanding the folders](#understanding-the-folders)
+6. [Troubleshooting failed PDFs](#troubleshooting-failed-pdfs)
+7. [Optional / advanced commands](#optional--advanced-commands)
+8. [Corpus design](#corpus-design)
+9. [All environment variables (.env)](#all-environment-variables-env)
+10. [Design decisions](#design-decisions)
+11. [Glossary](#glossary)
 
-1. **List papers** — `python src/collect.py` asks CrossRef for candidate DOIs and writes one line per paper to `data/manifest.jsonl` (a simple text file where each line is JSON).
-2. **Download PDFs** — `python src/download.py` tries several **legal open-access** sources for each DOI and saves passing PDFs under `data/raw/`.
-3. **Extract text** — `python src/extract.py` (or your future summarization code) reads PDFs and prepares clean text. The repo’s `extract.py` entry point is a **small smoke test** using fixtures.
-4. **Check overall progress** — `python pipeline.py` merges the automatic list with any hand-added papers and prints how close you are to **250 PDFs**.
+---
 
-Optional: **`python src/supplement.py`** helps when a journal cannot reach 50 OA PDFs automatically — it explains what to do next and updates `data/missing_papers.csv`.
+## How the pipeline works (plain English)
 
-Manual PDFs: drop files in **`data/incoming_manuals/`** and run **`python src/auto_ingest_workflow.py`** (enrichment → ingest → status). See [Design Decisions](#design-decisions) and the [Glossary](#glossary).
+Think of the pipeline as a **post-office assembly line** with three main stations:
 
-All detailed terms (DOI, CrossRef, OA, etc.) are defined in the [Glossary](#glossary) at the end of this file.
-
-## Balanced Corpus Design
-
-The pipeline targets **exactly 250 papers — 50 from each of 5 journals**:
-
-| Journal | ISSN | Target |
-|---------|------|--------|
-| Journal of Veterinary Internal Medicine (JVIM) | 1939-1676 | 50 |
-| Journal of the American Veterinary Medical Association (JAVMA) | 0003-1488 | 50 |
-| Veterinary Surgery | 0161-3499 | 50 |
-| Veterinary Radiology & Ultrasound (VRU) | 1058-8183 | 50 |
-| Journal of Feline Medicine and Surgery (JFMS) | 1098-612X | 50 |
-
-Equal-quota sampling is used instead of proportional sampling for two reasons:
-
-1. **Bias prevention**: proportional sampling would over-represent high-OA journals
-   like JVIM and under-represent surgical journals, biasing the LLM's learned
-   writing-style patterns.
-2. **Subgroup analysis power**: 50 papers per journal gives adequate statistical
-   power for per-journal comparisons in Phase 4.
-
-**Date range**: 2023-01-01 to 2025-12-31.  
-**Open-access only**: no paywalled content is ever attempted.  
-**Shortfall handling**: if a journal has fewer than 50 OA papers available,
-the pipeline logs the deficit and generates `data/missing_papers.csv` for
-manual supplementation via `src/supplement.py`.
-
-## Current Status — Phase 2.4 Validation
-
-This branch (`phase-2.4-validation`) documents and hardens the Phase 2 ingestion
-pipeline: beginner-oriented comments in the Core 5 scripts, manifest enrichment
-before manual ingest, and the production-safe OA downloader.
-
-### What is new in Phase 2.1
-
-**Expanded OA fallback chain (6 sources, in order):**
-
-1. Unpaywall API — now tries every `oa_locations` entry, prioritizing direct PDFs
-2. PubMed Central (NCBI E-utils) — DOI → PMCID → PDF or OA tar.gz package
-3. Semantic Scholar API — returns `openAccessPdf` URL when known
-4. `fulltext-article-downloader` CLI — queries Unpaywall, BASE, and CORE
-5. Publisher-direct PDF URL — Wiley (`10.1111/`), AVMA (`10.2460/`), SAGE (`10.1177/`)
-6. Article-page HTML scraping — follows DOI redirect, reads `citation_pdf_url` meta tag
-
-**Publisher-safe throttling:**
-
-- API requests use a short fixed delay (`DOWNLOAD_DELAY_SECONDS`)
-- Publisher website requests use a separate configurable random jitter
-  (`PUBLISHER_DELAY_MIN_SECONDS` / `PUBLISHER_DELAY_MAX_SECONDS`)
-- HTTP 429 rate-limit responses are respected via `Retry-After` header
-
-**Structured failure diagnostics:**
-
-- Every attempted URL now records HTTP status code, final redirect URL,
-  `Content-Type`, and the first 200 bytes of the response body
-- `MIME_TYPE_MISMATCH`, `HTTP_403`, `HTTP_429`, `PDF_MAGIC_MISMATCH`,
-  `NO_PDF_URL`, and `REQUEST_TIMEOUT` are distinct failure codes
-- `data/error_log.jsonl` now includes the best failure detail per DOI,
-  not just a generic "all fallbacks failed" message
-
-**NCBI OA package support:**
-
-- When PMC's browser-facing PDF URL returns a JavaScript challenge page,
-  the pipeline falls back to NCBI's official `oa.fcgi` OA package service,
-  downloads the `tar.gz`, and extracts the PDF from it
-
-**All downloads validated by `%PDF` magic bytes:**
-
-- HTML pages, login walls, bot-challenge pages, and empty files are all
-  rejected before saving, regardless of HTTP status or Content-Type header
-
-**All accepted PDFs must contain enough extractable text:**
-
-- A file can be a valid PDF and still be useless for LLM summarization. For
-  example, it might be a one-page abstract, a correction notice, an image-only
-  scan, or a publisher placeholder page.
-- After the basic `%PDF` file-format check, `src/download.py` opens the PDF
-  with `pdfplumber`, counts pages (`MIN_PAGES`, default `3`; reject with
-  `TOO_FEW_PAGES` if shorter), extracts text from every page, removes anything after a
-  References/Bibliography heading, then checks IMRAD-style headings
-  (`MIN_SECTIONS`, default `3` matches among introduction / methods /
-  materials-and-methods / results / discussion; reject with `MISSING_SECTIONS`).
-- The final acceptance rule remains `MIN_EXTRACTED_WORDS=3000` by default. A PDF with
-  fewer useful words after that pipeline is rejected and does not count toward the 50-paper journal quota.
-- `TARGET_EXTRACTED_WORDS=4500` documents the desired paper length used for
-  budgeting, while `MIN_EXTRACTED_TOKENS=4000` is kept as a diagnostic estimate.
-  The pipeline does not reject by token count because exact token counts depend
-  on the model tokenizer.
-- Existing PDFs in `data/raw/` are rechecked at the start of each live download
-  run. Bad existing PDFs are moved to `data/quarantine/` instead of deleted, so
-  the pipeline can retry that DOI while preserving an audit trail.
-
-**The pipeline can now:**
-
-- collect up to 2000 DOI candidates per journal from CrossRef (stratified across 2023-2025)
-- skip obvious non-paper records such as corrections, errata, issue information, and abstract programs
-- optionally annotate candidates with Unpaywall OA metadata before downloading
-- infer covariates: species, study design, clinical topic
-- download only legally open-access PDFs through a 6-source fallback chain
-- detect and log OA shortfalls; generate `data/missing_papers.csv`
-- extract and clean PDF text, remove references before truncating
-- keep a structured error ledger with per-attempt diagnostic detail
-- merge OA and manually supplemented PDFs into a unified corpus view
-- run in dry-run mode with no network calls
-
-Future phases will add LLM summarization, LLM-as-a-judge evaluation, human
-review, and statistical analysis.
-
-## Project Structure
-
-```text
-.
-|-- README.md
-|-- requirements.txt
-|-- .env.template
-|-- pipeline.py               # Merges OA + manual PDFs; reports corpus status
-|-- data/                     # Created locally; usually gitignored
-|   |-- manifest.jsonl         # OA paper list created by collect.py
-|   |-- manual_manifest.jsonl  # Manually added papers (same schema as manifest.jsonl)
-|   |-- raw/                   # Accepted PDFs that passed format + text validation
-|   |-- quarantine/            # Rejected old PDFs plus JSON sidecar metadata
-|   |-- error_log.jsonl        # Pipeline errors + OA shortfall entries
-|   `-- missing_papers.csv     # Papers needing manual supplementation
-|-- src/
-|   |-- main.py                # Simple startup check
-|   |-- collect.py             # Stratified CrossRef collection (200 candidates/journal)
-|   |-- download.py            # Balanced OA download (stop-loss at 50 PDFs/journal)
-|   |-- supplement.py          # Manual supplement helper — prints instructions, writes CSV
-|   |-- extract.py             # Extracts and cleans PDF text (library + smoke-test `__main__`)
-|   |-- file_paths.py          # Shared PDF naming + path resolution (descriptive vs legacy)
-|   |-- utils.py               # Budget guard, rate limits, error logging
-|   `-- utils/
-|       `-- generate_mock.py   # Development helper: writes a synthetic JSON paper fixture
-`-- tests/
-    |-- manual_test_phase2.py  # Phase 2 checklist tests
-    |-- test_pdf_validation.py # Unit tests for the PDF text validation gate
-    |-- test_file_paths.py     # Unit tests for descriptive filenames and path resolution
-    |-- test_collect_filters.py # Unit tests for non-article filters and year windows
-    `-- fixtures/
-        `-- sample_paper.json
+```
+[CrossRef API]              [Open-access sources]          [Your computer]
+      ↓                             ↓                              ↓
+  collect.py          →        download.py           →         data/raw/
+  (builds a list)           (grabs free PDFs)             (your PDF collection)
+      ↓                             ↓
+ manifest.jsonl               pipeline.py
+ (catalogue of                (scoreboard:
+  known papers)               how close to 250?)
 ```
 
-## Every script and what it does
+When automatic download isn't enough (many papers are paywalled), you download them yourself from the library and run:
 
-| What you run | Role |
-|--------------|------|
-| `python src/collect.py` | Builds or appends `data/manifest.jsonl` from CrossRef (or mock rows if `DRY_RUN=true`). |
-| `python src/download.py` | Walks the manifest, downloads **OA-only** PDFs with validation, writes `data/error_log.jsonl` and possibly `data/missing_papers.csv`. |
-| `python src/extract.py` | **Smoke test only**: forces `DRY_RUN=true`, loads a fixture DOI, prints success and a short preview. Import `extract_clean_text` from code for real extraction. |
-| `python src/supplement.py` | Human-facing report for journals below 50 PDFs; refreshes `data/missing_papers.csv`. |
-| `python src/enrich_manifest_from_pdfs.py` | Pre-ingest: reads metadata DOIs from inbox PDFs, queries CrossRef per unknown DOI, appends rows to `manifest.jsonl`. |
-| `python src/ingest_manual_pdfs.py` | Moves legal manual PDFs from `data/manual_inbox/` into `data/raw/` with descriptive filenames; appends `data/manual_manifest.jsonl`. Read-only on `manifest.jsonl`. |
-| `python src/auto_ingest_workflow.py` | End-to-end manual ingest: retry `failed/`, stage `incoming_manuals/` → inbox, enrich manifest, ingest, `pipeline.py`, supplement, optional cleanup. Logs to `data/logs/auto_ingest_workflow.log`. |
-| `python pipeline.py` | Loads OA + `data/manual_manifest.jsonl`, validates PDFs on disk, prints per-journal status. **Exits with code 1** if fewer than **200** confirmed PDFs (for scripts/CI). |
-| `python src/main.py` | Minimal sanity check: loads `.env` and prints that the environment is initialized. |
-| `python src/utils/generate_mock.py` | Developer utility to regenerate rich mock JSON (not required for the normal user workflow). |
-
-**Library modules** (imported by other code, not “steps”): `src/file_paths.py` (filenames), `src/utils.py` (logging, budget guard, delays).
-
-## Before You Start
-
-You need these installed on your computer:
-
-- Git
-- Python 3.10 or newer
-- A terminal, such as PowerShell on Windows
-- Internet access for live collection and download runs
-
-You do not need paid API keys for the current Phase 2 dry run.
-
-## Quick Start: Run The Pipeline After Cloning
-
-These steps are written for Windows PowerShell. Run each command from the
-terminal, one at a time.
-
-### Step 1: Clone The Project
-
-Cloning means "download a copy of this project onto your computer."
-
-```powershell
-git clone <REPOSITORY_URL>
+```
+data/incoming_manuals/    →    auto_ingest_workflow.py    →    data/raw/
+(you drop PDFs here)           (matches, renames, moves)       (accepted PDFs)
 ```
 
-Replace `<REPOSITORY_URL>` with the real GitHub repository URL.
+The workflow script is smart: before trying to match each PDF, it looks up the paper's DOI in CrossRef and adds it to the catalogue automatically. This means PDFs that used to get stuck in a `failed/` folder will now be matched and accepted.
 
-### Step 2: Go Into The Project Folder
+---
 
-After cloning, move your terminal into the new folder.
+## First-time setup
 
 ```powershell
+# 1. Clone the repo and enter it
+git clone https://github.com/Mistical-ai/vet-llm-research.git
 cd vet-llm-research
-```
 
-If your cloned folder has a different name, use that folder name instead.
-
-### Step 3: Create A Virtual Environment
-
-A virtual environment is a small, private Python workspace for this project.
-It keeps this project's packages separate from other Python projects.
-
-```powershell
+# 2. Create a virtual environment and activate it
 python -m venv .venv
-```
+.venv\Scripts\activate          # Windows PowerShell
 
-### Step 4: Turn On The Virtual Environment
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell says scripts are blocked, run this once in the same terminal:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-
-Then try activating again:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-You will know it worked if you see `(.venv)` at the start of your terminal line.
-
-### Step 5: Install The Required Packages
-
-Packages are pieces of Python code that this project depends on.
-
-```powershell
+# 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. Copy the environment template and fill it in
+copy .env.template .env
+# Open .env in any text editor:
+#   - Set DRY_RUN=false  (use real network; keep =true just to practice)
+#   - Set UNPAYWALL_EMAIL=your.name@uoguelph.ca  (required for CrossRef)
+
+# 5. Verify everything loaded correctly (optional)
+python src/main.py
+# Expected output: "Pipeline Initialized." — if you see this, you're ready.
 ```
 
-This installs all dependencies, including `beautifulsoup4` (for HTML parsing
-in the downloader) and `fulltext-article-downloader` (one option **midway**
-through the six-step OA acquisition chain — after Unpaywall, PubMed Central,
-and Semantic Scholar). Wait until the install finishes before moving to the
-next step.
+---
 
-### Step 6: Create Your Local Settings File
+## The 4 commands you need to know
 
-The `.env` file stores settings for your own computer. It is not committed to
-Git because it may later contain private API keys.
+| # | Command | What it does |
+|---|---------|-------------|
+| 1 | `python src/collect.py` | Build the paper list |
+| 2 | `python src/download.py` | Auto-download open-access PDFs |
+| 3 | `python src/supplement.py` | See what's still missing |
+| 4 | `python src/auto_ingest_workflow.py` | Add manual PDFs to the corpus |
+
+Run `python pipeline.py` at any time to see the scoreboard.
+
+---
+
+## Step-by-step guide
+
+### Step 1 — Build the paper list
 
 ```powershell
-Copy-Item .env.template .env
+python src/collect.py
 ```
 
-Open `.env` and check these values:
+**What it does:** Asks CrossRef (a public academic database) for papers from each of the 5 journals published between 2023 and 2026. Writes one line per paper to `data/manifest.jsonl` — this is your catalogue of known papers.
 
-```text
-DRY_RUN=true
-BUDGET_HARD_STOP=0.00
-UNPAYWALL_EMAIL=your.name@uoguelph.ca
-
-# -- Downloader settings (safe production defaults) --
-DOWNLOAD_VERBOSE=false
-DOWNLOAD_DELAY_SECONDS=2
-PUBLISHER_DELAY_MIN_SECONDS=10
-PUBLISHER_DELAY_MAX_SECONDS=25
-RATE_LIMIT_BACKOFF_SECONDS=60
-
-# -- PDF text validation settings --
-MIN_EXTRACTED_WORDS=3000
-TARGET_EXTRACTED_WORDS=4500
-MIN_EXTRACTED_TOKENS=4000
-SKIP_VALIDATION_FOR_TESTING=false
+**What you'll see:**
+```
+[collect] JVIM: querying years 2023, 2024, 2025, 2026 ...
+[collect] JVIM 2023: 487 candidates
+[collect] JAVMA: querying years ...
+...
+[collect] Collection complete. Manifest contains 8,432 new entries.
 ```
 
-For your first run, keep `DRY_RUN=true`. This is the safest mode. It uses mock
-data and avoids real downloads.
+**What you'll have after:** A `data/manifest.jsonl` file with thousands of candidate papers. No PDFs yet.
 
-Change `UNPAYWALL_EMAIL` to your university email address (no leading space).
-This is not a secret; it is used by CrossRef and Unpaywall to identify the
-requesting institution.
+**Important note:** Running `collect.py` again will **add** more entries — it never deletes. If you want to start fresh, delete `data/manifest.jsonl` first.
 
-The downloader variables control throttling for publisher-facing requests:
-
-| Variable | Default | Description |
+**Settings you can change in `.env`:**
+| Variable | Default | What it does |
 |----------|---------|-------------|
-| `DOWNLOAD_VERBOSE` | `false` | Print per-URL debug info (status, Content-Type, body start) |
-| `DOWNLOAD_DELAY_SECONDS` | `2` in `.env.template` | Pause between API calls (Unpaywall, Semantic Scholar, PMC) |
-| `PUBLISHER_DELAY_MIN_SECONDS` | `10` | Minimum random jitter before a publisher URL request |
-| `PUBLISHER_DELAY_MAX_SECONDS` | `25` | Maximum random jitter before a publisher URL request |
-| `RATE_LIMIT_BACKOFF_SECONDS` | `60` | Fallback sleep when a server returns HTTP 429 with no `Retry-After` |
+| `DRY_RUN` | `true` | Set to `false` for real network calls |
+| `COLLECT_CANDIDATES_PER_JOURNAL` | `2000` | How many candidates per journal to collect |
+| `COLLECT_YEARS` | `2023,2024,2025,2026` | Which years to include |
+| `UNPAYWALL_EMAIL` | *(required)* | Your email — needed for CrossRef polite-pool access |
 
-Set all delay values to `0` only during single-DOI debugging. Leave them at
-their defaults for real collection runs to respect publisher rate limits.
+---
 
-The validation variables control which PDFs are allowed into `data/raw/`:
-
-- `MIN_EXTRACTED_WORDS=3000` is the hard gate. If `pdfplumber` extracts fewer
-  than 3,000 useful words after references are removed, the PDF is rejected.
-- `TARGET_EXTRACTED_WORDS=4500` is the desired planning target. It explains the
-  budget assumption but does not reject papers by itself.
-- `MIN_EXTRACTED_TOKENS=4000` is recorded in logs for cost awareness. It is not
-  the hard gate because token counts vary by LLM provider.
-- `SKIP_VALIDATION_FOR_TESTING=false` should stay false for real work. Only set
-  it to true in narrow unit tests that are not testing PDF extraction.
-
-The `.env.template` file also documents **collection** options (`COLLECT_CANDIDATES_PER_JOURNAL`, year balancing, optional Unpaywall preflight). You can leave them at their defaults until you read the **Running With Real Data** section.
-
-### Step 7: Run The Phase 2 Checklist
-
-This checks the safety pieces before you run the pipeline.
-
-```powershell
-python tests/manual_test_phase2.py
-```
-
-You want to see:
-
-```text
-ALL TESTS PASSED - Phase 2 is ready.
-```
-
-If a test fails, read the message in the terminal before continuing.
-
-### Step 8: Collect The Paper List
-
-This creates `data/manifest.jsonl` with up to `COLLECT_CANDIDATES_PER_JOURNAL` OA candidates per journal (default **2000**).
-Live collection queries 2023, 2024, and 2025 separately by default so the
-manifest does not fill only from the newest CrossRef results. It also skips
-obvious non-paper records such as corrections, errata, issue information, and
-conference abstract/report programs.
-
-In dry-run mode, it writes 2 fake papers per journal (10 total) so you can
-test the pipeline without using the internet.
-
-```powershell
-python src/collect.py
-```
-
-Expected result:
-
-```text
-[collect] DRY_RUN per-journal candidate counts:
-  JVIM                       2 mock candidates  (download target: 50)
-  JAVMA                      2 mock candidates  (download target: 50)
-  Veterinary Surgery         2 mock candidates  (download target: 50)
-  VRU                        2 mock candidates  (download target: 50)
-  JFMS                       2 mock candidates  (download target: 50)
-Collection complete. Manifest contains 10 new entries.
-```
-
-Important: `collect.py` appends to `data/manifest.jsonl`. For a clean fresh
-run, delete `data/manifest.jsonl` before running collection again.
-
-### Step 9: Test The Download Step
-
-In dry-run mode, this does not download real PDFs. It simulates the balanced
-per-journal scheduling and shows what would happen per journal.
+### Step 2 — Auto-download open-access PDFs
 
 ```powershell
 python src/download.py
 ```
 
-Expected result (dry-run with 2 mock papers per journal):
+**What it does:** Goes through every paper in `data/manifest.jsonl`, tries up to 6 legal open-access sources for each one, validates each PDF (right format? enough text? proper structure?), and saves passing PDFs to `data/raw/`. Stops at 50 PDFs per journal.
 
-```text
-[download] DRY_RUN=true — no network calls.
-[download] Simulating balanced download (existing PDFs already counted).
+**The 6 sources it tries (in order):**
+1. Unpaywall API (largest OA index)
+2. PubMed Central (NIH's free archive)
+3. Semantic Scholar
+4. fulltext-article-downloader tool
+5. Publisher-direct URLs (Wiley, AVMA, SAGE)
+6. HTML scraping (follows the DOI link, looks for a PDF button)
 
-  Journal                   Exist  Would add  Shortfall
-  -------------------------------------------------------
-  JVIM                          0          2          0
-  JAVMA                         0          2          0
-  Veterinary Surgery            0          2          0
-  VRU                           0          2          0
-  JFMS                          0          2          0
-  -------------------------------------------------------
-  TOTAL                         0         10          0
+**The 5 validation checks every PDF must pass:**
+1. Starts with the `%PDF` magic bytes (confirms it's a real PDF, not a login page)
+2. Has at least 3 pages
+3. Has extractable text (not a scanned image)
+4. Has at least 3 of: Introduction, Methods, Results, Discussion, Conclusion
+5. Has at least 3,000 words after removing the reference list
 
-[download] DRY_RUN summary: 10/250 PDFs would be acquired, 0 shortfall.
+**What you'll see:**
+```
+[download] JVIM: 10.1111/jvim.16872 → Unpaywall OK (direct PDF)
+[download] JVIM: 10.1111/jvim.16858 → Cloudflare blocked — try library
+[download] JVIM: 10.1111/jvim.16918 → PMC OK
+...
+[download] JVIM: 50/50 ✓  JAVMA: 32/50  Vet Surgery: 45/50  VRU: 41/50  JFMS: 28/50
+[download] Complete. data/missing_papers.csv updated.
 ```
 
-In dry-run mode, "would be acquired" means the logic would succeed for those
-DOIs. No real PDFs are saved. The shortfall of 240 (250 - 10) is expected
-because the dry-run manifest only has 2 mock papers per journal.
+**What you'll have after:**
+- `data/raw/` — PDFs that passed all checks
+- `data/error_log.jsonl` — details on every failed attempt
+- `data/missing_papers.csv` — list of papers still needed (if any journal is under 50)
 
-### Step 10: Test The Text Extraction Step
+**If many papers fail with "Cloudflare blocked":** That's normal. Publisher websites block automated tools. Those papers need to be downloaded manually through the library (see Step 5).
 
-This runs a small smoke test using the fixture data in `tests/fixtures`. The
-script sets `DRY_RUN=true` internally so it does not need live PDFs.
+---
 
-```powershell
-python src/extract.py
-```
-
-Expected result (your line lengths may differ slightly):
-
-```text
-Extraction successful. Output length: ... chars.
-First 500 chars:
- ...
-```
-
-At this point, the Phase 2 dry-run pipeline is working.
-
-## Running With Real Data
-
-Only do this after the dry run works.
-
-### Step 1: Edit `.env`
-
-Change:
-
-```text
-DRY_RUN=true
-```
-
-to:
-
-```text
-DRY_RUN=false
-```
-
-Keep:
-
-```text
-BUDGET_HARD_STOP=0.00
-```
-
-Phase 2 does not call paid LLM APIs, so the budget should stay at zero.
-
-### Step 2: Collect Real Metadata
-
-```powershell
-python src/collect.py
-```
-
-This queries CrossRef for papers from the target journals and writes them to
-`data/manifest.jsonl`.
-
-### Step 3: Download Open-Access PDFs
-
-```powershell
-python src/download.py
-```
-
-The downloader tries **six sources** for each DOI, in order:
-
-1. Unpaywall API — all `oa_locations`, prioritizing direct PDF/repository URLs
-2. PubMed Central — DOI → PMCID → direct PDF, then NCBI OA tar.gz package
-3. Semantic Scholar API — `openAccessPdf` URL
-4. `fulltext-article-downloader` CLI (Unpaywall + BASE + CORE)
-5. Publisher-direct PDF URL — Wiley, AVMA, SAGE heuristics
-6. Article-page HTML scraping — `citation_pdf_url` meta tag or `<a>` links
-
-Every downloaded file goes through chained validation layers before it is counted:
-
-1. **Format validation** checks that the response really starts with `%PDF`.
-   This rejects HTML bot-challenge pages, login walls, and empty responses.
-2. **Page-count validation** opens the temporary PDF with `pdfplumber` and
-   rejects PDFs shorter than `MIN_PAGES` (`TOO_FEW_PAGES`); extraction is skipped
-   for failures at this step.
-3. **Text extraction** reads every page, then strips the References/Bibliography
-   tail using the same rules as downstream extraction.
-4. **Section-heading validation** requires at least `MIN_SECTIONS` distinct hits
-   among canonical headings (introduction, methods/materials-and-methods,
-   results, discussion). Failures log `MISSING_SECTIONS`.
-5. **Word-count validation** applies the final gate: at least `MIN_EXTRACTED_WORDS`
-   useful words (`TEXT_TOO_SHORT` / related types if extraction failed earlier).
-
-Short PDFs or front-matter stubs can satisfy `%PDF` but still fail IMRAD-ish
-signals or length. Only PDFs that pass the chain are moved into `data/raw/` and
-counted toward the 50-per-journal quota.
-
-If validation fails during a new download, the temporary file is deleted and the
-pipeline tries the next legal OA source for that DOI. The failure is recorded in
-`data/error_log.jsonl` with `"stage": "validation"` and an `error_type` such as
-`TOO_FEW_PAGES`, `MISSING_SECTIONS`, `TEXT_TOO_SHORT`, `NO_EXTRACTABLE_TEXT`, or
-`PDF_CORRUPT`.
-
-At the start of a live download run, the pipeline also revalidates PDFs that
-already exist in `data/raw/`. If an older PDF now fails any validation gate, it is
-moved to `data/quarantine/` with a timestamped filename and a matching `.json`
-metadata file. It is not permanently deleted. After quarantine, that DOI is no
-longer counted as already downloaded, so the normal fallback chain can try to
-find a better source.
-
-PDFs are saved in `data/raw/` with descriptive filenames that include the
-journal, paper title, and DOI suffix. Older DOI-only filenames are still
-recognized, so existing downloads continue to count. The download stops at
-50 PDFs per journal (stop-loss). If a journal falls short, a warning is written to
-`data/error_log.jsonl` and `data/missing_papers.csv` is created.
-
-Optional settings in `.env` that affect live runs:
-
-```text
-DOWNLOAD_VERBOSE=false           # set to true to print per-URL debug info
-COLLECT_CANDIDATES_PER_JOURNAL=2000  # DOI candidates to collect per journal
-COLLECT_YEAR_BALANCED=true       # collect across 2023, 2024, and 2025
-COLLECT_YEARS=2023,2024,2025     # publication years to query separately
-COLLECT_PREFLIGHT_UNPAYWALL=false # add OA metadata during collection
-COLLECT_REQUIRE_UNPAYWALL_OA=false # skip non-OA candidates during collection
-COLLECT_MIN_OA_LOCATIONS=1       # strict-mode minimum OA locations
-COLLECT_PREFER_DIRECT_PDF=true   # strict-mode preference for PDF URLs
-DOWNLOAD_DELAY_SECONDS=2         # pause between API calls (see .env.template)
-PUBLISHER_DELAY_MIN_SECONDS=10   # random jitter floor before publisher URLs
-PUBLISHER_DELAY_MAX_SECONDS=25   # random jitter ceiling before publisher URLs
-RATE_LIMIT_BACKOFF_SECONDS=60    # fallback sleep on HTTP 429 with no Retry-After
-MAX_FAILED_PER_JOURNAL=250       # stop a journal after this many OA failures
-MIN_PAGES=3                      # reject PDFs shorter than this before extraction
-MIN_SECTIONS=3                   # min distinct heading matches among IMRAD-ish set
-MIN_EXTRACTED_WORDS=3000         # hard minimum useful words after references
-TARGET_EXTRACTED_WORDS=4500      # planning target for paper length/budget
-MIN_EXTRACTED_TOKENS=4000        # diagnostic token estimate, not hard gate
-SKIP_VALIDATION_FOR_TESTING=false
-```
-
-To debug a single DOI with full diagnostic output:
-
-```powershell
-$env:DOWNLOAD_VERBOSE="true"; $env:PUBLISHER_DELAY_MIN_SECONDS="0"; $env:PUBLISHER_DELAY_MAX_SECONDS="0"
-python -c "import sys; sys.path.insert(0,'src'); from download import download_paper; download_paper('10.1111/jvim.70254')"
-```
-
-### Step 4: Check Corpus Status
+### Step 3 — Check your progress
 
 ```powershell
 python pipeline.py
 ```
 
-This merges `data/manifest.jsonl` (OA papers) with `data/manual_manifest.jsonl`
-(manually added papers, if any) and prints a per-journal status table.
+**What it does:** Counts every PDF in `data/raw/`, cross-references with `data/manifest.jsonl` and `data/manual_manifest.jsonl`, and prints a scoreboard.
 
-If you have **fewer than 200** PDFs confirmed in `data/raw/`, the process
-**exits with status code 1**. That is intentional so automated checks can fail
-fast; it does not mean Python is broken.
+**What you'll see:**
+```
+====================================================================
+  CORPUS STATUS
+====================================================================
+  PDFs confirmed — primary:          147  (count toward quota)
+  PDFs confirmed — secondary (2_):    12  (reviews; not in quota)
 
-### Step 5: Handle OA Shortfalls (if needed)
+  Journal                  Target  Primary  Secondary  Status
+  ——————————————————————————————————————————————————————————————
+  JVIM                        50      50         4     ✓ OK
+  JAVMA                       50      32         2     NEED 18 MORE PRIMARY
+  Veterinary Surgery          50      28         3     NEED 22 MORE PRIMARY
+  VRU                         50      21         2     NEED 29 MORE PRIMARY
+  JFMS                        50      16         1     NEED 34 MORE PRIMARY
+====================================================================
+```
 
-Sometimes the automatic downloader cannot reach **50 PDFs per journal** using only
-open-access links. That is normal for paywall-heavy journals.
+**Exit codes:**
+- Exit 0 (success) = 200 or more primary PDFs
+- Exit 1 (warning) = fewer than 200 primary PDFs — not a crash, just means you're not done yet
 
-**See what is missing.** From the project folder (venv on):
+---
+
+### Step 4 — Find out what's still missing
 
 ```powershell
 python src/supplement.py
 ```
 
-That prints plain-language hints per journal and refreshes **`data/missing_papers.csv`**
-(a spreadsheet-friendly checklist you can filter or sort).
+**What it does:** Compares the manifest to `data/raw/` and generates a fresh list of papers still needed for each journal. Rewrites `data/missing_papers.csv` with different suggestions each time (randomly shuffled so you get variety).
 
-**Add papers you obtained legally** (library access, publisher OA pages, author
-copies—never bypassing paywalls). After you have PDF files on your computer,
-follow **[Guide: Manually adding papers to your corpus](#guide-manually-adding-papers-to-your-corpus)**
-(below) so filenames and manifests stay consistent.
+**What you'll see:**
+```
+[supplement] Per-journal acquisition status:
+  Journal                    Have  Target  Missing
+  --------------------------------------------------
+  JVIM                         50      50        0
+  JAVMA                        32      50       18
+  Veterinary Surgery           28      50       22
+  ...
 
-The pipeline counts toward **250** papers total when possible; **`pipeline.py`
-also exits with code 1 until at least 200 PDFs are present**, which is expected
-during buildup—not a broken install.
-
----
-
-## Guide: Manually adding papers to your corpus
-
-This section is for beginners. Read it once; later you only repeat **Section C**.
-
-### What you are doing (in plain English)
-
-| Idea | Meaning |
-|------|---------|
-| **Manifest** | `data/manifest.jsonl` is the master list of candidate papers from CrossRef (built when you run `collect.py`). Your scripts match downloads to this list. |
-| **Manual PDF** | A PDF **you** saved because automation could not fetch it with OA-only rules. |
-| **Goal** | Put those PDFs into **`data/raw/`** under the same descriptive filenames the pipeline expects, and record them in **`data/manual_manifest.jsonl`**—without editing `manifest.jsonl` by hand. |
-
-**Legal rule:** Only ingest papers you are allowed to use (institutional access,
-publisher-granted OA, author-shared copies, etc.). This workflow does not bypass
-subscriptions.
-
----
-
-### Section A — Before you try this
-
-Work through these checks once:
-
-1. **Terminal location:** Open PowerShell and `cd` into your project folder (the one that contains `pipeline.py` and the `src` folder).
-2. **Virtual environment:** Activate it (`.\.venv\Scripts\Activate.ps1`). You should see `(.venv)` at the start of the prompt.
-3. **Manifest exists:** You must have run `python src/collect.py` at least once so **`data/manifest.jsonl`** exists and lists the DOIs you care about. If that file is missing, run collection before manual ingestion.
-
----
-
-### Section B — See what still needs a PDF
-
-Optional but helpful:
-
-```powershell
-python src/supplement.py
+  DOI     : 10.1177/1098612X231170159
+  Title   : Feline hypertrophic cardiomyopathy in 847 cats...
+  Journal : JFMS
+  -> Check University of Guelph library access (https://lib.uoguelph.ca)
+  -> Email corresponding author for preprint / accepted manuscript
+  ...
+[supplement] Missing papers report written: data/missing_papers.csv
 ```
 
-You get console output plus **`data/missing_papers.csv`**. Use it like a shopping
-list while you download papers from permitted sources.
+**What you'll have after:** A fresh `data/missing_papers.csv` with actionable suggestions. Open it in Excel or any spreadsheet app.
+
+**Options:**
+```powershell
+python src/supplement.py           # different suggestions every run (recommended)
+python src/supplement.py --seed 42 # same suggestions every run (for reproducibility)
+```
 
 ---
 
-### Section C — Recommended: one command after you drop files
+### Step 5 — Add papers manually
 
-This is the **easiest path**. You only touch one folder yourself.
+When automatic download can't get a paper (usually because it's paywalled), you can download it yourself through the University of Guelph library and add it to the corpus.
 
-#### Step C1 — Make sure you have PDF files
+#### The recommended way (one command does everything)
 
-Download or save PDFs anywhere temporarily (Downloads folder is fine).
+**1. Download the PDF** from the UoG library or by emailing the author.
 
-#### Step C2 — Put PDFs in the incoming folder
+**2. Drop the PDF into `data/incoming_manuals/`** — any filename is fine.
 
-1. Open **File Explorer** and go to your project folder.
-2. Open **`data`** (create it if needed—it is usually hidden from Git).
-3. Open or create **`incoming_manuals`** inside `data`.
-4. **Drag every PDF into `data/incoming_manuals/` so they sit directly in that folder.**  
-   Do **not** put them inside extra subfolders for normal batches—keep it flat.
-
-#### Step C3 — Run the automation script
-
-In PowerShell (project folder, venv on):
-
+**3. Run:**
 ```powershell
 python src/auto_ingest_workflow.py
 ```
 
-**What this script does for you**, in order:
+**What it does automatically (in order):**
 
-1. **Retries** PDFs in **`data/manual_inbox/failed/`** (moves them back to the inbox).
-2. **Moves** every `*.pdf` from **`data/incoming_manuals/`** into **`data/manual_inbox/`** (staging).
-3. Runs **`python src/enrich_manifest_from_pdfs.py`** so unknown DOIs get manifest rows from CrossRef (non-fatal if it fails).
-4. Runs **`python src/ingest_manual_pdfs.py`**, which matches each PDF to the manifest and moves successes into **`data/raw/`** (failures → **`manual_inbox/failed/`**).
-5. Runs **`python pipeline.py`** for an updated **per-journal table**.
-6. Runs **`python src/supplement.py`** (unless `--no-supplement`) to refresh **`data/missing_papers.csv`** after ingestion.
-7. **Archives** remaining failures under **`data/manual_inbox/archive_failed/YYYY-MM-DD/`** (unless `--no-clean`).
+| Step | What happens |
+|------|-------------|
+| 1. Retry failures | Any PDFs that failed on a previous run are automatically tried again |
+| 2. Stage new files | Moves PDFs from `data/incoming_manuals/` → `data/manual_inbox/` |
+| 3. Enrich manifest | Reads each PDF's DOI, looks it up in CrossRef, adds missing entries to `data/manifest.jsonl` |
+| 4. Ingest | Matches PDFs to manifest entries, renames them properly, moves to `data/raw/` |
+| 5. Update scoreboard | Runs `pipeline.py` to show updated counts |
+| 6. Refresh missing list | Runs `supplement.py` to update `data/missing_papers.csv` |
+| 7. Clean up | Archives any remaining failures to `data/manual_inbox/archive_failed/YYYY-MM-DD/` |
 
-#### Step C4 — Read the output
+**What you'll see:**
+```
+[2026-05-19T14:32:01Z] === auto_ingest_workflow start ===
+[2026-05-19T14:32:01Z] retry_failed: returned 3 PDF(s) to inbox for retry.
+[2026-05-19T14:32:01Z] stage_incoming: moved paper1.pdf → manual_inbox/paper1.pdf
+[2026-05-19T14:32:02Z] enrich_manifest: starting pre-ingest CrossRef enrichment…
+[enrich] (1/4) paper1.pdf
+[enrich]   DOI found via filename: 10.1177/1098612x231170159
+[enrich]   Querying CrossRef for 10.1177/1098612x231170159 …
+[enrich]   Appended: 10.1177/1098612x231170159 | JFMS | 2023
+...
+[manual_ingest] IMPORTED paper1.pdf → JFMS__Feline HCM__10_1177_1098612X231170159.pdf
+[2026-05-19T14:32:15Z] === auto_ingest_workflow complete (retried=3, staged=1) pipeline_rc=0 ===
+```
 
-- **Green-light signs:** Lines like `IMPORTED` and a balanced journal table from `pipeline.py`.
-- **Exit code 1 from `pipeline.py`:** Normal until you reach **200** total PDFs in **`data/raw/`**. It does **not** mean the manual step failed.
+**What you'll have after:**
+- New PDFs in `data/raw/` with proper descriptive names
+- Log file: `data/logs/auto_ingest_workflow.log`
+- Anything that still couldn't be matched: `data/manual_inbox/failed/` (with a reason in `data/error_log.jsonl`)
 
-Logs are also saved to **`data/logs/auto_ingest_workflow.log`** so you can scroll back later.
+**Options:**
+```powershell
+python src/auto_ingest_workflow.py                    # standard run
+python src/auto_ingest_workflow.py --no-supplement    # skip refreshing missing_papers.csv
+python src/auto_ingest_workflow.py --no-clean         # keep failed/ folder intact for inspection
+python src/auto_ingest_workflow.py --incoming PATH    # use a different drop folder
+```
+
+#### How the PDF matching works
+
+When you drop a PDF in `incoming_manuals/`, the pipeline identifies it using three methods (in order):
+
+1. **PDF metadata** — Some PDFs store the DOI in their document properties
+2. **Filename** — If the filename looks like a DOI (e.g. `10.1177_1098612X231170159.pdf`), it reads the DOI from there
+3. **First page text** — Reads only page 1 of the PDF looking for the DOI in the header or footer
+
+Once a DOI is found, the pipeline checks if it's in `manifest.jsonl`. If not, it automatically looks it up in CrossRef and adds it before trying to ingest. This means PDFs no longer fail just because their DOI wasn't in the manifest.
+
+#### What if a PDF still ends up in `failed/`?
+
+Check `data/error_log.jsonl` for the reason. Common causes:
+
+| Reason | What it means | Fix |
+|--------|--------------|-----|
+| `failed_unknown` | No DOI found anywhere in the PDF or filename | Re-download a text-based PDF (not a scan) |
+| `failed_match` | DOI found but CrossRef doesn't know this paper | Try a different DOI, or check if the DOI is correct |
+| `failed_ambiguous_title` | Title matches multiple papers in the manifest | Rare — check the PDF's actual DOI manually |
+
+**Good news:** PDFs in `failed/` are automatically retried on the next run of `auto_ingest_workflow.py`. You don't need to move them manually.
 
 ---
 
-### Section D — What each folder means after a run
+### Step 6 — Repeat until done
 
-| Folder or file | Role |
-|----------------|------|
-| `data/incoming_manuals/` | **Your drop zone.** Empty after a successful staging step—the PDFs moved onward. |
-| `data/manual_inbox/` | **Staging.** Scripts shuffle files here before ingest; usually cleared as ingest runs. |
-| `data/raw/` | **Final accepted PDFs** with descriptive names (`journal__title__doi_suffix.pdf`). |
-| `data/manual_manifest.jsonl` | One JSON line per manually tracked paper that already has a PDF on disk. |
-| `data/manifest.jsonl` | CrossRef-derived candidate list—**do not edit by hand**; ingest only reads it. |
-| `data/manual_inbox/failed/` | PDFs that could not be matched—inspect before deleting. |
-| `data/manual_inbox/skipped_existing_in_raw/` | Duplicate uploads when `data/raw/` already had that paper. |
-| `data/manual_inbox/archive_failed/` | Dated buckets (`YYYY-MM-DD`) where cleaned-up failures are archived. |
+```
+python src/download.py         → try more OA sources
+python src/supplement.py       → see updated missing list
+[download PDFs from library]
+python src/auto_ingest_workflow.py  → add manual PDFs
+python pipeline.py             → check the scoreboard
+```
+
+Stop when `pipeline.py` shows 250/250 primary PDFs (exit code 0 means you've hit the 200-minimum threshold).
 
 ---
 
-### Section E — Optional flags (when you already did part of the work)
+## Understanding the folders
 
-```powershell
-python src/auto_ingest_workflow.py --help
 ```
-
-| Flag | When to use it |
-|------|----------------|
-| `--incoming PATH` | Use a different drop folder instead of `data/incoming_manuals/`. |
-| `--no-supplement` | Skip regenerating `missing_papers.csv` when you already ran `supplement.py` moments ago. |
-| `--no-clean` | Keep skipped/failed staging files between runs instead of deleting skipped PDFs and archiving failures. |
+vet-llm-research/
+├── data/
+│   ├── manifest.jsonl            ← Paper catalogue (built by collect.py)
+│   ├── manual_manifest.jsonl     ← Manually ingested papers (built by auto_ingest_workflow.py)
+│   ├── error_log.jsonl           ← All errors with details (never deleted)
+│   ├── missing_papers.csv        ← What's still needed (rewritten each supplement run)
+│   │
+│   ├── raw/                      ← ✅ ACCEPTED PDFs (your corpus lives here)
+│   ├── incoming_manuals/         ← 📥 DROP NEW PDFs HERE
+│   │
+│   ├── manual_inbox/             ← Staging area (auto_ingest_workflow.py manages this)
+│   │   ├── *.pdf                 ← Being processed right now
+│   │   ├── failed/               ← Couldn't match (automatically retried on next run)
+│   │   ├── skipped_existing_in_raw/  ← Already in corpus (safe to ignore)
+│   │   └── archive_failed/
+│   │       └── YYYY-MM-DD/       ← Failed PDFs archived by date
+│   │
+│   ├── quarantine/               ← PDFs moved out by audit_article_types.py
+│   └── logs/
+│       └── auto_ingest_workflow.log  ← Full run log
+│
+├── src/
+│   ├── collect.py                ← Build manifest.jsonl
+│   ├── download.py               ← Auto-download OA PDFs
+│   ├── supplement.py             ← Missing-paper report + shopping list
+│   ├── auto_ingest_workflow.py   ← One-command manual ingest
+│   ├── enrich_manifest_from_pdfs.py  ← CrossRef lookup for unknown PDFs
+│   ├── ingest_manual_pdfs.py     ← Match PDFs to manifest, move to raw/
+│   ├── audit_article_types.py    ← Reclassify/remove non-primary articles
+│   └── extract.py                ← Text extraction (smoke test only)
+│
+├── pipeline.py                   ← Scoreboard
+├── .env                          ← Your settings (never commit this)
+└── .env.template                 ← Settings reference
+```
 
 ---
 
-### Section F — If something goes wrong
+## Troubleshooting failed PDFs
 
-| Symptom | What to try |
-|---------|-------------|
-| Script stops **before** `pipeline.py` | **`ingest_manual_pdfs.py`** returned an error—often an unmatched DOI or title. Open **`data/manual_inbox/failed/`** and **`data/error_log.jsonl`** for clues. Fix metadata or add the paper’s DOI to your manifest via **`collect.py`** first. |
-| PDF landed in **`skipped_existing_in_raw`** | You already had that paper under **`data/raw/`**. Safe to ignore after cleanup. |
-| **`incoming_manuals`** empty but ingest failed | Files were moved to **`manual_inbox`** before ingest ran—they are not deleted from disk; check **`failed/`**. |
-| **`manifest.jsonl` missing** | Run **`python src/collect.py`** before manual ingestion. |
+### "A PDF I dropped in incoming_manuals/ ended up in failed/"
 
----
-
-### Section G — Advanced: run ingest alone
-
-If you prefer to drop PDFs straight into **`data/manual_inbox/`** without the
-incoming folder:
-
+**Step 1 — Check the error log:**
 ```powershell
-python src/ingest_manual_pdfs.py
+# Find entries for your PDF
+Select-String -Path data\error_log.jsonl -Pattern "your_filename_or_doi"
 ```
 
-Then run **`python pipeline.py`** yourself. Use **`--inbox`** if your PDFs live in
-another folder. Same matching rules apply (DOI in PDF text/metadata first, then
-PDF `/Title` vs manifest title).
-
----
-
-### Running the workflow twice
-
-Running **`python src/auto_ingest_workflow.py`** again with an empty incoming folder is safe: supplement may refresh, ingest sees whatever is left to process, and **`manual_manifest.jsonl`** does not get duplicate lines for the same DOI.
-
-## Useful Commands
-
-Run the simple startup check:
-
+**Step 2 — Re-run the workflow** (failed PDFs are automatically retried):
 ```powershell
-python src/main.py
+python src/auto_ingest_workflow.py
 ```
 
-Run the Phase 2 tests with pytest:
+**Step 3 — If it still fails, check the reason:**
 
-```powershell
-python -m pytest tests/manual_test_phase2.py -v
+| Error in log | Meaning | Fix |
+|-------------|---------|-----|
+| `pdfplumber metadata read failed` | PDF is a scanned image or corrupt | Download a text-based PDF from the publisher's website (not a scan) |
+| `CrossRef 404` | DOI not registered in CrossRef | Verify the DOI is correct; try searching the title on CrossRef.org |
+| `No DOI found (tried metadata, filename, page-1)` | No DOI anywhere in the file | Rename the file to match its DOI: `10.1177_1098612X231170159.pdf` |
+| `No OA or title linkage` | DOI found but not in manifest and CrossRef failed | Run `collect.py` to refresh the manifest, then retry |
+
+**Pro tip:** If you know the DOI, rename the file before dropping it:
 ```
-
-Run the PDF validation gate tests:
-
-```powershell
-python -m pytest tests/test_pdf_validation.py -v
+10.1177_1098612X231170159.pdf    ← use _ instead of / in the DOI
 ```
+The pipeline will extract the DOI from the filename automatically.
 
-Run tests for filename rules and collection filters:
+### "supplement.py keeps showing me papers I've already skipped"
 
-```powershell
-python -m pytest tests/test_file_paths.py tests/test_collect_filters.py -v
-```
-
-## Important Notes
-
-- Keep `.env` private. Do not commit API keys or your email address.
-- The `data/` folder is gitignored because it can contain downloaded papers,
-  generated manifests, and error logs.
-- The downloader only uses open-access sources. It does not bypass paywalls,
-  use institutional proxies, or attempt login. This is intentional and required
-  by research ethics and University of Guelph policy.
-- Some publishers (Wiley, SAGE) use Cloudflare bot-detection and will return
-  `403 Forbidden` even for genuinely OA papers. The script logs the specific
-  failure reason rather than silently skipping the paper.
-- `UNPAYWALL_EMAIL` must have no leading or trailing space. A space causes
-  Unpaywall to treat your address as invalid and return no OA locations.
-- Dry-run mode is the safest first step. Use it before every major change.
-- If something fails, check `data/error_log.jsonl`. Each failed DOI now
-  includes the most informative failure code (`HTTP_403`, `MIME_TYPE_MISMATCH`,
-  `NO_PDF_URL`, `TEXT_TOO_SHORT`, `NO_EXTRACTABLE_TEXT`, etc.) rather than a
-  generic message.
-- If a PDF is moved to `data/quarantine/`, it means the file existed in
-  `data/raw/` but did not pass the current text-validation gate. Look at the
-  matching `.json` sidecar file to see the DOI, word count, threshold, and
-  reason. This is intentional: quarantine preserves evidence while allowing the
-  downloader to retry that DOI.
-- If a journal has < 50 OA PDFs, `data/error_log.jsonl` will contain entries
-  with `"stage": "insufficient_oa"`. Run `python src/supplement.py` to act on them.
-- `data/manual_manifest.jsonl` must only contain entries whose PDFs are already
-  in `data/raw/`. `pipeline.py` validates this and will warn about missing PDFs.
-- To avoid duplicate papers: delete `data/manifest.jsonl` before re-running
-  `collect.py` for a fresh corpus build.
-
-## Troubleshooting
-
-If `python` is not recognized, try:
-
-```powershell
-py --version
-```
-
-If that works, use `py` instead of `python` in the commands above.
-
-If activation fails in PowerShell, run:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-
-If imports fail, make sure your virtual environment is active and run:
-
-```powershell
-pip install -r requirements.txt
-```
-
-If `download.py` says the manifest is missing, run:
-
-```powershell
-python src/collect.py
-```
-
-If you get duplicate papers in `data/manifest.jsonl`, delete that file and run
-collection again.
-
-If `download.py` reports a shortfall for a journal (fewer than 50 OA PDFs):
-
+Run it again — it shuffles randomly each time:
 ```powershell
 python src/supplement.py
 ```
+Each run shows a different subset of missing papers. If you don't want certain papers (e.g., they're all paywalled with no library access), just skip them and run again for new suggestions.
 
-This generates `data/missing_papers.csv` and prints acquisition instructions.
+### "pipeline.py exits with code 1"
 
-If `download.py` rejects a PDF with `TEXT_TOO_SHORT`:
-the PDF was technically readable, but after removing references it had fewer
-than `MIN_EXTRACTED_WORDS` useful words. This usually means it was not a full
-research article, or it was a short notice/editorial/correction. The downloader
-will treat that DOI as a failed attempt and continue looking for another legal
-OA source if one is available.
+That just means you haven't reached 200 primary PDFs yet — it's not a crash. Keep going through the loop (download → supplement → manual add).
 
-If `download.py` rejects a PDF with `NO_EXTRACTABLE_TEXT`:
-`pdfplumber` could open the PDF, but it found no real text. This commonly means
-the PDF is image-only or scanned. The pipeline rejects it because the LLM would
-receive no usable paper text.
+### "I accidentally ran collect.py twice and have duplicates in manifest.jsonl"
 
-If `download.py` rejects a PDF with `PDF_CORRUPT`:
-the file was empty, unreadable, password protected, malformed, or could not be
-opened by `pdfplumber`. The pipeline rejects it before it can break extraction
-or summarization later.
+Not a problem — the rest of the pipeline deduplicates by DOI. Duplicate lines in `manifest.jsonl` are safely ignored.
 
-If `pipeline.py` warns about manual manifest entries with missing PDFs:
-make sure the PDF file is in `data/raw/` using either the descriptive filename
-format or the legacy DOI-only filename (`/`, `:`, and `.` replaced by `_`, plus
-`.pdf` extension).
+---
 
-If `download.py` says `ModuleNotFoundError: No module named 'bs4'`:
-your virtual environment is not active, or you ran `pip install` in the wrong
-Python. Re-activate `.venv` and run `pip install -r requirements.txt` again.
-Then invoke the script through the virtual environment explicitly:
+## Optional / advanced commands
+
+### Clean up article types already in `data/raw/`
+
+If you realize some PDFs in `data/raw/` are case reports, editorials, or other non-primary articles:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" src/download.py
+# Preview only — no changes
+python src/audit_article_types.py
+
+# Move excluded types to quarantine + rename reviews with 2_ prefix
+python src/audit_article_types.py --remove --tag-secondary
 ```
 
-If every DOI fails with `HTTP_403` or `MIME_TYPE_MISMATCH`:
-the publisher is blocking automated requests with Cloudflare or a similar CDN.
-This is expected for some journals. Check `data/error_log.jsonl` for the
-`body_start` field — it will show the exact HTML the server returned (e.g.,
-"Just a moment..."). No script change can legally bypass this; use the manual
-supplement workflow for those papers.
+After running `--remove`, run `supplement.py` again to get updated missing-paper suggestions.
 
-If a PMC paper returns "Preparing to download..." HTML:
-the NCBI viewer requires JavaScript to start the download. The script handles
-this automatically by falling back to NCBI's official OA package service
-(`oa.fcgi`). If the package is also unavailable (FTP 550), that paper must be
-obtained manually.
+### Preview manifest enrichment without writing anything
 
-If you get `UnicodeEncodeError` in the PowerShell terminal:
-set `DOWNLOAD_VERBOSE=false` to suppress the diagnostic body-start output,
-which may contain non-ASCII characters from publisher HTML pages.
+```powershell
+python src/enrich_manifest_from_pdfs.py --dry-run
+```
 
-## Design Decisions
+Shows which PDFs would have new manifest entries added, without touching `manifest.jsonl`.
 
-Longer “why” explanations for the Core 5 scripts. Each script’s module docstring
-points here; the glossary defines acronyms.
+### Run supplement with a fixed seed (for reproducible results)
 
-### Why CrossRef for metadata?
+```powershell
+python src/supplement.py --seed 42
+```
 
-CrossRef is the canonical [DOI](#glossary) registry. The `/works` API is free for
-reasonable use, returns structured JSON (title, abstract, authors, year), and needs
-no paid key. [PubMed Central (PMC)](#glossary) covers many biomedical papers but not
-all veterinary surgery content. Scopus and Web of Science require institutional
-licenses we do not assume.
+Pass any integer as `--seed`. The same number always gives the same suggestions — useful if you need to share a specific list with a collaborator.
 
-### Why year-balanced collection?
+### Run a specific part of the workflow manually
 
-If we query one wide date range with “newest first,” CrossRef pages fill with the
-latest year and older years never enter the manifest. Splitting by `COLLECT_YEARS`
-keeps 2023–2026 represented before download tries to fill quotas. See
-[stratified / year-balanced collection](#glossary) in the glossary.
+```powershell
+# If PDFs are already in manual_inbox/ (not incoming_manuals/)
+python src/ingest_manual_pdfs.py
+python pipeline.py
 
-### Why skip corrections, errata, and short communications at collect time?
+# Just add CrossRef entries for PDFs already in the inbox
+python src/enrich_manifest_from_pdfs.py
+```
 
-Those items are not full primary-research articles. Letting them through would waste
-download attempts and pollute LLM evaluation with non-comparable text. Title-prefix
-rules in `collect.py` are stricter than relying on CrossRef “type” alone because
-publishers label types inconsistently.
+---
 
-### Why a multi-source OA download chain?
+## Corpus design
 
-No single service indexes every legal OA PDF. `download.py` tries metadata APIs and
-repositories before publisher HTML because CDNs often block scripted publisher hits
-([HTTP 403](#glossary)). Order in code: Unpaywall → PMC → Europe PMC → Semantic
-Scholar → optional `fulltext-article-downloader` CLI → publisher-direct URL → HTML
-`citation_pdf_url` scrape. Each step stops at the first PDF that passes validation.
+**Target:** 250 papers — 50 from each of 5 journals
 
-### Why the word-count gate (MIN_EXTRACTED_WORDS)?
+| Journal | Full name | ISSN | Target |
+|---------|-----------|------|--------|
+| JVIM | Journal of Veterinary Internal Medicine | 1939-1676 | 50 |
+| JAVMA | Journal of the American Veterinary Medical Association | 0003-1488 | 50 |
+| Veterinary Surgery | Veterinary Surgery | 0161-3499 | 50 |
+| VRU | Veterinary Radiology & Ultrasound | 1058-8183 | 50 |
+| JFMS | Journal of Feline Medicine and Surgery | 1098-612X | 50 |
 
-A file can be a real PDF but useless for summarization (one-page abstract, correction,
-image-only scan). After `%PDF` verification, we require minimum pages, IMRAD-like
-section headings, and enough words after stripping references. That makes “success”
-mean “usable for Phase 3,” not merely “bytes saved.”
+**Date range:** 2023-01-01 to 2026-12-31
 
-### Why pdfplumber?
+**Primary vs. secondary PDFs:**
+- **Primary** (count toward the 50-per-journal quota): original research articles
+- **Secondary** (tagged with `2_` prefix, do not count toward quota): systematic reviews, meta-analyses, scoping reviews
 
-We need page count and extractable text without a separate OCR stack for born-digital
-PDFs. `pdfplumber` is pure Python, matches what `extract.py` will use later, and fails
-cleanly on corrupt files. Scanned image-only PDFs are rejected rather than silently
-producing empty text. See [pdfplumber](#glossary).
+**Article types excluded entirely:** case reports, short communications, brief reports, imaging diagnoses, rapid communications
 
-### Why manifest enrichment before manual ingest?
+**Minimum threshold:** `pipeline.py` exits 0 when you have ≥ 200 primary PDFs. The full 250 is the goal.
 
-Researchers often download a paper before it appeared in a bulk `collect.py` run.
-`enrich_manifest_from_pdfs.py` looks up one DOI at a time and **appends** a manifest
-row. Without that step, `ingest_manual_pdfs.py` has nothing to match and files land
-in `failed/`. Enrichment uses **metadata DOI only** so reference-list DOIs are not
-added as fake manifest entries.
+---
 
-### Why manual_inbox/failed/?
+## All environment variables (.env)
 
-Ingest refuses to guess when a PDF cannot be linked to exactly one manifest row.
-Moving files to `failed/` (instead of deleting them) preserves evidence for
-`data/error_log.jsonl` review. `auto_ingest_workflow.py` retries `failed/` after
-enrichment. Duplicates already in `raw/` go to `skipped_existing_in_raw/`, not
-`failed/`, because those are successes not errors.
+Copy `.env.template` to `.env` and fill in your values. The most important ones:
 
-### Alternatives we rejected (summary)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DRY_RUN` | `true` | Set to `false` for real network calls. Keep `true` to practice without the internet. |
+| `UNPAYWALL_EMAIL` | *(required)* | Your email address — required for CrossRef and Unpaywall access |
+| `COLLECT_CANDIDATES_PER_JOURNAL` | `2000` | How many candidate papers per journal to collect |
+| `COLLECT_YEARS` | `2023,2024,2025,2026` | Which years to query |
+| `DOWNLOAD_VERBOSE` | `false` | Set to `true` to see every URL attempted |
+| `MAX_FAILED_PER_JOURNAL` | `300` | Stop-loss: give up on a journal after this many download failures |
+| `MIN_PAGES` | `3` | Reject PDFs shorter than this many pages |
+| `MIN_EXTRACTED_WORDS` | `3000` | Reject PDFs with fewer than this many words (after removing references) |
+| `EXCLUDE_ARTICLE_TYPE_PATTERNS` | *(see template)* | Comma-separated title phrases that mark non-primary articles |
 
-| Idea | Why not |
-|------|---------|
-| Manual DOI spreadsheet | Slow, error-prone, no shared schema with download.py |
-| Single OA source only | Too many gaps per journal |
-| Re-run full collect.py for every manual PDF | Misses DOIs outside ISSN/date slices; wastes API pages |
-| Delete unmatched PDFs | Loses debugging context |
-| Paywall automation | Legal and institutional-policy risk |
+Full list in `.env.template`.
+
+---
+
+## Design decisions
+
+**Why CrossRef instead of PubMed?**
+CrossRef covers all 5 target journals with structured metadata (title, DOI, year, authors, abstract). PubMed's E-utils are used as a *download fallback* (PMC hosts many free PDFs), not as the primary catalogue source.
+
+**Why random shuffling in supplement.py?**
+The paper list is always in the same manifest order (newest-first from CrossRef). Without shuffling, you'd see the same suggestions every run, even after skipping papers you can't get. Shuffling surfaces different candidates each time.
+
+**Why retry failed PDFs automatically?**
+A PDF can fail on one run (because its DOI wasn't in the manifest yet) and succeed on the next (after `enrich_manifest_from_pdfs.py` adds the entry). Automatically moving PDFs out of `failed/` and retrying them eliminates a manual step.
+
+**Why look up DOIs from three places (metadata, filename, page 1)?**
+Most publisher PDFs don't store the DOI in their embedded metadata dictionary — they show it as text on page 1, and download tools often name files after their DOI (e.g. `10.1177_xxx.pdf`). Checking all three places means the pipeline can identify almost any publisher PDF without human intervention.
+
+**Why metadata-only DOIs are NOT used for page-text scanning?**
+The first 5 pages of many papers include a reference list. Scanning page text for DOIs would risk adding a *cited paper* to the manifest instead of the paper itself. The enrichment step therefore checks metadata, then filename, then page 1 only — never pages 2–5.
+
+**Why append-only manifests?**
+`manifest.jsonl` and `manual_manifest.jsonl` are only ever appended. This preserves the full collection history and makes reruns safe: deduplication happens at read time, never by deleting existing rows.
+
+**Why 1-second delay between CrossRef calls in enrich_manifest_from_pdfs.py?**
+CrossRef's polite pool provides higher rate limits to clients that identify themselves with an email address and keep requests to ~1/second. The `UNPAYWALL_EMAIL` in `.env` is sent in the `User-Agent` header for this reason.
 
 ---
 
 ## Glossary
 
-Short definitions for terms used in this repository. Follow the links in **Useful Commands** and **Project Structure** for hands-on context.
-
 | Term | Meaning |
 |------|---------|
-| **API** | An automated web interface programs use to request data (for example, CrossRef or Unpaywall). You call an API with HTTP requests instead of clicking in a browser. |
-| **BASE / CORE** | Academic search indexes. The optional `fulltext-article-downloader` tool can query them to discover full-text links for some papers. |
-| **candidate** | A paper (usually identified by DOI) that `collect.py` wrote into `manifest.jsonl`. Only some candidates become downloaded PDFs after `download.py` runs. |
-| **CDN (Content Delivery Network)** | A network that serves publisher websites quickly; it sometimes includes bot protection (for example Cloudflare), which can return `403` or challenge pages to scripts. |
-| **Content-Type** | An HTTP header describing what kind of data a server is returning (for example `application/pdf` vs `text/html`). The downloader checks this along with raw bytes. |
-| **covariate** | Extra structured fields inferred for each paper (for example species or study design) so later analysis can group or compare results fairly. |
-| **CrossRef** | A nonprofit registry of scholarly metadata. This project uses CrossRef to list recent works in each target journal (by ISSN and date). |
-| **DOI (Digital Object Identifier)** | A permanent string ID for a scholarly work (for example `10.1111/jvim.70254`). It is the main key for manifests, downloads, and deduplication. |
-| **dry run** | Mode with `DRY_RUN=true`: no real network collection or downloads; mock rows exercise the rest of the pipeline safely. |
-| **E-utils** | NCBI’s programmatic interface for PubMed and related databases. Used here to map DOIs to PMC IDs when fetching OA copies. |
-| **exit code** | A small integer a program returns when it finishes. `pipeline.py` uses **1** when fewer than 200 PDFs are present so scripts know the corpus is below the minimum. |
-| **fixture** | A small test file bundled in `tests/fixtures/` so `extract.py` can run without your own PDFs. |
-| **HTML scraping** | Parsing a journal’s public article webpage to find a linked PDF URL (only after APIs and repositories are tried). |
-| **HTTP 403 / 429** | Standard web errors: **403** means “forbidden” (often bot blocking); **429** means “too many requests” (rate limiting). The downloader backs off when servers ask it to wait. |
-| **idempotent** | Safe to run more than once without breaking things: if a PDF is already valid on disk, `download.py` skips re-downloading that DOI. |
-| **ISSN** | A serial number for a journal (like an ISBN for periodicals). Each target journal has a known ISSN used in CrossRef queries. |
-| **JSON** | A structured text format `{ "key": "value" }` used for manifests and error logs. |
-| **JSONL** | “JSON Lines”: one JSON object per line in a text file (`data/manifest.jsonl`). Easy to append and stream. |
-| **Large Language Model (LLM)** | A broad class of AI text models. Phase 2 only prepares PDFs and text; later phases will use an LLM for summarization and evaluation. |
-| **magic bytes** | The first bytes of a file. Real PDFs start with `%PDF`; a downloaded “PDF” that is actually HTML will fail this check. |
-| **manifest** | The project’s list of papers to consider, stored as `data/manifest.jsonl` (OA pipeline) plus optional `data/manual_manifest.jsonl` (hand-added). |
-| **MAX_FAILED_PER_JOURNAL** | Stop-loss for wasted attempts: after this many failures in one journal, `download.py` stops trying more candidates there and relies on supplementation. |
-| **MIME type** | Same idea as **Content-Type**: what kind of file the server claims to send. Mismatches versus real bytes are logged as `MIME_TYPE_MISMATCH`. |
-| **OA (open access)** | Legally free-to-read (and here, free-to-download) versions of a paper, hosted by publishers or repositories. The pipeline never attempts paywalled downloads. |
-| **`oa.fcgi` / OA package** | NCBI’s service that bundles some PMC articles as downloadable archives when a browser PDF URL is not script-friendly. |
-| **Paywall** | A publisher restriction that requires payment or institutional login. This pipeline does not circumvent paywalls. |
-| **pdfplumber** | A Python library that extracts text from PDF pages. It powers the “enough words for summarization” quality gate. |
-| **Phase 2 / Phase 4** | **Phase 2** is ingestion (collect, download, validate, extract plumbing). **Phase 4** refers to planned statistical analysis and evaluation on the finished corpus. |
-| **PMC / PubMed Central** | NIH’s full-text archive for many life-science articles. Some veterinary papers have PMC OA copies even when the publisher site is awkward. |
-| **PMCID** | PubMed Central’s ID for an article deposit, discovered from the DOI when available. |
-| **Preflight** | Optional extra step during collection: call Unpaywall early to annotate or filter candidates by known OA links before `download.py` runs. |
-| **Quarantine** | Folder `data/quarantine/` where an older file in `data/raw/` is moved (with a `.json` sidecar) if it fails re-validation, instead of deleting it. |
-| **Repository** | A trusted archive (institutional or subject-specific) that hosts an OA PDF or landing page; Unpaywall lists these as **OA locations**. |
-| **Retry-After** | HTTP header telling clients how many seconds to wait after rate limiting (`429`). |
-| **Semantic Scholar** | A literature search API that sometimes exposes `openAccessPdf` URLs. |
-| **sidecar** | A small metadata file saved next to a quarantined PDF (JSON) describing why it was rejected. |
-| **Stop-loss** | The per-journal cap of **50 accepted PDFs** in `download.py`: once a journal reaches 50 good files, no more are downloaded for that journal in that run configuration. |
-| **Stratified / year-balanced collection** | Querying each calendar year (for example 2023, 2024, 2025) separately so the manifest is not dominated by the newest year only. |
-| **Throttling / jitter** | Pauses between requests. **Jitter** means random delay in a range so many clients do not retry at the exact same instant. |
-| **Token** | A chunk of text an LLM bills or measures; can differ by model. This repo tracks tokens only as a **rough budget estimate**, not as the PDF acceptance rule. |
-| **Unpaywall** | A service that maps DOIs to legal OA locations and license types. An **email** in `.env` is required for polite use. |
-| **Virtual environment** | An isolated Python install (`python -m venv .venv`) so this project’s packages do not clash with other Python work. |
-| **Word-count gate** | Rule enforced by `MIN_EXTRACTED_WORDS`: after stripping the reference list, the PDF must still contain enough words to resemble a full article. See [Design Decisions](#design-decisions). |
-| **Manifest enrichment** | `enrich_manifest_from_pdfs.py`: append CrossRef metadata for inbox PDFs whose DOI is not yet in `manifest.jsonl`, using metadata DOI only. |
-| **manual_inbox/failed/** | Folder where `ingest_manual_pdfs.py` moves PDFs it cannot match to the manifest; retried by `auto_ingest_workflow.py`. |
-| **Core 5 scripts** | `collect.py`, `download.py`, `ingest_manual_pdfs.py`, `auto_ingest_workflow.py`, `enrich_manifest_from_pdfs.py` — main ingestion design documented in code and README. |
+| **API** | Application Programming Interface — a way for two programs to talk to each other over the internet. CrossRef, Unpaywall, and PubMed are all accessed via their APIs. |
+| **Candidate** | A paper in `manifest.jsonl` that has not yet been downloaded. All manifest entries start as candidates. |
+| **CrossRef** | The non-profit registry that assigns and tracks DOIs for academic journals. Used by `collect.py` to find paper metadata. |
+| **DOI** | Digital Object Identifier — a permanent link to a paper, e.g. `10.1111/jvim.12345`. Every paper in the corpus has one. |
+| **DRY_RUN** | When `DRY_RUN=true`, scripts skip real network calls and use mock/fixture data. Safe for testing and practice. |
+| **Enrich (manifest enrichment)** | The step where `enrich_manifest_from_pdfs.py` looks up unknown DOIs in CrossRef and adds them to `manifest.jsonl` so ingest can match the PDFs. |
+| **Exit code** | A number a program returns when it finishes. 0 = success; 1 = something needs attention (not necessarily a crash). |
+| **failed/** | The subfolder inside `data/manual_inbox/` where PDFs land if the pipeline can't identify them. They are automatically retried on the next `auto_ingest_workflow.py` run. |
+| **Fixture** | A small, pre-built data file used for testing. Lives in `tests/fixtures/`. |
+| **ISSN** | International Standard Serial Number — a journal's unique identifier, like a DOI for the journal itself. |
+| **LLM** | Large Language Model — an AI like GPT-4 or Claude. The goal of this pipeline is to build a dataset for evaluating how well LLMs summarize veterinary papers. |
+| **magic bytes** | The first few bytes of a file that identify its type. A real PDF always starts with `%PDF`. If a "PDF" starts with `<html>`, it's a login wall, not a paper. |
+| **manifest.jsonl** | The catalogue file. Each line is a JSON object representing one paper (DOI, title, journal, year, authors, abstract). |
+| **manual_manifest.jsonl** | Same format as `manifest.jsonl`, but contains only papers you added manually. Both are merged by `pipeline.py`. |
+| **OA / open access** | A paper that can be legally downloaded for free. The pipeline only ever downloads OA papers. |
+| **Paywall** | A barrier that requires a journal subscription to access a paper. The pipeline cannot bypass paywalls — those papers must be obtained through the library. |
+| **PMC / PubMed Central** | The U.S. National Institutes of Health free archive of biomedical papers. Many veterinary papers are deposited here. |
+| **Primary PDF** | An original research article that counts toward the 50-per-journal quota. Contrast with secondary (reviews). |
+| **Quarantine** | `data/quarantine/` — where `audit_article_types.py` moves PDFs that shouldn't be in `data/raw/`. |
+| **Raw** | `data/raw/` — the final home of all accepted PDFs, renamed to a consistent format. |
+| **Secondary PDF** | A review article (systematic review, meta-analysis, etc.) — tagged with a `2_` filename prefix and not counted toward the quota. |
+| **Stop-loss** | A safety limit that prevents infinite downloading. `MAX_FAILED_PER_JOURNAL=300` means: give up on a journal after 300 consecutive failures. |
+| **Supplement** | The process of manually filling gaps that `download.py` couldn't fill automatically. `supplement.py` generates the shopping list. |
+| **Unpaywall** | A database that tracks legal open-access locations for papers. `download.py` uses it as its first download source. |
+| **Virtual environment** | An isolated Python installation. `.venv\Scripts\activate` activates it so your packages don't conflict with other Python projects. |
+| **Word-count gate** | The validation rule in `download.py` that rejects PDFs with fewer than 3,000 extracted words. Prevents short articles and corrupted text from entering the corpus. |
