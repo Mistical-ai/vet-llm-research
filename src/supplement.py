@@ -41,9 +41,11 @@ WHY DEFINE THE SHARED FUNCTION HERE (not in utils.py)?
     clearer: download → supplement → collect, never supplement → download.
 """
 
+import argparse
 import csv
 import json
 import os
+import random
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -195,7 +197,7 @@ def _load_failure_reasons() -> dict[str, str]:
 # Core report generation
 # ---------------------------------------------------------------------------
 
-def generate_supplement_report() -> list[dict]:
+def generate_supplement_report(seed: int | None = None) -> list[dict]:
     """
     Scan the manifest and data/raw/ to identify missing papers, then write
     data/missing_papers.csv and print manual supplement instructions.
@@ -207,15 +209,20 @@ def generate_supplement_report() -> list[dict]:
       2. Count how many of those DOIs have PDFs in data/raw/.
       3. If count < 50, the deficit papers are added to the missing list.
 
-    Papers are listed in manifest order (newest-first, because collect.py uses
-    sort=published desc), so high-priority recent papers appear at the top of
-    the CSV.
+    Candidates are shuffled randomly before selection so each run surfaces
+    different papers. Pass seed=<int> (or --seed on the CLI) for a
+    reproducible shuffle when you need to match a previous run.
 
     WHY NOT JUST COUNT PDFs IN data/raw/?
         Counting files in data/raw/ without the manifest would miss the
         metadata (title, journal) needed to populate the CSV report.  We need
         the manifest as the source of truth for which DOIs belong to which
         journal; data/raw/ is just the download cache.
+
+    Parameters
+    ----------
+    seed : int | None
+        Random seed for shuffling. None (default) = different each run.
 
     Returns
     -------
@@ -296,6 +303,7 @@ def generate_supplement_report() -> list[dict]:
                 )
             ]
 
+            random.Random(seed).shuffle(not_downloaded)
             for record in not_downloaded[:deficit]:
                 doi      = record.get("doi", "")
                 last_msg = failure_reasons.get(doi, "")
@@ -363,5 +371,19 @@ def generate_supplement_report() -> list[dict]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Report manifest gaps and rewrite data/missing_papers.csv.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible candidate shuffling (default: random each run)",
+    )
+    args = parser.parse_args(argv)
+    generate_supplement_report(seed=args.seed)
+
+
 if __name__ == "__main__":
-    generate_supplement_report()
+    main()

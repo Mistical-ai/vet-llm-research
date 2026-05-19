@@ -52,6 +52,7 @@ from ingest_manual_pdfs import (  # noqa: E402
     _collect_dois_from_plaintext,
     _load_manifest_indexes,
     _metadata_blob,
+    _normalize_match_doi,
 )
 from collect import _parse_crossref_item  # noqa: E402
 from utils import log_error  # noqa: E402
@@ -79,6 +80,63 @@ def _get_pdf_metadata_doi(pdf_path: Path) -> str | None:
     except Exception as exc:  # noqa: BLE001
         log_error(str(pdf_path.name), "enrich_manifest", f"pdfplumber metadata read failed: {exc}")
         return None
+
+
+def _doi_from_filename(pdf_path: Path) -> str | None:
+    """Parse a DOI from the filename, e.g. 10.1177_1098612X231170159.pdf → 10.1177/1098612X231170159.
+
+    Many academic download tools save PDFs with a DOI-based filename where the
+    single '/' in the DOI is replaced by '_'. This is safe for enrichment
+    because the filename was chosen by the user/tool to represent that paper.
+    """
+    import re
+    stem = pdf_path.stem
+    match = re.match(r'^(10\.\d{4,9})_(.+)$', stem)
+    if match:
+        candidate = f"{match.group(1)}/{match.group(2)}"
+        return _normalize_match_doi(candidate)
+    return None
+
+
+def _get_page1_doi(pdf_path: Path) -> str | None:
+    """Extract the first DOI from page 1 text only.
+
+    Page 1 is almost always the title/abstract page and typically shows the
+    paper's own DOI in a header or footer. Using only page 1 (not pages 1-5)
+    avoids the reference list which appears on later pages.
+    """
+    import pdfplumber
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if not pdf.pages:
+                return None
+            text = pdf.pages[0].extract_text() or ""
+            hits = _collect_dois_from_plaintext(text)
+            return hits[0] if hits else None
+    except Exception as exc:  # noqa: BLE001
+        log_error(str(pdf_path.name), "enrich_manifest", f"pdfplumber page-1 read failed: {exc}")
+        return None
+
+
+def _get_best_doi_for_enrichment(pdf_path: Path) -> tuple[str | None, str]:
+    """Try three DOI sources in order and return (doi, source_label).
+
+    Sources tried in order of reliability:
+    1. PDF embedded metadata dict (safest — identifies the file itself when present)
+    2. Filename-based DOI (safe — user/tool named the file after the DOI)
+    3. Page 1 text (reasonably safe — page 1 is title/abstract, not references)
+    """
+    doi = _get_pdf_metadata_doi(pdf_path)
+    if doi:
+        return doi, "metadata"
+    doi = _doi_from_filename(pdf_path)
+    if doi:
+        return doi, "filename"
+    doi = _get_page1_doi(pdf_path)
+    if doi:
+        return doi, "page-1"
+    return None, "none"
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +276,13 @@ def enrich_manifest_from_folder(
         pdfs_scanned += 1
         print(f"[enrich] ({pdfs_scanned}/{len(pdf_files)}) {pdf_path.name}")
 
-        doi = _get_pdf_metadata_doi(pdf_path)
+        doi, doi_source = _get_best_doi_for_enrichment(pdf_path)
 
         if doi is None:
-            print(f"[enrich]   No metadata DOI found — skipping enrichment for this PDF.")
+            print(f"[enrich]   No DOI found (tried metadata, filename, page-1) — skipping enrichment.")
             continue
+
+        print(f"[enrich]   DOI found via {doi_source}: {doi}")
 
         dois_found += 1
         doi_lower = doi.lower().strip()
@@ -267,7 +327,7 @@ def enrich_manifest_from_folder(
     print(
         f"[enrich] Done{suffix}. "
         f"PDFs scanned: {pdfs_scanned}, "
-        f"metadata DOIs found: {dois_found}, "
+        f"DOIs found: {dois_found}, "
         f"records appended: {records_appended}."
     )
     return pdfs_scanned, dois_found, records_appended

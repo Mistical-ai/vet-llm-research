@@ -127,7 +127,7 @@ def test_enrich_manifest_skips_existing_dois(tmp_path: Path) -> None:
     pdf.write_bytes(b"%PDF-1.4 fake")
 
     with (
-        patch.object(enrich, "_get_pdf_metadata_doi", return_value=doi),
+        patch.object(enrich, "_get_best_doi_for_enrichment", return_value=(doi, "metadata")),
         patch.object(enrich, "_fetch_crossref_single") as mock_fetch,
     ):
         _, _, appended = enrich.enrich_manifest_from_folder(
@@ -149,7 +149,7 @@ def test_enrich_manifest_appends_new_entry(tmp_path: Path) -> None:
     crossref_item = _make_crossref_item(doi=doi)
 
     with (
-        patch.object(enrich, "_get_pdf_metadata_doi", return_value=doi),
+        patch.object(enrich, "_get_best_doi_for_enrichment", return_value=(doi, "metadata")),
         patch.object(enrich, "_fetch_crossref_single", return_value=crossref_item),
         patch("time.sleep"),  # skip rate-limit delay
     ):
@@ -175,7 +175,7 @@ def test_enrich_manifest_dry_run_does_not_write(tmp_path: Path) -> None:
     crossref_item = _make_crossref_item(doi=doi)
 
     with (
-        patch.object(enrich, "_get_pdf_metadata_doi", return_value=doi),
+        patch.object(enrich, "_get_best_doi_for_enrichment", return_value=(doi, "metadata")),
         patch.object(enrich, "_fetch_crossref_single", return_value=crossref_item),
         patch("time.sleep"),
     ):
@@ -187,7 +187,7 @@ def test_enrich_manifest_dry_run_does_not_write(tmp_path: Path) -> None:
     assert manifest.read_text(encoding="utf-8") == ""
 
 
-def test_enrich_manifest_no_metadata_doi_skips_crossref(tmp_path: Path) -> None:
+def test_enrich_manifest_no_doi_found_skips_crossref(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text("", encoding="utf-8")
 
@@ -195,7 +195,7 @@ def test_enrich_manifest_no_metadata_doi_skips_crossref(tmp_path: Path) -> None:
     pdf.write_bytes(b"%PDF-1.4 fake")
 
     with (
-        patch.object(enrich, "_get_pdf_metadata_doi", return_value=None),
+        patch.object(enrich, "_get_best_doi_for_enrichment", return_value=(None, "none")),
         patch.object(enrich, "_fetch_crossref_single") as mock_fetch,
     ):
         _, dois_found, appended = enrich.enrich_manifest_from_folder(
@@ -246,3 +246,44 @@ def test_retry_failed_pdfs_missing_dir(tmp_path: Path) -> None:
     retried = _retry_failed_pdfs(failed_dir, inbox_dir)
 
     assert retried == []
+
+
+# ---------------------------------------------------------------------------
+# _doi_from_filename / _get_best_doi_for_enrichment
+# ---------------------------------------------------------------------------
+
+def test_doi_from_filename_valid() -> None:
+    pdf = Path("10.1177_1098612X231170159.pdf")
+    doi = enrich._doi_from_filename(pdf)
+    assert doi == "10.1177/1098612x231170159"
+
+
+def test_doi_from_filename_invalid() -> None:
+    pdf = Path("some_random_paper.pdf")
+    doi = enrich._doi_from_filename(pdf)
+    assert doi is None
+
+
+def test_get_best_doi_falls_back_to_filename(tmp_path: Path) -> None:
+    pdf = tmp_path / "10.1177_1098612X231170159.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    with patch.object(enrich, "_get_pdf_metadata_doi", return_value=None):
+        doi, source = enrich._get_best_doi_for_enrichment(pdf)
+
+    assert doi == "10.1177/1098612x231170159"
+    assert source == "filename"
+
+
+def test_get_best_doi_falls_back_to_page1(tmp_path: Path) -> None:
+    pdf = tmp_path / "no_doi_in_name.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    with (
+        patch.object(enrich, "_get_pdf_metadata_doi", return_value=None),
+        patch.object(enrich, "_get_page1_doi", return_value="10.1111/page1.doi"),
+    ):
+        doi, source = enrich._get_best_doi_for_enrichment(pdf)
+
+    assert doi == "10.1111/page1.doi"
+    assert source == "page-1"
