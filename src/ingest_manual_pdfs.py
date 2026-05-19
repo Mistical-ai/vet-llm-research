@@ -1,17 +1,26 @@
+#!/usr/bin/env python3
 """
-src/ingest_manual_pdfs.py — Bulk ingest legally obtained OA PDFs from disk
-===========================================================================
+Script: ingest_manual_pdfs.py
+Purpose: Move legally obtained PDFs from data/manual_inbox/ into data/raw/ using
+         manifest.jsonl metadata (read-only) and append data/manual_manifest.jsonl.
 
-Drop arbitrary PDF filenames into ``data/manual_inbox/``.  This script identifies
-each paper (prefer embedded DOI strings), pulls canonical rows from
-``data/manifest.jsonl``, saves under descriptive names in ``data/raw/``, and
-appends duplicate-free JSON lines into ``data/manual_manifest.jsonl``.
+Design choices explained (deeper detail in README § Design Decisions):
+- Why require manifest linkage? Filenames from browsers are meaningless; the manifest
+  is the single source of truth for DOI, journal, and descriptive filenames.
+- Why DOI first, then PDF Title? Embedded DOIs are the most reliable key; title
+  matching is a fallback when the DOI in the PDF is missing or not in the manifest.
+- Why a manual_inbox/failed/ folder instead of deleting? Unmatched PDFs are evidence
+  for debugging (wrong manifest, bad metadata, scan with no text). Researchers can
+  fix the root cause and re-run auto_ingest_workflow.py, which retries failed/.
+- Why never edit manifest.jsonl here? collect.py and enrich_manifest_from_pdfs.py
+  own manifest writes; ingest only reads so automated and manual paths stay auditable.
+- Why skipped_existing_in_raw/ vs failed/? Duplicates already in raw/ are success,
+  not errors — they are quarantined separately so failed/ stays actionable.
 
-LEGAL USE ONLY — researchers ingest manuscripts they legally obtained via OA,
-publisher permissions, library services, authors, etc.  This helper never speaks
-HTTP to subscription gateways.
+Alternative considered (and rejected): Guess filenames from PDF text only — too many
+collisions and no stable join key for pipeline.py.
 
-IMPORTANT: Never edit ``manifest.jsonl`` via this script; ingestion only reads it.
+Operator guide: README \"Guide: Manually adding papers to your corpus\".
 """
 
 from __future__ import annotations
@@ -96,8 +105,14 @@ def _metadata_blob(meta: dict[str, Any] | None) -> str:
 
 
 def _gather_dois_from_pdf(pdf_path: Path) -> tuple[list[str], str | None, str]:
-    """Return ordered DOIs (metadata-first) plus embedding Title hints."""
-    import pdfplumber  # Mirrors download/extract lazy strategy.
+    """
+    Collect DOI candidates from PDF metadata and the first five pages.
+
+    Why scan page text here (unlike enrich_manifest_from_pdfs)? Ingest must find
+    a manifest row even when enrichment failed; page text helps match DOIs in the
+    article body, while enrich uses metadata-only to avoid adding reference DOIs.
+    """
+    import pdfplumber  # Lazy import — see README \"Why pdfplumber?\"
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -215,6 +230,12 @@ def ingest_one_pdf(
     manual_registered: set[str],
     skipped_existing_root: Path,
 ) -> tuple[str, Path | None, str]:
+    """
+    Match one inbox PDF to a manifest row and move it into data/raw/.
+
+    Outcomes starting with failed_* move the file to manual_inbox/failed/ so the
+    researcher can inspect without losing the PDF. See README § Manual ingest failures.
+    """
     doi_candidates, embedded_title, trace = _gather_dois_from_pdf(pdf_path)
     doi: str | None = None
 

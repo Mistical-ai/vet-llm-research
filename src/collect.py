@@ -1,103 +1,28 @@
+#!/usr/bin/env python3
 """
-src/collect.py — The Ingestion Engine
-======================================
+Script: collect.py
+Purpose: Builds data/manifest.jsonl by querying CrossRef for candidate papers from
+         the five target veterinary journals (JOURNAL_TARGETS).
 
-WHY DOES THIS MODULE EXIST?
------------------------------
-Before we can summarise veterinary papers, we need a reliable list of *which*
-papers exist.  This module builds that list — the "manifest" — by querying the
-CrossRef API for up to COLLECT_CANDIDATES_PER_JOURNAL DOIs per journal and
-writing them to a JSONL file that download.py consumes.
+Design choices explained (deeper detail in README § Design Decisions):
+- Why CrossRef? Free, standard DOI registry; basic /works queries need no API key.
+  PubMed would miss many surgery papers; Scopus needs a paid license we do not use.
+- Why year-balanced collection? Each COLLECT_YEARS window is queried separately so
+  the manifest is not dominated by the newest year only (see README glossary).
+- Why skip corrections, errata, and short communications? They are not full
+  primary-research articles; filters are in NON_ARTICLE_TITLE_PATTERNS.
+- Why ~2000 candidates per journal for a 50-PDF quota? Most rows never download;
+  the buffer absorbs OA gaps and validation failures in download.py.
+- Why JSONL? Append-safe on crash; no database overhead at this scale.
+- Why keyword covariates, not an LLM? Deterministic, free pre-processing; uncertain
+  rows are flagged needs_manual_review for later human review.
 
-STRATIFIED CORPUS DESIGN
---------------------------
-This pipeline targets exactly 50 PDFs per journal across 5 journals (250
-total).  Equal-quota stratified sampling is used instead of proportional
-sampling for two reasons:
+Alternative considered (and rejected): Manual DOI spreadsheets — too slow and
+error-prone to maintain across five journals.
 
-  1. BIAS PREVENTION
-     High-OA journals (e.g. JVIM) publish far more freely available content
-     than surgical or radiology journals.  Proportional sampling would let
-     JVIM dominate the corpus, potentially biasing the LLM's learned writing-
-     style patterns toward internal-medicine content.  Equal quotas prevent this.
-
-  2. SUBGROUP ANALYSIS POWER
-     With exactly 50 papers per journal we can run balanced subgroup analyses
-     in Phase 4 (e.g. "does summarisation quality differ between JFMS and
-     Veterinary Surgery?").  A Kruskal-Wallis test with 5 groups of n=50 has
-     adequate power at α=0.05 for medium effect sizes.  A proportional approach
-     would leave low-OA journals with far fewer samples (sometimes < 20),
-     making subgroup comparisons underpowered.
-
-CANDIDATE BUFFER
------------------
-We collect COLLECT_CANDIDATES_PER_JOURNAL (default: 2000) DOIs per journal even
-though the download quota is 50.  Not every CrossRef DOI will have a freely
-downloadable PDF — publisher embargo, broken links, and PMC deposit lag all
-reduce the OA hit rate.  The surplus candidates give download.py a deeper
-fallback pool so transient OA gaps do not cause the corpus to fall short of
-50 PDFs per journal.  The larger pool is intentional: real download runs have
-shown that many candidates fail legal OA or text-quality validation.
-
-ARCHITECTURAL DECISIONS
-------------------------
-- WHY CROSSREF (not PubMed, not Scopus)?
-    CrossRef is the canonical DOI registry.  The API is free, requires no
-    account, and returns structured JSON.  PubMed only covers NIH-indexed
-    biomedical articles; it would miss many veterinary surgery papers.  Scopus
-    requires a paid institutional key we do not have.
-
-- WHY JSONL (not CSV, not a database)?
-    JSON Lines is append-safe.  If the pipeline crashes after paper #47,
-    lines 1-47 are already valid.  A CSV would require rewriting the whole
-    file; a database adds infrastructure with no benefit at ~250 rows.
-
-- WHY has-license:true AS A CROSSREF PRE-FILTER?
-    CrossRef's `has-license:true` filter restricts results to articles that
-    have a machine-readable license URL deposited by the publisher.  This is
-    NOT a guarantee that a PDF is freely downloadable — some licensed papers
-    are CC-BY but the PDF still sits behind an institutional login.  However,
-    the filter improves the OA hit rate in the candidate pool and reduces
-    wasted API pages.  The real legal gate is the download step (Unpaywall
-    `is_oa` check, Semantic Scholar `isOpenAccess` flag, PMC availability).
-
-- WHY YEAR-BALANCED, THEN sort=published desc?
-    The study window is 2023-2025, so live collection queries each year
-    separately by default.  Within each year, sorting newest-first keeps the
-    candidate pool recent without letting 2025 crowd out 2024/2023.
-
-- WHY DRY_RUN MODE?
-    Lets the researcher test the entire pipeline end-to-end without network
-    access.  Critical for laptop development before a scheduled compute run.
-
-TARGET JOURNALS AND ISSNs
---------------------------
-  - JVIM  (Journal of Veterinary Internal Medicine) : 1939-1676 (e-ISSN)
-  - JAVMA (J. American Veterinary Medical Association) : 0003-1488
-  - Veterinary Surgery                               : 0161-3499
-  - VRU   (Veterinary Radiology & Ultrasound)        : 1058-8183
-  - JFMS  (Journal of Feline Medicine and Surgery)   : 1098-612X
-
-MANIFEST SCHEMA (one JSON object per line)
-------------------------------------------
-{
-  "doi":                "10.1111/jvim.12345",
-  "title":              "Evaluation of ...",
-  "year":               2024,
-  "pub_year":           2024,
-  "authors":            ["Smith J", "Jones A"],
-  "abstract":           "Objective: ...",
-  "journal":            "JVIM",
-  "issn":               "1939-1676",
-  "species":            ["Canine"],
-  "study_design":       "Prospective Observational",
-  "clinical_topic":     "Gastroenterology",
-  "needs_manual_review": false
-}
-
-Note: "year" and "pub_year" carry the same value.  "year" is kept for
-backward compatibility with extract.py and existing tests; "pub_year" is
-the canonical field name used by the balanced-corpus workflow.
+Manifest schema: one JSON object per line (doi, title, year, pub_year, authors,
+abstract, journal, issn, species, study_design, clinical_topic, needs_manual_review).
+Both year and pub_year are kept so older scripts and tests stay compatible.
 """
 
 import json
@@ -444,7 +369,11 @@ def _plain_text(value: str) -> str:
 
 def _candidate_rejection_reason(record: dict) -> str | None:
     """
-    Return a reason if a manifest candidate is not a useful full-paper target.
+    Return a rejection reason if this CrossRef row should not enter the manifest.
+
+    Why title-based rules instead of CrossRef \"type\" alone? Publishers use
+    inconsistent type strings; leading-title patterns (Correction:, Case Report:)
+    catch editorial noise more reliably than a single metadata field.
     """
     title = _plain_text(str(record.get("title", "")))
     abstract = _plain_text(str(record.get("abstract", "")))
@@ -524,20 +453,12 @@ def _passes_oa_preflight(record: dict) -> bool:
 
 def _parse_crossref_item(item: dict, journal_name: str, issn: str) -> dict | None:
     """
-    Convert a raw CrossRef API item into our manifest schema.
+    Convert one CrossRef API item into a manifest row.
 
-    Returns None if the item lacks a DOI (the only mandatory field).
-
-    WHY INCLUDE BOTH 'year' AND 'pub_year'?
-        'year' was the original field name used in Phase 2.  'pub_year' is the
-        canonical field name required by the balanced-corpus workflow (so that
-        download.py and supplement.py can query the publication year without
-        guessing the field name).  Both carry the same value to maintain
-        backward compatibility with extract.py and existing tests.
-
-    WHY GUARD FOR MISSING DOI?
-        CrossRef items occasionally lack certain fields.  A missing DOI makes
-        the record useless — we can't download or deduplicate without it.
+    Why this shape? download.py, supplement.py, and ingest_manual_pdfs.py all
+    expect the same fields so we never re-query CrossRef during summarization.
+    Species/study_design use keyword inference here (not an LLM) to avoid cost
+    on a step that only ranks candidates. Returns None when DOI is missing.
     """
     doi = item.get("DOI", "").strip()
     if not doi:
@@ -745,7 +666,10 @@ MOCK_PAPERS: list[dict] = [
 
 def _collection_windows() -> list[tuple[str, str, str, int]]:
     """
-    Return date windows and per-window candidate targets for live collection.
+  Split COLLECT_CANDIDATES_PER_JOURNAL across COLLECT_YEARS.
+
+  Why not one combined date filter? CrossRef pagination with sort=newest would
+  starve older years; separate windows keep each year represented in the manifest.
     """
     if not COLLECT_YEAR_BALANCED or not COLLECT_YEARS:
         return [("all", DATE_FROM, DATE_TO, COLLECT_CANDIDATES_PER_JOURNAL)]

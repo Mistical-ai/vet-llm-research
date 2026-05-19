@@ -1,158 +1,25 @@
+#!/usr/bin/env python3
 """
-src/download.py — Automated Open-Access PDF Acquisition
-=========================================================
+Script: download.py
+Purpose: Download legal open-access (OA) PDFs for manifest candidates into data/raw/.
 
-WHY DOES THIS MODULE EXIST?
------------------------------
-A language model can summarise a paper far better from its full text than
-from a 250-word abstract.  This module attempts to download the open-access
-full-text PDF for every paper in the manifest so that extract.py has something
-to work with.
+Design choices explained (deeper detail in README § Design Decisions):
+- Why a multi-source fallback chain? No single index lists every OA copy; order in
+  download_paper() is: Unpaywall → PMC (PubMed Central) → Europe PMC → Semantic Scholar
+  → optional fulltext-article-downloader CLI → publisher-direct URL → HTML scrape.
+  Repository APIs are tried before publisher pages to reduce bot blocks (CDN).
+- Why %PDF magic bytes? Content-Type headers lie; login HTML must never become a \"PDF\".
+- Why MIN_EXTRACTED_WORDS (and MIN_PAGES / MIN_SECTIONS)? A valid PDF can still be a
+  correction, scan, or stub — the gate ensures enough IMRAD-like text for LLM work.
+  See README glossary: \"Word-count gate\" and \"Why pdfplumber?\".
+- Why browser-like headers? Many publisher CDNs return HTTP 403 to python-requests
+  User-Agents even for OA files; headers do not bypass paywalls (magic bytes still apply).
+- Why stop at 50 PDFs per journal? Balanced corpus design (see collect.py / README).
+- Why revalidate files already in raw/? Older runs may have saved pre-gate PDFs that
+  still occupy quota slots; failures move to data/quarantine/ with a JSON sidecar.
 
-LEGAL CONSTRAINT (NON-NEGOTIABLE)
------------------------------------
-We ONLY download content that is genuinely open access — either confirmed by
-a trusted OA metadata service (Unpaywall, Semantic Scholar) or delivered
-without authentication by the publisher's own website.  We do NOT:
-  - Attempt to log in to journal websites.
-  - Use a VPN to circumvent geographic or institutional access controls.
-  - Use browser automation (Selenium, Playwright) to scrape subscription content.
-  - Access Sci-Hub or similar shadow libraries.
-
-HOW WE VERIFY A RESPONSE IS REALLY A PDF (NOT A PAYWALLED PAGE):
-    Every response body is checked against the PDF magic bytes (%PDF) before
-    being saved.  If a publisher serves an HTML login page at an OA-looking
-    URL, the magic byte check catches it and we move on.  This means trying a
-    publisher's direct PDF URL is completely safe — the worst outcome is we
-    save nothing.
-
-HOW WE VERIFY A PDF IS USEFUL FOR LLM SUMMARISATION:
-    A file can be a real PDF and still be the wrong kind of paper for this
-    project.  Examples: a one-page abstract, a correction notice, an image-only
-    scanned PDF, or a publisher placeholder.  Those files pass the %PDF check
-    but do not give the LLM enough usable article text.
-
-    After the `%PDF` check the downloader validates usefulness in order:
-      1. Write the candidate bytes to a temporary PDF file.
-      2. Open it with pdfplumber and count pages; reject if fewer than MIN_PAGES.
-      3. Extract text from every page (same extractor as ``src/extract.py``).
-      4. Remove anything after a References/Bibliography heading.
-      5. Require section-heading signals (introduction / methods / results /
-         discussion / conclusion categories with synonym regexes): at least MIN_SECTIONS
-         distinct matched categories.
-      6. Count words; accept only if the useful pre-references text has at least
-         MIN_EXTRACTED_WORDS words (default: 3000).
-
-    This makes "download success" mean "we have a real PDF with enough text for
-    summarisation", not merely "we received bytes that look like a PDF".
-
-Violating publisher terms of service could jeopardise the University of Guelph's
-institutional access agreements.  The study will acknowledge in its limitations
-section that the full-text corpus may be smaller than 250 papers because not all
-papers are open access.
-
-FALLBACK CHAIN (in priority order)
-------------------------------------
-1. fulltext-article-downloader CLI (if installed via pip):
-   A specialist tool that queries multiple OA repositories at once.
-   We call it as a subprocess so a missing installation doesn't crash the import.
-
-2. Unpaywall API (https://api.unpaywall.org):
-   A well-maintained, free service that returns OA PDF URLs for a DOI.
-   We now try ALL oa_locations (not just best_oa_location) so that if the
-   primary link is stale or temporarily down, we fall through to the next.
-   Requires an email address in the request header (set via UNPAYWALL_EMAIL in .env).
-
-3. Semantic Scholar Open Access PDF URL:
-   Semantic Scholar's API returns an `openAccessPdf` field for many papers.
-   No API key required for basic queries.
-
-4. PubMed Central (via NCBI E-utils):
-   For papers indexed in PMC, we can fetch the full-text PDF directly.
-   Requires a DOI-to-PMCID lookup step.
-
-5. Publisher-direct PDF URL (Wiley, AVMA, SAGE):
-   Many publishers expose OA PDFs at a predictable URL pattern without login.
-   We try these directly using browser-like headers.  Paywalled papers return
-   an HTML page or 403, which the magic byte check rejects — no false saves.
-   Covered publishers (by DOI prefix):
-     - Wiley (10.1111/):  onlinelibrary.wiley.com/doi/pdf/{doi}
-     - AVMA  (10.2460/):  avmajournals.avma.org/doi/pdf/{doi}
-     - SAGE  (10.1177/):  journals.sagepub.com/doi/pdf/{doi}
-
-6. Article-page HTML scraping (citation_pdf_url meta tag):
-   Follow the DOI redirect to the publisher's article page, parse the HTML for
-   a <meta name="citation_pdf_url"> tag (a standard Google Scholar metadata
-   convention used by most publishers), and download the URL it contains.
-   A requests.Session() is used to carry cookies from the HTML page fetch to
-   the PDF download, which some publishers (SAGE) require.
-
-If all six sources fail, we log the failure and move on.
-The pipeline is designed to work with whatever subset of PDFs is legally available.
-
-WHY BROWSER-LIKE HEADERS?
----------------------------
-Many publishers reject plain Python requests.get() calls with 403 Forbidden
-even when the paper is open access — their CDN or reverse proxy checks the
-User-Agent and blocks non-browser strings.  Using a realistic browser
-User-Agent string (Chrome on Windows) resolves this for most publishers.
-This does NOT bypass authentication: publishers still gate subscription content
-behind login forms.  The magic byte check ensures we only keep real PDFs.
-
-BALANCED CORPUS DOWNLOAD LOGIC
----------------------------------
-This step enforces per-journal PDF quotas (50 PDFs per journal, 250 total)
-through four mechanisms:
-
-  1. STOP-LOSS: Once a journal reaches its 50-PDF quota, remaining candidates
-     for that journal are skipped.  This prevents over-downloading from high-OA
-     journals while under-collecting from lower-OA ones.
-
-  2. MAX_FAILED_PER_JOURNAL: If a journal exhausts its failure budget before
-     reaching 50 PDFs, it is marked for manual supplementation rather than
-     burning through all candidates pointlessly.  Default = 300 (set via
-     .env to override).
-
-  3. MANUAL_ONLY_THRESHOLD / CLOUDFLARE: Persistent HTTP 403 / CDN blocks are
-     counted per journal (including entries replayed from data/error_log.jsonl).
-     Once the count reaches MANUAL_ONLY_THRESHOLD, remaining manifest rows for
-     that journal skip automated downloads and are recorded as CLOUDFLARE_BLOCKED
-     in data/missing_papers.csv.
-
-  4. SHORTFALL LOGGING: If any journal ends below 50 PDFs, a structured entry
-     is written to data/error_log.jsonl (stage="insufficient_oa") and
-     data/missing_papers.csv is generated for manual supplementation.
-
-PROGRESS BAR
---------------
-The bar shows "Successful PDFs / 250" rather than "DOIs attempted / total".
-This gives a more actionable picture: the bar moves only when a PDF is actually
-saved, so stalling reveals OA problems immediately rather than after the run.
-
-VERBOSITY
-----------
-Set DOWNLOAD_VERBOSE=false in .env to suppress per-DOI attempt and failure
-messages.  Summary lines (per-journal status) and final counts always print
-regardless of the verbosity flag.  All failures are still written to
-data/error_log.jsonl regardless of DOWNLOAD_VERBOSE.
-Set DOWNLOAD_VERBOSE=true to see every step of every fallback — useful when
-debugging why a specific DOI is failing.
-
-IDEMPOTENCY
------------
-WHY CHECK data/raw/ BEFORE DOWNLOADING?
-    If the pipeline crashes mid-run and is restarted, we don't want to re-download
-    papers that were already saved.  Checking `if pdf_path.exists(): skip` makes
-    the download step safe to re-run as many times as needed.
-
-WHY REVALIDATE EXISTING PDFs?
-    Older runs may have saved PDFs before the text-length gate existed.  If we
-    blindly count those files, a one-page PDF could permanently occupy one of
-    the 50 journal quota slots.  At the start of each live download run, existing
-    manifest PDFs in data/raw/ are rechecked.  Any bad file is moved to
-    data/quarantine/ with a JSON sidecar instead of being deleted.  After that,
-    the DOI is treated as not downloaded, so the normal fallback chain can try
-    to find a better OA copy.
+Legal constraint: no logins, VPN circumvention, or shadow libraries. Failures log to
+data/error_log.jsonl; journal shortfalls also feed data/missing_papers.csv via supplement.
 """
 
 # json lets us read and write JSON/JSONL records.

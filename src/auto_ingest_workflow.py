@@ -1,20 +1,26 @@
+#!/usr/bin/env python3
 """
-src/auto_ingest_workflow.py — One-shot bridge from manual downloads → corpus
-==============================================================================
+Script: auto_ingest_workflow.py
+Purpose: One command from data/incoming_manuals/ to an updated corpus in data/raw/.
 
-Workflow (researcher-facing):
-    1. Drop legally acquired PDFs into ``data/incoming_manuals/``.
-    2. Run ``python src/auto_ingest_workflow.py``.
-    3. Review printed summaries / ``data/logs/auto_ingest_workflow.log``.
+Design choices explained (deeper detail in README § Design Decisions):
+- Why run enrich_manifest_from_pdfs.py before ingest? Manual PDFs often arrive
+  before their DOI was collected in bulk; per-PDF CrossRef lookup appends missing
+  manifest rows so ingest can match without hand-editing manifest.jsonl.
+- Why retry failed/ at the start? A previous run may have failed only because the
+  manifest was incomplete; enrichment plus retry avoids permanent false negatives.
+- Why subprocess calls instead of imports? Each step is a standalone script researchers
+  can run alone; subprocess keeps logs visible and exit codes isolated.
+- Why supplement.py after pipeline.py? The missing-papers CSV should reflect PDFs
+  just ingested into raw/, not the pre-ingest gap list.
+- Why archive failed/ at the end? Preserves evidence by date without cluttering the
+  inbox; skipped duplicates are deleted because they are benign.
 
-This orchestrates supplement reporting (optional), staging moves into the inbox,
-the canonical ingest helper (rename + ``manual_manifest.jsonl`` append),
-corpus reporting via ``pipeline.py``, and optional housekeeping under
-``data/manual_inbox/``.
+Researcher steps: drop PDFs in data/incoming_manuals/ → run this script → read
+data/logs/auto_ingest_workflow.log and pipeline.py output.
 
-See README section **Fully automated manual ingestion** for operator guidance.
+See README \"Guide: Manually adding papers to your corpus\".
 """
-
 from __future__ import annotations
 
 import argparse
@@ -79,6 +85,38 @@ def _run_python_script(rel_script: Path, *, description: str) -> subprocess.Comp
         check=False,
         text=True,
     )
+
+
+def _retry_failed_pdfs(failed_dir: Path, inbox_root: Path) -> list[str]:
+    """
+    Move PDFs from manual_inbox/failed/ back to the inbox root for another attempt.
+
+    Why at workflow start? Enrichment may add the manifest row that failed ingest
+    last time; retrying before new incoming files avoids leaving fixable PDFs buried.
+    """
+    if not failed_dir.exists():
+        log_line("retry_failed: failed/ does not exist — nothing to retry.")
+        return []
+
+    pdf_candidates = sorted(
+        p for p in failed_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".pdf"
+    )
+
+    if not pdf_candidates:
+        log_line("retry_failed: failed/ is empty — nothing to retry.")
+        return []
+
+    retried: list[str] = []
+    for pdf_path in pdf_candidates:
+        destination = _unique_path(inbox_root, pdf_path.name)
+        shutil.move(str(pdf_path), str(destination))
+        detail = f"failed/{pdf_path.name} → manual_inbox/{destination.name}"
+        retried.append(detail)
+        log_line(f"retry_failed: moved {detail}")
+
+    log_line(f"retry_failed: returned {len(retried)} PDF(s) to inbox for retry.")
+    return retried
 
 
 def _stage_incoming_pdfs(incoming_root: Path, inbox_root: Path) -> list[str]:
@@ -181,21 +219,29 @@ def main(argv: list[str] | None = None) -> int:
 
     log_line("=== auto_ingest_workflow start ===")
 
-    # --- Supplement --------------------------------------------------------------
-    if args.no_supplement:
-        log_line("SKIP supplement (--no-supplement).")
-    else:
-        supplement_proc = _run_python_script(Path("src") / "supplement.py", description="missing CSV refresh")
-        if supplement_proc.returncode != 0:
-            log_line(
-                f"ERROR supplement.py exited {supplement_proc.returncode}; "
-                "incoming PDFs untouched.",
-                echo=True,
-            )
-            return supplement_proc.returncode
+    # --- Retry previously failed PDFs -------------------------------------------
+    # Move PDFs from failed/ back into the inbox BEFORE staging new ones so
+    # they participate in manifest enrichment and get a fresh ingest attempt.
+    retried = _retry_failed_pdfs(FAILED_DIR, inbox_root)
 
     # --- Stage incoming → inbox --------------------------------------------------
     transfers = _stage_incoming_pdfs(incoming, inbox_root)
+
+    # --- Pre-ingest manifest enrichment -----------------------------------------
+    # Scan all inbox PDFs, extract metadata DOIs, look up unknowns in CrossRef,
+    # and append missing entries to manifest.jsonl BEFORE ingest runs.
+    # Non-fatal: if this step fails, ingest still runs with the existing manifest.
+    log_line("enrich_manifest: starting pre-ingest CrossRef enrichment…")
+    enrich_proc = _run_python_script(
+        Path("src") / "enrich_manifest_from_pdfs.py",
+        description="pre-ingest manifest enrichment via CrossRef",
+    )
+    if enrich_proc.returncode != 0:
+        log_line(
+            "WARN enrich_manifest_from_pdfs.py exited non-zero; "
+            "proceeding with ingest using existing manifest.",
+            echo=True,
+        )
 
     # --- ingest_manual_pdfs ------------------------------------------------------
     ingest_proc = _run_python_script(Path("src") / "ingest_manual_pdfs.py", description="manual ingest bridge")
@@ -214,6 +260,20 @@ def main(argv: list[str] | None = None) -> int:
 
     log_line(f"pipeline.py finished with exit code {pipeline_proc.returncode}")
 
+    # --- supplement reconciliation -----------------------------------------------
+    # Regenerate missing_papers.csv now that new PDFs are in data/raw/.
+    # Running after pipeline.py means the CSV reflects the actual post-ingestion
+    # state — papers just ingested are automatically excluded from the suggestions.
+    # Failure is non-fatal: the PDFs are already ingested; this is reporting only.
+    if args.no_supplement:
+        log_line("SKIP supplement reconciliation (--no-supplement).")
+    else:
+        supplement_proc = _run_python_script(
+            Path("src") / "supplement.py",
+            description="reconcile missing_papers.csv post-ingestion",
+        )
+        log_line(f"supplement.py finished (exit code {supplement_proc.returncode})")
+
     # --- housekeeping -------------------------------------------------------------
     if args.no_clean:
         log_line("SKIP inbox cleanup (--no-clean).")
@@ -225,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
 
     log_line(
         f"=== auto_ingest_workflow complete "
-        f"(staged={len(transfers)}) pipeline_rc={pipeline_proc.returncode} ==="
+        f"(retried={len(retried)}, staged={len(transfers)}) pipeline_rc={pipeline_proc.returncode} ==="
     )
 
     # Preserve pipeline semantics for downstream CI hooks while signalling ingest OK.

@@ -20,6 +20,8 @@ Think of the pipeline as an assembly line with **four main stations** you usuall
 
 Optional: **`python src/supplement.py`** helps when a journal cannot reach 50 OA PDFs automatically — it explains what to do next and updates `data/missing_papers.csv`.
 
+Manual PDFs: drop files in **`data/incoming_manuals/`** and run **`python src/auto_ingest_workflow.py`** (enrichment → ingest → status). See [Design Decisions](#design-decisions) and the [Glossary](#glossary).
+
 All detailed terms (DOI, CrossRef, OA, etc.) are defined in the [Glossary](#glossary) at the end of this file.
 
 ## Balanced Corpus Design
@@ -48,10 +50,11 @@ Equal-quota sampling is used instead of proportional sampling for two reasons:
 the pipeline logs the deficit and generates `data/missing_papers.csv` for
 manual supplementation via `src/supplement.py`.
 
-## Current Status — Phase 2.1 Validation
+## Current Status — Phase 2.4 Validation
 
-This branch is the Phase 2.1 validation iteration.  The baseline Phase 2
-pipeline has been significantly hardened with a production-safe OA downloader.
+This branch (`phase-2.4-validation`) documents and hardens the Phase 2 ingestion
+pipeline: beginner-oriented comments in the Core 5 scripts, manifest enrichment
+before manual ingest, and the production-safe OA downloader.
 
 ### What is new in Phase 2.1
 
@@ -170,8 +173,9 @@ review, and statistical analysis.
 | `python src/download.py` | Walks the manifest, downloads **OA-only** PDFs with validation, writes `data/error_log.jsonl` and possibly `data/missing_papers.csv`. |
 | `python src/extract.py` | **Smoke test only**: forces `DRY_RUN=true`, loads a fixture DOI, prints success and a short preview. Import `extract_clean_text` from code for real extraction. |
 | `python src/supplement.py` | Human-facing report for journals below 50 PDFs; refreshes `data/missing_papers.csv`. |
+| `python src/enrich_manifest_from_pdfs.py` | Pre-ingest: reads metadata DOIs from inbox PDFs, queries CrossRef per unknown DOI, appends rows to `manifest.jsonl`. |
 | `python src/ingest_manual_pdfs.py` | Moves legal manual PDFs from `data/manual_inbox/` into `data/raw/` with descriptive filenames; appends `data/manual_manifest.jsonl`. Read-only on `manifest.jsonl`. |
-| `python src/auto_ingest_workflow.py` | End-to-end manual ingest driver: optional supplement refresh, stages `data/incoming_manuals/` → inbox, runs ingest + `pipeline.py`, logs to `data/logs/auto_ingest_workflow.log`. |
+| `python src/auto_ingest_workflow.py` | End-to-end manual ingest: retry `failed/`, stage `incoming_manuals/` → inbox, enrich manifest, ingest, `pipeline.py`, supplement, optional cleanup. Logs to `data/logs/auto_ingest_workflow.log`. |
 | `python pipeline.py` | Loads OA + `data/manual_manifest.jsonl`, validates PDFs on disk, prints per-journal status. **Exits with code 1** if fewer than **200** confirmed PDFs (for scripts/CI). |
 | `python src/main.py` | Minimal sanity check: loads `.env` and prints that the environment is initialized. |
 | `python src/utils/generate_mock.py` | Developer utility to regenerate rich mock JSON (not required for the normal user workflow). |
@@ -641,11 +645,13 @@ python src/auto_ingest_workflow.py
 
 **What this script does for you**, in order:
 
-1. Runs **`python src/supplement.py`** (unless you skip it—see flags below) so your missing-paper list stays fresh.
+1. **Retries** PDFs in **`data/manual_inbox/failed/`** (moves them back to the inbox).
 2. **Moves** every `*.pdf` from **`data/incoming_manuals/`** into **`data/manual_inbox/`** (staging).
-3. Runs **`python src/ingest_manual_pdfs.py`**, which reads each PDF, finds its DOI (or matches title metadata to the manifest), picks the correct descriptive filename, and moves the result into **`data/raw/`**.
-4. **Appends** the matching manifest row to **`data/manual_manifest.jsonl`** when needed (without changing **`manifest.jsonl`**).
-5. Runs **`python pipeline.py`** so you see an updated **per-journal table**.
+3. Runs **`python src/enrich_manifest_from_pdfs.py`** so unknown DOIs get manifest rows from CrossRef (non-fatal if it fails).
+4. Runs **`python src/ingest_manual_pdfs.py`**, which matches each PDF to the manifest and moves successes into **`data/raw/`** (failures → **`manual_inbox/failed/`**).
+5. Runs **`python pipeline.py`** for an updated **per-journal table**.
+6. Runs **`python src/supplement.py`** (unless `--no-supplement`) to refresh **`data/missing_papers.csv`** after ingestion.
+7. **Archives** remaining failures under **`data/manual_inbox/archive_failed/YYYY-MM-DD/`** (unless `--no-clean`).
 
 #### Step C4 — Read the output
 
@@ -858,6 +864,83 @@ If you get `UnicodeEncodeError` in the PowerShell terminal:
 set `DOWNLOAD_VERBOSE=false` to suppress the diagnostic body-start output,
 which may contain non-ASCII characters from publisher HTML pages.
 
+## Design Decisions
+
+Longer “why” explanations for the Core 5 scripts. Each script’s module docstring
+points here; the glossary defines acronyms.
+
+### Why CrossRef for metadata?
+
+CrossRef is the canonical [DOI](#glossary) registry. The `/works` API is free for
+reasonable use, returns structured JSON (title, abstract, authors, year), and needs
+no paid key. [PubMed Central (PMC)](#glossary) covers many biomedical papers but not
+all veterinary surgery content. Scopus and Web of Science require institutional
+licenses we do not assume.
+
+### Why year-balanced collection?
+
+If we query one wide date range with “newest first,” CrossRef pages fill with the
+latest year and older years never enter the manifest. Splitting by `COLLECT_YEARS`
+keeps 2023–2026 represented before download tries to fill quotas. See
+[stratified / year-balanced collection](#glossary) in the glossary.
+
+### Why skip corrections, errata, and short communications at collect time?
+
+Those items are not full primary-research articles. Letting them through would waste
+download attempts and pollute LLM evaluation with non-comparable text. Title-prefix
+rules in `collect.py` are stricter than relying on CrossRef “type” alone because
+publishers label types inconsistently.
+
+### Why a multi-source OA download chain?
+
+No single service indexes every legal OA PDF. `download.py` tries metadata APIs and
+repositories before publisher HTML because CDNs often block scripted publisher hits
+([HTTP 403](#glossary)). Order in code: Unpaywall → PMC → Europe PMC → Semantic
+Scholar → optional `fulltext-article-downloader` CLI → publisher-direct URL → HTML
+`citation_pdf_url` scrape. Each step stops at the first PDF that passes validation.
+
+### Why the word-count gate (MIN_EXTRACTED_WORDS)?
+
+A file can be a real PDF but useless for summarization (one-page abstract, correction,
+image-only scan). After `%PDF` verification, we require minimum pages, IMRAD-like
+section headings, and enough words after stripping references. That makes “success”
+mean “usable for Phase 3,” not merely “bytes saved.”
+
+### Why pdfplumber?
+
+We need page count and extractable text without a separate OCR stack for born-digital
+PDFs. `pdfplumber` is pure Python, matches what `extract.py` will use later, and fails
+cleanly on corrupt files. Scanned image-only PDFs are rejected rather than silently
+producing empty text. See [pdfplumber](#glossary).
+
+### Why manifest enrichment before manual ingest?
+
+Researchers often download a paper before it appeared in a bulk `collect.py` run.
+`enrich_manifest_from_pdfs.py` looks up one DOI at a time and **appends** a manifest
+row. Without that step, `ingest_manual_pdfs.py` has nothing to match and files land
+in `failed/`. Enrichment uses **metadata DOI only** so reference-list DOIs are not
+added as fake manifest entries.
+
+### Why manual_inbox/failed/?
+
+Ingest refuses to guess when a PDF cannot be linked to exactly one manifest row.
+Moving files to `failed/` (instead of deleting them) preserves evidence for
+`data/error_log.jsonl` review. `auto_ingest_workflow.py` retries `failed/` after
+enrichment. Duplicates already in `raw/` go to `skipped_existing_in_raw/`, not
+`failed/`, because those are successes not errors.
+
+### Alternatives we rejected (summary)
+
+| Idea | Why not |
+|------|---------|
+| Manual DOI spreadsheet | Slow, error-prone, no shared schema with download.py |
+| Single OA source only | Too many gaps per journal |
+| Re-run full collect.py for every manual PDF | Misses DOIs outside ISSN/date slices; wastes API pages |
+| Delete unmatched PDFs | Loses debugging context |
+| Paywall automation | Legal and institutional-policy risk |
+
+---
+
 ## Glossary
 
 Short definitions for terms used in this repository. Follow the links in **Useful Commands** and **Project Structure** for hands-on context.
@@ -906,4 +989,7 @@ Short definitions for terms used in this repository. Follow the links in **Usefu
 | **Token** | A chunk of text an LLM bills or measures; can differ by model. This repo tracks tokens only as a **rough budget estimate**, not as the PDF acceptance rule. |
 | **Unpaywall** | A service that maps DOIs to legal OA locations and license types. An **email** in `.env` is required for polite use. |
 | **Virtual environment** | An isolated Python install (`python -m venv .venv`) so this project’s packages do not clash with other Python work. |
-| **Word-count gate** | Rule enforced by `MIN_EXTRACTED_WORDS`: after stripping the reference list, the PDF must still contain enough words to resemble a full article. |
+| **Word-count gate** | Rule enforced by `MIN_EXTRACTED_WORDS`: after stripping the reference list, the PDF must still contain enough words to resemble a full article. See [Design Decisions](#design-decisions). |
+| **Manifest enrichment** | `enrich_manifest_from_pdfs.py`: append CrossRef metadata for inbox PDFs whose DOI is not yet in `manifest.jsonl`, using metadata DOI only. |
+| **manual_inbox/failed/** | Folder where `ingest_manual_pdfs.py` moves PDFs it cannot match to the manifest; retried by `auto_ingest_workflow.py`. |
+| **Core 5 scripts** | `collect.py`, `download.py`, `ingest_manual_pdfs.py`, `auto_ingest_workflow.py`, `enrich_manifest_from_pdfs.py` — main ingestion design documented in code and README. |

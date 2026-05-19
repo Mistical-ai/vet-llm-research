@@ -55,12 +55,33 @@ from utils import log_error
 load_dotenv()
 
 # ---------------------------------------------------------------------------
+# Article-type patterns (read from the same env var as download.py)
+# ---------------------------------------------------------------------------
+# WHY NOT IMPORT FROM download.py?
+#   download.py imports write_missing_report() from this module, so importing
+#   back from download.py would create a circular import.  Reading the env var
+#   directly gives the same values without the dependency cycle.
+
+_EXCLUDE_ARTICLE_TYPE_PATTERNS: list[str] = [
+    phrase.strip().lower()
+    for phrase in os.getenv(
+        "EXCLUDE_ARTICLE_TYPE_PATTERNS",
+        "short communication,brief communication,brief report,"
+        "case report,case series,case study,"
+        "imaging diagnosis,imaging findings,"
+        "rapid communication",
+    ).split(",")
+    if phrase.strip()
+]
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 MANIFEST_PATH    = Path("data") / "manifest.jsonl"
 RAW_DIR          = Path("data") / "raw"
 MISSING_CSV_PATH = Path("data") / "missing_papers.csv"
+ERROR_LOG_PATH   = Path("data") / "error_log.jsonl"
 
 # Suggested actions shown for each missing paper.
 # WHY TWO ACTIONS?
@@ -130,6 +151,47 @@ def write_missing_report(missing_papers: list[dict]) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Failure reason lookup
+# ---------------------------------------------------------------------------
+
+def _load_failure_reasons() -> dict[str, str]:
+    """
+    Read data/error_log.jsonl and return a dict mapping each DOI to the message
+    from its most recent 'download' stage entry.
+
+    WHY ONLY THE DOWNLOAD STAGE?
+        Validation and collect_filter entries describe problems with the PDF
+        content or metadata — not the download attempt.  We want the reason
+        the automated downloader couldn't retrieve the file, since that's what
+        tells the researcher how to get it manually (library proxy vs. author
+        email vs. genuinely paywalled).
+
+    WHY LAST ENTRY WINS?
+        download.py logs one entry per attempt; the last one reflects the final
+        state after all fallbacks were exhausted.  Earlier entries for the same
+        DOI are intermediate failures that were superseded.
+    """
+    reasons: dict[str, str] = {}
+    if not ERROR_LOG_PATH.exists():
+        return reasons
+    with open(ERROR_LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if entry.get("stage") == "download":
+                    doi = entry.get("doi", "").strip()
+                    msg = entry.get("message", "")
+                    if doi:
+                        reasons[doi] = msg
+            except json.JSONDecodeError:
+                continue
+    return reasons
+
+
+# ---------------------------------------------------------------------------
 # Core report generation
 # ---------------------------------------------------------------------------
 
@@ -188,6 +250,10 @@ def generate_supplement_report() -> list[dict]:
                 continue
 
     # --- Compare manifest against downloaded PDFs ---
+    # Load per-DOI failure reasons from the error log so the CSV tells the
+    # researcher WHY each paper wasn't downloaded and how to approach it.
+    failure_reasons = _load_failure_reasons()
+
     missing_papers: list[dict] = []
     total_missing  = 0
 
@@ -199,9 +265,11 @@ def generate_supplement_report() -> list[dict]:
         target = JOURNAL_TARGETS.get(journal, 50)
 
         # Determine which DOIs from this journal already have a PDF on disk.
+        # Only primary-research PDFs (no "2_" prefix) count toward the quota.
         downloaded_dois: set[str] = {
             r["doi"] for r in records
             if resolve_existing_pdf_path(RAW_DIR, r) is not None
+            and not resolve_existing_pdf_path(RAW_DIR, r).name.startswith("2_")
         }
 
         have    = len(downloaded_dois)
@@ -211,15 +279,45 @@ def generate_supplement_report() -> list[dict]:
         print(f"  {journal:<25} {have:>5}  {target:>6}  {deficit:>7}")
 
         if deficit > 0:
-            # Candidates for manual supplementation: manifest records that
-            # do NOT yet have a PDF, listed newest-first (manifest order).
+            # Candidates: manifest records that do NOT yet have a primary PDF.
             not_downloaded = [r for r in records if r["doi"] not in downloaded_dois]
+
+            # Filter out non-primary article types by checking the title.
+            # This removes case reports, short communications, editorials, and
+            # other non-original-research articles that slipped past the title
+            # filter in collect.py.  The same phrases live in download.py and
+            # audit_article_types.py; here we read them from the same env var
+            # (_EXCLUDE_ARTICLE_TYPE_PATTERNS) to avoid a circular import.
+            not_downloaded = [
+                r for r in not_downloaded
+                if not any(
+                    phrase in r.get("title", "").lower()
+                    for phrase in _EXCLUDE_ARTICLE_TYPE_PATTERNS
+                )
+            ]
+
             for record in not_downloaded[:deficit]:
+                doi      = record.get("doi", "")
+                last_msg = failure_reasons.get(doi, "")
+
+                # Translate the raw error log message into an actionable hint.
+                if "CLOUDFLARE_BLOCKED" in last_msg or "cloudflare" in last_msg.lower():
+                    # The downloader found an OA URL but publisher CDN blocked it.
+                    # Institutional library proxy or a direct author request will
+                    # often succeed where the automated downloader cannot.
+                    reason = "CLOUDFLARE_BLOCKED — try UoG library proxy or author email"
+                elif "ended with" in last_msg:
+                    reason = "Download failed: " + last_msg.split("ended with ")[-1].strip()
+                elif last_msg:
+                    reason = last_msg[:100]
+                else:
+                    reason = "No OA version found by download.py"
+
                 missing_papers.append({
                     "journal":        journal,
-                    "doi":            record.get("doi", ""),
+                    "doi":            doi,
                     "title":          record.get("title", "No title available"),
-                    "reason_missing": "No OA version found by download.py",
+                    "reason_missing": reason,
                 })
 
     print("  " + "-" * 50)
@@ -228,6 +326,14 @@ def generate_supplement_report() -> list[dict]:
     if not missing_papers:
         print("\n[supplement] All journal quotas met. No manual supplementation needed.")
         return []
+
+    # Sort so CLOUDFLARE_BLOCKED papers appear first.
+    # These are the most actionable: the downloader found an OA URL but publisher
+    # CDN blocked it.  Institutional library proxy (UoG) or an author email will
+    # usually succeed.  Papers with other failure reasons follow.
+    missing_papers.sort(
+        key=lambda p: (0 if "CLOUDFLARE_BLOCKED" in p["reason_missing"] else 1)
+    )
 
     # --- Print human-readable supplement instructions ---
     print(

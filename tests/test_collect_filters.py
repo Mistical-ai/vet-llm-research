@@ -34,9 +34,13 @@ def test_candidate_filter_accepts_real_article() -> None:
     assert collect._candidate_rejection_reason(record) is None
 
 
-def test_collection_windows_cover_2023_to_2025() -> None:
+def test_collection_windows_match_configured_years() -> None:
     windows = collect._collection_windows()
 
-    labels = [label for label, *_ in windows]
-    assert labels == ["2023", "2024", "2025"]
     assert sum(quota for *_, quota in windows) == collect.COLLECT_CANDIDATES_PER_JOURNAL
+    if collect.COLLECT_YEAR_BALANCED and collect.COLLECT_YEARS:
+        labels = [label for label, *_ in windows]
+        assert labels == [str(y) for y in sorted(collect.COLLECT_YEARS)]
+    else:
+        assert len(windows) == 1
+        assert windows[0][0] == "all"
