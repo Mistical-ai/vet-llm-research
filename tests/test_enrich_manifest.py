@@ -11,6 +11,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 import enrich_manifest_from_pdfs as enrich  # noqa: E402
 from auto_ingest_workflow import _retry_failed_pdfs  # noqa: E402
+from ingest_manual_pdfs import _doi_from_filename, _gather_dois_from_pdf  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -253,15 +254,24 @@ def test_retry_failed_pdfs_missing_dir(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def test_doi_from_filename_valid() -> None:
-    pdf = Path("10.1177_1098612X231170159.pdf")
-    doi = enrich._doi_from_filename(pdf)
+    doi = _doi_from_filename(Path("10.1177_1098612X231170159.pdf"))
     assert doi == "10.1177/1098612x231170159"
 
 
 def test_doi_from_filename_invalid() -> None:
-    pdf = Path("some_random_paper.pdf")
-    doi = enrich._doi_from_filename(pdf)
+    doi = _doi_from_filename(Path("some_random_paper.pdf"))
     assert doi is None
+
+
+def test_gather_dois_prefers_filename_when_pdf_unreadable(tmp_path: Path) -> None:
+    pdf = tmp_path / "10.1177_1098612X231170159.pdf"
+    pdf.write_bytes(b"not a real pdf")
+
+    dois, title, trace = _gather_dois_from_pdf(pdf)
+
+    assert dois == ["10.1177/1098612x231170159"]
+    assert title is None
+    assert "filename" in trace
 
 
 def test_get_best_doi_falls_back_to_filename(tmp_path: Path) -> None:
@@ -275,15 +285,81 @@ def test_get_best_doi_falls_back_to_filename(tmp_path: Path) -> None:
     assert source == "filename"
 
 
-def test_get_best_doi_falls_back_to_page1(tmp_path: Path) -> None:
+def test_get_best_doi_falls_back_to_frequency_scan_multi_page(tmp_path: Path) -> None:
+    """DOI appearing on multiple pages (header/footer) is returned with freq label."""
     pdf = tmp_path / "no_doi_in_name.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
 
     with (
         patch.object(enrich, "_get_pdf_metadata_doi", return_value=None),
-        patch.object(enrich, "_get_page1_doi", return_value="10.1111/page1.doi"),
+        patch.object(
+            enrich,
+            "_get_page_dois_with_frequency",
+            return_value=[("10.1111/paper.doi", 4), ("10.9999/ref.doi", 1)],
+        ),
     ):
         doi, source = enrich._get_best_doi_for_enrichment(pdf)
 
-    assert doi == "10.1111/page1.doi"
-    assert source == "page-1"
+    assert doi == "10.1111/paper.doi"
+    assert "pages-freq" in source
+
+
+def test_get_best_doi_falls_back_to_frequency_scan_single_page(tmp_path: Path) -> None:
+    """Single-occurrence DOI is still returned but labelled page-text."""
+    pdf = tmp_path / "no_doi_in_name.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    with (
+        patch.object(enrich, "_get_pdf_metadata_doi", return_value=None),
+        patch.object(
+            enrich,
+            "_get_page_dois_with_frequency",
+            return_value=[("10.1111/single.doi", 1)],
+        ),
+    ):
+        doi, source = enrich._get_best_doi_for_enrichment(pdf)
+
+    assert doi == "10.1111/single.doi"
+    assert source == "page-text"
+
+
+def test_get_best_doi_no_doi_found(tmp_path: Path) -> None:
+    """Returns (None, 'none') when all sources come up empty."""
+    pdf = tmp_path / "no_doi_in_name.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    with (
+        patch.object(enrich, "_get_pdf_metadata_doi", return_value=None),
+        patch.object(enrich, "_get_page_dois_with_frequency", return_value=[]),
+    ):
+        doi, source = enrich._get_best_doi_for_enrichment(pdf)
+
+    assert doi is None
+    assert source == "none"
+
+
+def test_get_page_dois_with_frequency_prefers_high_count(tmp_path: Path) -> None:
+    """DOI appearing on more pages sorts before single-occurrence DOIs."""
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    # Simulate: page 0 has both DOIs, pages 1-3 repeat only the paper's own DOI.
+    page_texts = [
+        "doi:10.1111/own.doi  see also doi:10.9999/ref.doi",
+        "doi:10.1111/own.doi",
+        "doi:10.1111/own.doi",
+        "doi:10.1111/own.doi",
+    ]
+
+    mock_page = MagicMock()
+    mock_pdf = MagicMock()
+    mock_pdf.__enter__ = MagicMock(return_value=mock_pdf)
+    mock_pdf.__exit__ = MagicMock(return_value=False)
+    mock_pdf.pages = [MagicMock(extract_text=MagicMock(return_value=t)) for t in page_texts]
+
+    with patch("pdfplumber.open", return_value=mock_pdf):
+        result = enrich._get_page_dois_with_frequency(pdf, max_pages=4)
+
+    dois = [d for d, _ in result]
+    assert dois[0] == "10.1111/own.doi", "high-frequency DOI should rank first"
+    assert "10.9999/ref.doi" in dois

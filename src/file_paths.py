@@ -33,12 +33,24 @@ def sanitize_filename_part(value: object, *, max_length: int = 80) -> str:
     return text[:max_length].strip("_") or "untitled"
 
 
+def doi_to_slug(doi: str) -> str:
+    """
+    Convert a DOI into a filesystem- and batch-API-safe slug.
+
+    Used by Phase 3 to build cache filenames (data/processed/{slug}.jsonl) and
+    batch API `custom_id` values that join requests to responses. Keeping this
+    in one place means summariser/evaluator/CLI cannot disagree on the format.
+
+    Example: "10.1111/jvim.16872" -> "10_1111_jvim_16872"
+    """
+    return doi.replace("/", "_").replace(":", "_").replace(".", "_").strip("_")
+
+
 def legacy_doi_filename(doi: str) -> str:
     """
     Return the original DOI-only filename used by earlier pipeline versions.
     """
-    safe = doi.replace("/", "_").replace(":", "_").replace(".", "_")
-    return f"{safe}.pdf"
+    return f"{doi_to_slug(doi)}.pdf"
 
 
 def _record_value(record_or_doi: Mapping[str, object] | str, key: str) -> str:

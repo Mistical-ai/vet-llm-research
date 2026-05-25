@@ -148,22 +148,34 @@ def _stage_incoming_pdfs(incoming_root: Path, inbox_root: Path) -> list[str]:
 
 
 def _clean_manual_inbox(*, archive_day_folder: Path) -> None:
-    """Remove skipped duplicates + relocate failures into dated archive buckets."""
+    """Archive skipped duplicates and failed PDFs into dated folders.
 
-    # --- skipped_existing_in_raw: delete loose duplicate inbox artifacts --------
-    if SKIPPED_DIR.exists():
-        removed = 0
-        for path in sorted(SKIPPED_DIR.iterdir()):
-            if path.is_file():
-                path.unlink()
-                removed += 1
-                log_line(f"clean: deleted skipped_existing/{path.name}")
-        if removed == 0:
-            log_line("clean: skipped_existing_in_raw already empty.")
-
-    # --- failed/: archive PDF evidence -------------------------------------------
+    Why archive instead of delete for skipped_existing_in_raw/?
+    When DOI matching incorrectly identifies a new paper as a duplicate of one
+    already ingested this same run, the file lands in skipped_existing_in_raw/.
+    Deleting it would destroy a paper the researcher never recovered.  Archiving
+    keeps it recoverable at archive_failed/<date>/skipped/ indefinitely.
+    """
     archive_day_folder.mkdir(parents=True, exist_ok=True)
 
+    # --- skipped_existing_in_raw: archive (not delete) ---------------------------
+    if SKIPPED_DIR.exists():
+        skipped_archive = archive_day_folder / "skipped"
+        archived_skipped = 0
+        for path in sorted(SKIPPED_DIR.iterdir()):
+            if path.is_file():
+                skipped_archive.mkdir(parents=True, exist_ok=True)
+                target = _unique_path(skipped_archive, path.name)
+                shutil.move(str(path), str(target))
+                archived_skipped += 1
+                rel_arc = target.relative_to(REPO_ROOT)
+                log_line(f"clean: archived skipped/{path.name} → {rel_arc}")
+        if archived_skipped == 0:
+            log_line("clean: skipped_existing_in_raw already empty.")
+    else:
+        log_line("clean: skipped_existing_in_raw absent — nothing to archive.")
+
+    # --- failed/: archive PDF evidence -------------------------------------------
     if not FAILED_DIR.exists():
         log_line("clean: failed/ absent — nothing to archive.")
         FAILED_DIR.mkdir(parents=True, exist_ok=True)

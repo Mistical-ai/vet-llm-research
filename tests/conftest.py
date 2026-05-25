@@ -1,0 +1,37 @@
+"""
+tests/conftest.py — Shared test setup
+======================================
+
+Adds `src/` and the hyphenated `llm-sum/` Phase 3 folder to sys.path so all
+tests can import flat-module style:
+
+    from utils import log_error           # src/utils.py
+    from file_paths import doi_to_slug    # src/file_paths.py
+    from summarizer import generate_summary  # llm-sum/summarizer.py
+    from evaluator import parse_judge_response  # llm-sum/evaluator.py
+
+Forces DRY_RUN=true and a permissive BUDGET_HARD_STOP so accidental real
+API calls in test code would still abort safely, and so BudgetGuard does
+not exit during deterministic-cost mock tests.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Force these for tests, overriding anything in the shell environment OR the
+# project .env. Without `os.environ[...] = ...`, an explicit DRY_RUN=false in
+# the user's local .env would leak into test runs and trigger real API code
+# paths.
+os.environ["DRY_RUN"] = "true"
+os.environ["BUDGET_HARD_STOP"] = "1000.00"
+
+for path in (_REPO_ROOT / "src", _REPO_ROOT / "llm-sum"):
+    sp = str(path)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)

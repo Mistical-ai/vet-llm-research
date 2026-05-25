@@ -9,3 +9,9 @@ tqdm
 pytest
 beautifulsoup4
 fulltext-article-downloader
+
+# Phase 3: LLM Summarisation & Evaluation
+openai>=1.50.0
+anthropic>=0.40.0
+google-generativeai>=0.8.0
+tiktoken>=0.7.0

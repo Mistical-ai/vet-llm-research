@@ -78,9 +78,14 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Maximum characters to pass to the LLM.  12k chars ≈ 4k tokens — fits all
-# target models without truncation on the model side.
+# Kept for backwards-compatibility — imported by older code and tests.
+# prepare_texts.py no longer truncates at extraction time; this value is now
+# only used if a caller explicitly passes it to truncate_to_limit().
 MAX_CHARS = 12_000
+
+# When True, strip the references section before caching. Set to false for
+# debugging if you suspect the pattern is matching too early.
+REMOVE_REFERENCES: bool = os.getenv("REMOVE_REFERENCES", "true").lower() == "true"
 
 # Path to the dry-run fixture.  In dry-run mode we return the cleaned text
 # from this file instead of reading a real PDF.
@@ -109,21 +114,70 @@ MANIFEST_PATH = Path("data") / "manifest.jsonl"
 # Flags: re.IGNORECASE so "REFERENCES" and "references" both match.
 #        re.MULTILINE so ^ and $ match line boundaries (not just string ends).
 REFERENCES_PATTERN = re.compile(
-    r"\n\s*(?:references?|bibliography|works\s+cited|literature\s+cited)\s*(?:\n|$)",
+    r"\n\s*(?:references?|reference\s+list|cited\s+references?|bibliography|works\s+cited|literature\s+cited)\s*(?:\n|$)",
     re.IGNORECASE | re.MULTILINE,
 )
+
+# Fallback for two-column PDFs where pdfplumber merges "REFERENCES" onto the
+# same line as adjacent column text (e.g. ORCID block + "REFERENCES" + citation
+# header all on one line). Fires only when the next line looks like a numbered
+# citation (1. Author or [1] Author) to avoid false positives.
+REFERENCES_INLINE_RE = re.compile(
+    r"\n[^\n]{0,200}\bREFERENCES?\b[^\n]*\n(?=\s*(?:\d+[\.\):]|\[\d+\]))",
+    re.IGNORECASE,
+)
+
+# Wiley Online Library embeds a per-page download watermark in extracted text.
+# pdfplumber picks it up at every page boundary. Each instance has the form:
+#   {ISSN}\n{YEAR}\n{ISSUE/VOL}\nDownloaded\nfrom\nhttps://onlinelibrary.wiley.com/...
+#   ...\nCreative\nCommons\n[Attribution ]License
+# The (?:\d[\d,]*\n){0,5} prefix captures the ISSN/year/issue lines before
+# "Downloaded" so they are removed together with the rest of the block.
+# {0,3000} prevents over-matching while covering messy multi-column layouts.
+WILEY_WATERMARK_RE = re.compile(
+    r"(?:\d[\d,]*\n){0,5}Downloaded[\s\S]{0,3000}?Creative\s+Commons\s+(?:Attribution[- ])?License",
+    re.IGNORECASE,
+)
+
+
+def clean_publisher_noise(text: str) -> str:
+    """
+    Remove publisher-injected watermarks from PDF-extracted text.
+
+    Currently handles Wiley Online Library download footers, which pdfplumber
+    picks up at every page boundary in two-column journals (JVIM, VRU). In some
+    papers these watermarks account for >60% of the extracted character count,
+    making papers appear far shorter than they are.
+
+    Must be called BEFORE remove_references_section() because watermarks can
+    appear after the reference list on the final page — stripping references
+    first would leave a trailing watermark block.
+    """
+    cleaned = WILEY_WATERMARK_RE.sub("", text)
+    # Collapse any runs of 3+ blank lines created by watermark removal.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    removed = len(text) - len(cleaned)
+    if removed > 0:
+        print(f"  [extract] Removed publisher watermark(s) ({removed:,} chars stripped).")
+    return cleaned
 
 
 def remove_references_section(text: str) -> str:
     """
-    Find the first occurrence of a reference/bibliography heading and
-    return only the text that precedes it.
+    Find the LAST occurrence of a reference/bibliography heading and return
+    only the text that precedes it.
 
-    WHY 'FIRST OCCURRENCE'?
-        In rare papers, "References" appears as a word mid-paragraph
-        (e.g. "the study references previous work...").  Using the regex
-        means we only cut at a heading-style occurrence (preceded by a
-        newline), which avoids false positives.
+    WHY LAST OCCURRENCE?
+        Scientific papers sometimes mention "References" early — in a Methods
+        section ("see References 3-5"), in a Table of Contents, or in a heading
+        like "Cross-References". The ACTUAL bibliography section is always the
+        final major section of a research article. Taking the last match is
+        therefore far more robust than taking the first, which would discard
+        everything from Methods/Results onward if an early match fires.
+
+    The strict pattern requires the heading on its own line. The inline fallback
+    (REFERENCES_INLINE_RE) catches two-column PDFs where pdfplumber merges the
+    heading with adjacent column content onto the same line.
 
     Parameters
     ----------
@@ -131,11 +185,16 @@ def remove_references_section(text: str) -> str:
 
     Returns
     -------
-    str — The text with everything from the References heading onward removed.
+    str — The text with everything from the last References heading onward removed.
     """
-    match = REFERENCES_PATTERN.search(text)
-    if match:
-        # Keep only everything before the matched heading.
+    matches = list(REFERENCES_PATTERN.finditer(text))
+    if not matches:
+        # Fallback: two-column layout may have merged "REFERENCES" mid-line.
+        matches = list(REFERENCES_INLINE_RE.finditer(text))
+
+    if matches:
+        # Use the LAST match — the bibliography is always the final section.
+        match = matches[-1]
         cleaned = text[: match.start()].rstrip()
         chars_removed = len(text) - len(cleaned)
         print(f"  [extract] Removed references section ({chars_removed:,} chars stripped).")
@@ -294,13 +353,18 @@ def _extract_dry_run(doi: str) -> str | None:
     """
     Dry-run path: read the golden fixture and apply the cleaning pipeline.
 
-    WHY APPLY REAL CLEANING IN DRY-RUN?
-        The whole point of a dry-run is to exercise the code paths.  If we
-        returned a pre-cleaned string from the fixture, we'd never catch bugs
-        in remove_references_section() or truncate_to_limit().  Instead, the
-        fixture stores a *raw* snippet (with a References section) and we clean
-        it the same way we would a real PDF.
+    Only returns text for DOIs that have an actual PDF in data/raw/.
+    Without this check, every manifest record (thousands of them) would
+    get a .txt file written — one fixture-text copy per DOI — even for
+    papers that were never downloaded.
     """
+    # Require an existing PDF even in dry-run mode so prepare_texts.py does
+    # not create fake cache files for papers we haven't downloaded yet.
+    record = _manifest_record_for_doi(doi)
+    pdf_path = preferred_pdf_path(RAW_DIR, record)
+    if not pdf_path.exists():
+        return None
+
     if not FIXTURE_PATH.exists():
         print(f"[extract] Fixture not found at {FIXTURE_PATH}. "
               "Run src/utils/generate_mock.py first.")
@@ -316,18 +380,22 @@ def _extract_dry_run(doi: str) -> str | None:
 
     print(f"[extract] DRY_RUN — using fixture text ({len(raw_text):,} chars).")
 
-    # Apply the SAME cleaning pipeline as a live PDF run.
-    text_no_refs  = remove_references_section(raw_text)
-    text_final    = truncate_to_limit(text_no_refs)
-    return text_final
+    text_no_refs = remove_references_section(raw_text) if REMOVE_REFERENCES else raw_text
+    # No truncation here — the cache should hold the full cleaned text.
+    # Summarizer applies MAX_INPUT_CHARS when building the LLM prompt.
+    return text_no_refs
 
 
 def _extract_live(doi: str) -> str | None:
     """
-    Live path: find PDF in data/raw/, extract, clean, truncate.
+    Live path: find PDF in data/raw/, extract, clean.
 
     The PDF path is resolved from manifest metadata when available so both new
     descriptive filenames and legacy DOI-only filenames work.
+
+    No truncation is applied here. The full cleaned text is returned so that
+    prepare_texts.py can cache it completely. The summariser applies its own
+    MAX_INPUT_CHARS limit when building the LLM prompt.
     """
     record = _manifest_record_for_doi(doi)
     pdf_path = preferred_pdf_path(RAW_DIR, record)
@@ -340,14 +408,8 @@ def _extract_live(doi: str) -> str | None:
     if raw_text is None:
         return None  # Error already logged inside extract_text_from_pdf.
 
-    # STEP 2: Remove references BEFORE truncation.
-    # This is the critical ordering discussed in the module docstring.
-    text_no_refs = remove_references_section(raw_text)
-
-    # STEP 3: Truncate AFTER references are gone.
-    text_final = truncate_to_limit(text_no_refs)
-
-    return text_final
+    text_no_refs = remove_references_section(raw_text) if REMOVE_REFERENCES else raw_text
+    return text_no_refs
 
 
 # ---------------------------------------------------------------------------

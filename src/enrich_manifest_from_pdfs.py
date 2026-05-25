@@ -7,9 +7,9 @@ Design choices explained (deeper detail in README § Design Decisions):
 - Why query CrossRef per PDF instead of re-running collect.py? Bulk collect walks
   ISSN/date windows; a manually downloaded paper may never appear in that slice.
   One /works/{doi} call is precise and cheap for a handful of files.
-- Why metadata DOI only (not page text)? Reference lists on pages 1–5 contain other
-  papers' DOIs; metadata almost always identifies the file itself. ingest_manual_pdfs
-  still scans page text when matching — see its module docstring.
+- Why metadata, then filename, then page 1? Reference lists pollute multi-page scans;
+  filename DOIs (``10.1177_1098612X….pdf``) are trusted when metadata is empty.
+  ingest_manual_pdfs uses the same filename helper and may also scan pages 1–5.
 - Why append-only? Never overwrite manifest lines — preserves collect.py history and
   any manual annotations on existing rows.
 - Why non-fatal in auto_ingest_workflow? Ingest can still succeed for PDFs already
@@ -50,9 +50,9 @@ if str(_SRC_DIR) not in sys.path:
 
 from ingest_manual_pdfs import (  # noqa: E402
     _collect_dois_from_plaintext,
+    _doi_from_filename,
     _load_manifest_indexes,
     _metadata_blob,
-    _normalize_match_doi,
 )
 from collect import _parse_crossref_item  # noqa: E402
 from utils import log_error  # noqa: E402
@@ -82,50 +82,51 @@ def _get_pdf_metadata_doi(pdf_path: Path) -> str | None:
         return None
 
 
-def _doi_from_filename(pdf_path: Path) -> str | None:
-    """Parse a DOI from the filename, e.g. 10.1177_1098612X231170159.pdf → 10.1177/1098612X231170159.
-
-    Many academic download tools save PDFs with a DOI-based filename where the
-    single '/' in the DOI is replaced by '_'. This is safe for enrichment
-    because the filename was chosen by the user/tool to represent that paper.
+def _get_page_dois_with_frequency(
+    pdf_path: Path, max_pages: int = 5
+) -> list[tuple[str, int]]:
     """
-    import re
-    stem = pdf_path.stem
-    match = re.match(r'^(10\.\d{4,9})_(.+)$', stem)
-    if match:
-        candidate = f"{match.group(1)}/{match.group(2)}"
-        return _normalize_match_doi(candidate)
-    return None
+    Scan pages 0..(max_pages-1) and return [(doi, page_count)] sorted by page_count desc.
 
+    page_count = number of distinct pages on which the DOI appears.  A paper's
+    own DOI is printed in the header or footer of every page (high count), while
+    DOIs from the reference list appear on at most one page (count = 1).
 
-def _get_page1_doi(pdf_path: Path) -> str | None:
-    """Extract the first DOI from page 1 text only.
-
-    Page 1 is almost always the title/abstract page and typically shows the
-    paper's own DOI in a header or footer. Using only page 1 (not pages 1-5)
-    avoids the reference list which appears on later pages.
+    Ties at the same frequency are broken by first-appearance order (earlier page
+    wins), which matches the document-order preference used in ingest_manual_pdfs.
     """
     import pdfplumber
 
+    page_counts: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            if not pdf.pages:
-                return None
-            text = pdf.pages[0].extract_text() or ""
-            hits = _collect_dois_from_plaintext(text)
-            return hits[0] if hits else None
+            for idx in range(min(max_pages, len(pdf.pages))):
+                text = pdf.pages[idx].extract_text() or ""
+                for doi in _collect_dois_from_plaintext(text):
+                    page_counts[doi] = page_counts.get(doi, 0) + 1
+                    if doi not in first_seen:
+                        first_seen[doi] = idx
     except Exception as exc:  # noqa: BLE001
-        log_error(str(pdf_path.name), "enrich_manifest", f"pdfplumber page-1 read failed: {exc}")
-        return None
+        log_error(
+            str(pdf_path.name),
+            "enrich_manifest",
+            f"pdfplumber page-frequency scan failed: {exc}",
+        )
+    return sorted(
+        page_counts.items(),
+        key=lambda x: (-x[1], first_seen.get(x[0], 999)),
+    )
 
 
 def _get_best_doi_for_enrichment(pdf_path: Path) -> tuple[str | None, str]:
-    """Try three DOI sources in order and return (doi, source_label).
+    """Try DOI sources in order of reliability and return (doi, source_label).
 
-    Sources tried in order of reliability:
     1. PDF embedded metadata dict (safest — identifies the file itself when present)
     2. Filename-based DOI (safe — user/tool named the file after the DOI)
-    3. Page 1 text (reasonably safe — page 1 is title/abstract, not references)
+    3. Page-frequency scan across pages 1–5: the paper's own DOI appears in every
+       page header/footer (high count); cited DOIs appear only once.  The most
+       frequent DOI wins; ties are broken by earliest page of appearance.
     """
     doi = _get_pdf_metadata_doi(pdf_path)
     if doi:
@@ -133,10 +134,14 @@ def _get_best_doi_for_enrichment(pdf_path: Path) -> tuple[str | None, str]:
     doi = _doi_from_filename(pdf_path)
     if doi:
         return doi, "filename"
-    doi = _get_page1_doi(pdf_path)
-    if doi:
-        return doi, "page-1"
-    return None, "none"
+
+    by_freq = _get_page_dois_with_frequency(pdf_path, max_pages=5)
+    if not by_freq:
+        return None, "none"
+
+    best_doi, best_count = by_freq[0]
+    source = f"pages-freq{best_count}" if best_count >= 2 else "page-text"
+    return best_doi, source
 
 
 # ---------------------------------------------------------------------------

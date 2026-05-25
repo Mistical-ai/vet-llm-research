@@ -17,8 +17,9 @@ Design choices explained (deeper detail in README § Design Decisions):
 - Why skipped_existing_in_raw/ vs failed/? Duplicates already in raw/ are success,
   not errors — they are quarantined separately so failed/ stays actionable.
 
-Alternative considered (and rejected): Guess filenames from PDF text only — too many
-collisions and no stable join key for pipeline.py.
+Filename DOI fallback: when publishers save files as ``10.1177_1098612X….pdf`` (slash
+replaced by underscore) and the PDF has no text layer, we parse the stem before
+failing — see ``_doi_from_filename``.
 
 Operator guide: README \"Guide: Manually adding papers to your corpus\".
 """
@@ -91,6 +92,21 @@ def _collect_dois_from_plaintext(blob: str) -> list[str]:
     return results
 
 
+def _doi_from_filename(pdf_path: Path) -> str | None:
+    """
+    Parse a DOI encoded in the PDF filename (e.g. ``10.1177_1098612X231170159.pdf``).
+
+    Why safe here? The researcher or download tool named the file after one paper;
+    unlike page-text scans, this is not a reference-list DOI. Shared with
+    enrich_manifest_from_pdfs.py so both steps agree on the same identifier.
+    """
+    stem = pdf_path.stem
+    registrar_match = re.match(r"^(10\.\d{4,9})_(.+)$", stem, flags=re.IGNORECASE)
+    if registrar_match:
+        return _normalize_match_doi(f"{registrar_match.group(1)}/{registrar_match.group(2)}")
+    return _normalize_match_doi(stem)
+
+
 def _normalize_pdf_title(raw: str) -> str:
     txt = html.unescape(str(raw or "")).strip()
     txt = re.sub(r"<[^>]+>", " ", txt)
@@ -106,13 +122,19 @@ def _metadata_blob(meta: dict[str, Any] | None) -> str:
 
 def _gather_dois_from_pdf(pdf_path: Path) -> tuple[list[str], str | None, str]:
     """
-    Collect DOI candidates from PDF metadata and the first five pages.
+    Collect DOI candidates ordered by reliability: metadata → filename →
+    multi-page DOIs → single-page DOIs.
 
-    Why scan page text here (unlike enrich_manifest_from_pdfs)? Ingest must find
-    a manifest row even when enrichment failed; page text helps match DOIs in the
-    article body, while enrich uses metadata-only to avoid adding reference DOIs.
+    The paper's own DOI is printed in the header or footer of every page (high
+    page-frequency), while DOIs from the reference list appear on one page only.
+    Sorting by frequency before falling back to document order means the paper's
+    own DOI is tried first, preventing accidental matching against a cited paper
+    whose DOI coincidentally appears earlier in the text.
     """
     import pdfplumber  # Lazy import — see README \"Why pdfplumber?\"
+
+    filename_hit = _doi_from_filename(pdf_path)
+    filename_hits = [filename_hit] if filename_hit else []
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -124,19 +146,49 @@ def _gather_dois_from_pdf(pdf_path: Path) -> tuple[list[str], str | None, str]:
             )
             meta_hits = _collect_dois_from_plaintext(meta_blob)
 
-            chunks = [meta_blob]
+            # Scan each page individually so we can rank DOIs by how many pages
+            # they appear on.  Ties are broken by first-appearance order.
             scan_pages = min(5, len(pdf.pages))
+            page_doi_counts: dict[str, int] = {}
+            doi_first_seen: dict[str, int] = {}
+            page_dois: list[list[str]] = []
             for idx in range(scan_pages):
-                chunks.append(pdf.pages[idx].extract_text() or "")
-            corpus = "\n".join(chunks)
-            corpus_hits = _collect_dois_from_plaintext(corpus)
+                text = pdf.pages[idx].extract_text() or ""
+                hits = _collect_dois_from_plaintext(text)
+                page_dois.append(hits)
+                for doi in hits:
+                    page_doi_counts[doi] = page_doi_counts.get(doi, 0) + 1
+                    if doi not in doi_first_seen:
+                        doi_first_seen[doi] = idx
 
-            ordered = list(dict.fromkeys(meta_hits + corpus_hits))
+            # High-frequency DOIs (appear on 2+ pages) = paper's own header/footer DOI.
+            multi_page = [
+                doi
+                for doi, cnt in sorted(
+                    page_doi_counts.items(),
+                    key=lambda x: (-x[1], doi_first_seen.get(x[0], 999)),
+                )
+                if cnt >= 2
+            ]
+
+            # Single-page DOIs in document order (page 1 first, preserving position).
+            seen: set[str] = set(multi_page)
+            single_page: list[str] = []
+            for page_doi_list in page_dois:
+                for doi in page_doi_list:
+                    if doi not in seen and page_doi_counts[doi] == 1:
+                        single_page.append(doi)
+                        seen.add(doi)
+
+            ordered = list(dict.fromkeys(meta_hits + filename_hits + multi_page + single_page))
             hint = embedded_title or (ordered[0] if ordered else "unknown")
             trace = f"[pdf]={pdf_path.name} hint={hint!r}"
             return ordered, embedded_title, trace
 
     except Exception as exc:  # noqa: BLE001
+        if filename_hits:
+            trace = f"[pdf]={pdf_path.name} hint={filename_hits[0]!r} (filename; pdfplumber error={exc!r})"
+            return filename_hits, None, trace
         log_error(
             str(pdf_path.name),
             "manual_ingest",

@@ -1,0 +1,17 @@
+You are a specialist veterinary researcher. Summarize the following peer-reviewed article for a clinical audience.
+
+Focus on these four sections, in order:
+1. Objective — the research question or hypothesis being tested.
+2. Key Methods — study design, species, sample size, primary intervention or measurement.
+3. Primary Results — the most important quantitative and qualitative findings.
+4. Clinical Significance — how a practising clinician should apply or interpret these results.
+
+Rules:
+- Output must be under 400 words.
+- Use plain prose. No bullet points unless the source itself uses one.
+- Do not introduce facts, statistics, or interpretations that are not present or directly implied in the article text.
+- If a section's information is not present in the source, write "Not reported" for that section rather than inferring.
+- Do not preface or end with conversational text. Begin with the Objective section.
+
+Article text:
+{ARTICLE_TEXT}
