@@ -5,7 +5,13 @@ llm-sum/prepare_texts.py — Cache cleaned paper text for the summariser
 Walks data/raw/*.pdf directly (one file = one paper), extracts the FULL
 cleaned text (references stripped, nothing else truncated), and caches to:
 
-    data/processed/{slug}.jsonl   — one JSON line: doi, slug, text, metadata
+    data/processed/<descriptive_stem>.jsonl
+
+The cache filename mirrors the PDF stem exactly so a PDF and its cleaned-
+text cache always share a name. The ``slug`` field inside the JSON line is
+still ``doi_to_slug(doi)`` — that is the stable key used by summariser
+custom_id, cost_estimator, and check_batch_status; only the on-disk
+filename gained the descriptive prefix.
 
 Why walk PDFs directly instead of the manifest?
     The manifest may have multiple records per DOI, duplicate entries, or
@@ -42,7 +48,11 @@ from extract import (  # noqa: E402
     clean_publisher_noise,
     REMOVE_REFERENCES,
 )
-from file_paths import doi_to_slug, pdf_path_candidates  # noqa: E402
+from file_paths import (  # noqa: E402
+    doi_to_slug,
+    descriptive_stem,
+    pdf_path_candidates,
+)
 from utils import log_error  # noqa: E402
 
 RAW_DIR = DATA_DIR / "raw"
@@ -52,11 +62,11 @@ MIN_WORD_COUNT_WARN = int(os.getenv("MIN_WORD_COUNT_WARN", "1000"))
 
 
 # ---------------------------------------------------------------------------
-# Processed-cache readers (shared by cost_estimator, run_phase3 status, etc.)
+# Processed-cache readers (shared by cost_estimator, summarizer, evaluator)
 # ---------------------------------------------------------------------------
 
 def read_processed_jsonl(path: Path) -> str | None:
-    """Return the `text` field from one data/processed/{slug}.jsonl cache file."""
+    """Return the `text` field from one data/processed/*.jsonl cache file."""
     if not path.exists():
         return None
     line = path.read_text(encoding="utf-8").strip()
@@ -69,15 +79,87 @@ def read_processed_jsonl(path: Path) -> str | None:
     return text if isinstance(text, str) and text.strip() else None
 
 
+def processed_jsonl_path(record_or_doi) -> Path:
+    """
+    Return the descriptive ``data/processed/*.jsonl`` path for a paper.
+
+    Prefers ``<descriptive_stem>.jsonl`` when the input is a record (or
+    mapping) containing journal + title; falls back to the legacy
+    ``<doi_to_slug(doi)>.jsonl`` when only a DOI string is available.
+    The returned path may not exist on disk — callers should check.
+    """
+    if (not isinstance(record_or_doi, str)
+            and record_or_doi.get("journal")
+            and record_or_doi.get("title")):
+        return PROCESSED_DIR / f"{descriptive_stem(record_or_doi)}.jsonl"
+
+    doi = record_or_doi if isinstance(record_or_doi, str) else str(
+        record_or_doi.get("doi", "") or ""
+    )
+    return PROCESSED_DIR / f"{doi_to_slug(doi)}.jsonl"
+
+
+def find_processed_jsonl(record_or_doi) -> Path | None:
+    """
+    Locate the cache file for a paper on disk, trying both naming schemes.
+
+    Order: descriptive name (new) → legacy ``{slug}.jsonl``. Returns None
+    if neither exists. This is the lookup that summariser/evaluator use,
+    so a partially-migrated ``data/processed/`` directory still works.
+    """
+    preferred = processed_jsonl_path(record_or_doi)
+    if preferred.exists():
+        return preferred
+
+    if not isinstance(record_or_doi, str):
+        doi = str(record_or_doi.get("doi", "") or "")
+        if doi:
+            legacy = PROCESSED_DIR / f"{doi_to_slug(doi)}.jsonl"
+            if legacy.exists() and legacy != preferred:
+                return legacy
+    return None
+
+
+def read_cached_text(record_or_doi) -> str | None:
+    """
+    Return the cleaned-text body of the cache file for a paper, or None.
+
+    Convenience wrapper around find_processed_jsonl + read_processed_jsonl
+    so callers don't need to know which filename convention is on disk.
+    """
+    path = find_processed_jsonl(record_or_doi)
+    return read_processed_jsonl(path) if path is not None else None
+
+
 def iter_processed_texts(processed_dir: Path | None = None) -> Iterable[tuple[str, str]]:
-    """Yield (slug, text) for every non-empty cached paper in data/processed/."""
+    """
+    Yield ``(slug, text)`` for every non-empty cached paper.
+
+    ``slug`` is read from the JSON line itself (the stable ``doi_to_slug``
+    value), NOT from ``path.stem`` — under descriptive naming the stem is
+    the journal/title/DOI mash, but the in-file slug stays canonical so
+    downstream cost-estimation and batch-merging keep working.
+    """
     root = processed_dir if processed_dir is not None else PROCESSED_DIR
     if not root.exists():
         return
     for path in sorted(root.glob("*.jsonl")):
-        text = read_processed_jsonl(path)
-        if text:
-            yield path.stem, text
+        if not path.exists():
+            continue
+        line = path.read_text(encoding="utf-8").strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text = obj.get("text") if isinstance(obj, dict) else None
+        slug = obj.get("slug") if isinstance(obj, dict) else None
+        if not (isinstance(text, str) and text.strip()):
+            continue
+        if not (isinstance(slug, str) and slug):
+            slug = path.stem  # last resort for malformed lines
+        yield slug, text
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +207,32 @@ def _slug_from_pdf(pdf_path: Path) -> str:
 
     Legacy:      10_1111_jvim_16872.pdf            → 10_1111_jvim_16872
     Descriptive: jvim__outcomes__10_1111_jvim_16872.pdf → 10_1111_jvim_16872
+
+    The slug is the stable join key used by summariser custom_id and the
+    batch result merger; the filename is a separate concern handled by
+    ``_output_filename`` below.
     """
     stem = pdf_path.stem
     parts = stem.split("__")
     return parts[-1] if len(parts) > 1 else stem
+
+
+def _output_filename(pdf_path: Path, doi: str, record: dict) -> str:
+    """
+    Build the ``data/processed/*.jsonl`` filename for one PDF.
+
+    Preferred (manifest record with journal + title + doi available):
+        ``<descriptive_stem(record)>.jsonl`` — mirrors the PDF stem exactly.
+    Fallback (orphan PDF, no manifest match):
+        ``<pdf_path.stem>.jsonl`` — still mirrors the PDF, just from disk.
+
+    Either way, the on-disk cache file is one rename away from its source
+    PDF, which is what makes ``scripts/verify_extraction.py`` work without
+    a separate manifest lookup.
+    """
+    if record and doi and record.get("journal") and record.get("title"):
+        return f"{descriptive_stem(record)}.jsonl"
+    return f"{pdf_path.stem}.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +257,7 @@ def prepare_one_pdf(pdf_path: Path, doi: str, record: dict) -> dict:
     Returns a result dict; never raises.
     """
     slug = doi_to_slug(doi) if doi else _slug_from_pdf(pdf_path)
-    jsonl_path = PROCESSED_DIR / f"{slug}.jsonl"
+    jsonl_path = PROCESSED_DIR / _output_filename(pdf_path, doi, record)
 
     if _jsonl_is_fresh(jsonl_path, pdf_path):
         return {"doi": doi, "slug": slug, "status": "cached"}

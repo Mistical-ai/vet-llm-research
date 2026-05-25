@@ -89,6 +89,26 @@ def descriptive_pdf_filename(record_or_doi: Mapping[str, object] | str) -> str:
     return f"{journal}__{title}__{doi_suffix}.pdf"
 
 
+def descriptive_stem(record_or_doi: Mapping[str, object] | str) -> str:
+    """
+    Return the descriptive filename without any extension.
+
+    Same logic as ``descriptive_pdf_filename`` but with the ``.pdf`` suffix
+    removed, so callers can append whatever extension they need (``.pdf``,
+    ``.jsonl``, ``.txt``). Keeping the stem-builder in one place is what
+    lets ``data/raw/<stem>.pdf`` and ``data/processed/<stem>.jsonl`` stay
+    in lockstep — a PDF and its cleaned-text cache always share a name.
+
+    Example
+    -------
+    >>> descriptive_stem({"doi": "10.1111/jvim.16872",
+    ...                   "journal": "JVIM",
+    ...                   "title": "Pre-illness dietary risk factors"})
+    'jvim__pre_illness_dietary_risk_factors__10_1111_jvim_16872'
+    """
+    return descriptive_pdf_filename(record_or_doi).removesuffix(".pdf")
+
+
 def pdf_path_candidates(
     raw_dir: Path,
     record_or_doi: Mapping[str, object] | str,

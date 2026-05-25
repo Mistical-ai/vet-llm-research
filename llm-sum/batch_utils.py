@@ -195,17 +195,14 @@ def _iter_manifest(path: Path):
                 continue
 
 
-def _read_cached_text(slug: str) -> str | None:
-    path = PROCESSED_DIR / f"{slug}.jsonl"
-    if not path.exists():
-        return None
-    line = path.read_text(encoding="utf-8").strip()
-    if not line:
-        return None
-    try:
-        return json.loads(line).get("text")
-    except (json.JSONDecodeError, AttributeError):
-        return None
+def _read_cached_text(record_or_doi) -> str | None:
+    """
+    Locate this paper's cleaned-text cache and return its body. Delegates
+    to ``prepare_texts.read_cached_text`` so descriptive and legacy filenames
+    both work.
+    """
+    from prepare_texts import read_cached_text as _shared_read
+    return _shared_read(record_or_doi)
 
 
 def run_batch_summarisation(
@@ -243,9 +240,10 @@ def run_batch_summarisation(
         if not doi:
             continue
         slug = doi_to_slug(doi)
-        article_text = _read_cached_text(slug)
+        article_text = _read_cached_text(record)
         if article_text is None:
-            log_error(doi, "summarize", f"No cached text at data/processed/{slug}.jsonl")
+            log_error(doi, "summarize",
+                      f"No cached text for {slug} (descriptive + legacy lookups failed)")
             continue
 
         slug_to_doi[slug] = doi
@@ -350,10 +348,11 @@ def run_batch_evaluation(
         if not doi:
             continue
         slug = entry.get("custom_id") or doi_to_slug(doi)
-        reference_text = _read_cached_text(slug)
+        # The summary entry carries journal+title so the descriptive lookup works.
+        reference_text = _read_cached_text(entry)
         if reference_text is None:
             log_error(doi, "batch_evaluate",
-                      f"No cached text at data/processed/{slug}.jsonl — skipping")
+                      f"No cached text for {slug} — skipping")
             continue
 
         for summariser, slot in (entry.get("models") or {}).items():
