@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 from models_config import all_providers  # noqa: E402
+from phase3_mode import resolve_mode, VALID_MODES  # noqa: E402
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
@@ -35,6 +36,9 @@ MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 # ---------------------------------------------------------------------------
 
 def cmd_extract(args: argparse.Namespace) -> int:
+    # Extract is mode-agnostic (no API calls), but we still print the
+    # banner so the user knows what the next steps will do.
+    print(resolve_mode(args.mode).banner())
     from prepare_texts import main as prepare_main
     return prepare_main(["--manifest", str(args.manifest)] +
                         (["--limit", str(args.limit)] if args.limit else []))
@@ -45,20 +49,21 @@ def cmd_extract(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_summarize(args: argparse.Namespace) -> int:
+    profile = resolve_mode(args.mode)
+    print(profile.banner())
+
     if args.estimate:
         # Import lazily so a missing tiktoken / SDK doesn't break other commands.
         import os
         from cost_estimator import run as run_estimate
-        # Estimation respects USE_BATCH_API from .env unless overridden by DEVELOPMENT_MODE.
-        from summarizer import DEVELOPMENT_MODE  # noqa
-        batched = (os.getenv("USE_BATCH_API", "false").lower() == "true"
-                   and not DEVELOPMENT_MODE)
         judges = [j.strip() for j in os.getenv("JUDGE_MODELS", "openai").split(",") if j.strip()]
-        run_estimate(batched=batched, judge_providers=judges)
+        run_estimate(batched=profile.use_batch, judge_providers=judges)
         return 0
 
     from summarizer import main as summarize_main
-    delegate = []
+    delegate = ["--mode", profile.name]
+    if args.limit is not None:
+        delegate += ["--limit", str(args.limit)]
     if args.resume:
         delegate.append("--resume")
     if args.force:
@@ -75,8 +80,13 @@ def cmd_summarize(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
+    profile = resolve_mode(args.mode)
+    print(profile.banner())
+
     from evaluator import main as evaluate_main
-    delegate = []
+    delegate = ["--mode", profile.name]
+    if args.limit is not None:
+        delegate += ["--limit", str(args.limit)]
     if args.force:
         delegate.append("--force")
     if args.no_resume:
@@ -90,7 +100,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 # status
 # ---------------------------------------------------------------------------
 
-def cmd_status(_args: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace) -> int:
+    print(resolve_mode(args.mode).banner())
     processed = list(PROCESSED_DIR.glob("*.jsonl")) if PROCESSED_DIR.exists() else []
     print(f"[phase3:status] data/processed/*.jsonl : {len(processed)} files")
 
@@ -164,24 +175,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # --mode is shared by every subcommand: any of test|single|dev|batch
+    # overrides PHASE3_MODE from .env for this invocation only.
+    def _add_mode_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--mode", choices=VALID_MODES, default=None,
+                       help="Override PHASE3_MODE for this run "
+                            "(test|single|dev|batch).")
+
     p_extract = sub.add_parser("extract", help="Build data/processed/*.jsonl cache.")
+    _add_mode_arg(p_extract)
     p_extract.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     p_extract.add_argument("--limit", type=int, default=None)
     p_extract.set_defaults(func=cmd_extract)
 
     p_sum = sub.add_parser("summarize", help="Run the three summarisers.")
+    _add_mode_arg(p_sum)
+    p_sum.add_argument("--limit", type=int, default=None,
+                       help="Override the mode's paper_limit (e.g. --limit 1).")
     p_sum.add_argument("--estimate", action="store_true",
                        help="Print projected cost (uses tiktoken on cached texts); no API calls.")
     p_sum.add_argument("--resume", action="store_true",
                        help="Skip (doi, model) pairs already at status=success.")
     p_sum.add_argument("--force", action="store_true",
-                       help="Bypass batch-mode confirmation. USE WITH CAUTION.")
+                       help="Bypass interactive confirmation. USE WITH CAUTION.")
     p_sum.add_argument("--providers", default=None,
                        help="Comma-separated subset of providers.")
     p_sum.add_argument("--manifest", type=Path, default=None)
     p_sum.set_defaults(func=cmd_summarize)
 
     p_eval = sub.add_parser("evaluate", help="Run the blind judge.")
+    _add_mode_arg(p_eval)
+    p_eval.add_argument("--limit", type=int, default=None,
+                        help="Override the mode's paper_limit.")
     p_eval.add_argument("--judges", default=None,
                         help="Comma-separated judge provider keys.")
     p_eval.add_argument("--no-resume", action="store_true",
@@ -191,6 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_status = sub.add_parser("status", help="Print per-stage counts.")
+    _add_mode_arg(p_status)
     p_status.set_defaults(func=cmd_status)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")

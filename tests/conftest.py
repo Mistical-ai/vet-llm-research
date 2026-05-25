@@ -30,6 +30,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # paths.
 os.environ["DRY_RUN"] = "true"
 os.environ["BUDGET_HARD_STOP"] = "1000.00"
+# PHASE3_MODE=test forces dry_run regardless of the DRY_RUN env var — a
+# defence-in-depth guardrail so a stray DRY_RUN=false in a child shell
+# can't promote a unit test into a paid API call.
+os.environ.setdefault("PHASE3_MODE", "test")
 
 for path in (_REPO_ROOT / "src", _REPO_ROOT / "llm-sum"):
     sp = str(path)

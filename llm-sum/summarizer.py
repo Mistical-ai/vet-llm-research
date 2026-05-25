@@ -22,9 +22,10 @@ branches on provider:
 
 DESIGN DECISIONS
 ----------------
-* `DEVELOPMENT_MODE = True` is hardcoded at module top. When True, the run
-  caps at 2 papers and forces real-time mode (no batch submissions). This is
-  the last guardrail before a full-corpus spend.
+* Run modes are controlled by ``PHASE3_MODE`` in ``.env`` (test, single,
+  dev, batch). See ``phase3_mode.py``. The summariser does not hardcode
+  any safety constants any more — the safe default is encoded in the
+  fact that ``test`` is the resolved mode when ``PHASE3_MODE`` is unset.
 
 * Model versions are recorded EXACTLY as the provider returns them
   (e.g. "gpt-5.5-0325-preview", not "gpt-5"). Providers silently update
@@ -56,14 +57,7 @@ from models_config import all_providers, compute_cost, get_model_spec  # noqa: E
 from file_paths import doi_to_slug  # noqa: E402
 from utils import BudgetGuard, log_error, sleep_for_model  # noqa: E402
 from extract import truncate_to_limit  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Hardcoded development guardrail
-# ---------------------------------------------------------------------------
-# Hardcoded, not env-driven. The whole point is that a misconfigured .env
-# cannot accidentally bypass this safety. Flip to False ONLY for production.
-DEVELOPMENT_MODE: bool = True
-DEV_MODE_PAPER_LIMIT: int = 2
+from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
@@ -82,10 +76,15 @@ MAX_INPUT_CHARS: int = int(os.getenv("MAX_INPUT_CHARS", "0"))
 def _is_dry_run() -> bool:
     """
     Read DRY_RUN at call time so tests (and the user toggling .env between
-    runs) get the current value. Reading at module-import time bakes the
-    initial state into the process and is hard to override safely.
+    runs) get the current value. ``PHASE3_MODE=test`` ALSO forces dry-run
+    via ``resolve_mode().dry_run``, so test mode never reaches a real API
+    even if ``DRY_RUN=false`` was set.
     """
-    return os.getenv("DRY_RUN", "true").lower() == "true"
+    if os.getenv("DRY_RUN", "true").lower() == "true":
+        return True
+    # PHASE3_MODE=test is the last guardrail: even with DRY_RUN=false,
+    # test mode short-circuits to mocks.
+    return resolve_mode().dry_run
 
 
 # Backwards-compatible module attribute. Tests that monkeypatch
@@ -387,18 +386,15 @@ def _write_all_summaries(path: Path, summaries_by_doi: dict[str, dict]) -> None:
 # Confirmation guard
 # ---------------------------------------------------------------------------
 
-def confirm_real_batch(use_batch: bool, force: bool) -> bool:
+def confirm_real_batch(profile: ModeProfile, force: bool) -> bool:
     """
     Final interactive guardrail. Returns True if it's safe to proceed.
 
-    Triggers ONLY when all three conditions hold:
-        USE_BATCH_API=true  AND  DEVELOPMENT_MODE=False  AND  DRY_RUN=False
-    Otherwise no confirmation needed.
-
-    `--force` bypasses the prompt for overnight/scheduled use, and writes
-    an audit line to data/logs/ so the override is traceable.
+    Triggers when the resolved profile both requires confirmation AND is
+    not already short-circuited to mocks. ``--force`` bypasses the prompt
+    for overnight/scheduled use and logs an audit line.
     """
-    if not (use_batch and (not DEVELOPMENT_MODE) and (not _is_dry_run())):
+    if profile.dry_run or not profile.requires_confirm:
         return True
 
     if force:
@@ -412,8 +408,11 @@ def confirm_real_batch(use_batch: bool, force: bool) -> bool:
         print(audit_line.strip())
         return True
 
+    label = "REAL batch jobs to paid APIs" if profile.use_batch else (
+        f"REAL real-time API calls (limit={profile.paper_limit or 'no limit'})"
+    )
     reply = input(
-        "\n[phase3:safety] About to submit REAL batch jobs to paid APIs.\n"
+        f"\n[phase3:safety] About to submit {label}.\n"
         "Type 'yes' to confirm: "
     ).strip().lower()
     if reply != "yes":
@@ -438,17 +437,18 @@ def _iter_manifest(path: Path):
                 continue
 
 
-def _read_cached_text(slug: str) -> str | None:
-    path = PROCESSED_DIR / f"{slug}.jsonl"
-    if not path.exists():
-        return None
-    line = path.read_text(encoding="utf-8").strip()
-    if not line:
-        return None
-    try:
-        return json.loads(line).get("text")
-    except (json.JSONDecodeError, AttributeError):
-        return None
+def _read_cached_text(record_or_doi) -> str | None:
+    """
+    Locate this paper's cleaned-text cache and return its body.
+
+    Delegates to ``prepare_texts.read_cached_text`` so both descriptive
+    (``jvim__title__10_1111_jvim_16872.jsonl``) and legacy (``10_1111_jvim_16872.jsonl``)
+    cache filenames work — the summariser doesn't care which the prepare
+    step used. Accepts a full manifest record (preferred, enables descriptive
+    lookup) or a bare DOI string (legacy fallback only).
+    """
+    from prepare_texts import read_cached_text as _shared_read
+    return _shared_read(record_or_doi)
 
 
 def run_realtime(
@@ -480,10 +480,15 @@ def run_realtime(
             continue
 
         slug = doi_to_slug(doi)
-        article_text = _read_cached_text(slug)
+        # Pass the full manifest record so we can find the descriptive-named
+        # cache file. Falls back to legacy {slug}.jsonl if a record is
+        # missing journal/title or the migration hasn't happened yet.
+        article_text = _read_cached_text(record)
         if article_text is None:
             counts["no_text"] += 1
-            log_error(doi, "summarize", f"No cached text at data/processed/{slug}.jsonl")
+            log_error(doi, "summarize",
+                      f"No cached text for {slug} (looked for descriptive "
+                      f"name + legacy {slug}.jsonl)")
             continue
 
         entry = summaries_by_doi.get(doi) or _new_summary_entry(record)
@@ -531,10 +536,14 @@ def run_realtime(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase 3 — multi-model summariser.")
+    parser.add_argument("--mode", choices=VALID_MODES, default=None,
+                        help="Override PHASE3_MODE from .env: test|single|dev|batch.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Override the mode's default paper_limit (e.g. --limit 3).")
     parser.add_argument("--resume", action="store_true",
                         help="Skip (doi, model) pairs already at status=success.")
     parser.add_argument("--force", action="store_true",
-                        help="Bypass the interactive batch confirmation. USE WITH CAUTION.")
+                        help="Bypass the interactive confirmation. USE WITH CAUTION.")
     parser.add_argument("--providers", default=",".join(all_providers()),
                         help="Comma-separated provider keys (subset of openai,anthropic,gemini).")
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
@@ -542,20 +551,17 @@ def main(argv: list[str] | None = None) -> int:
 
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
 
-    use_batch_env = os.getenv("USE_BATCH_API", "false").lower() == "true"
-    effective_batch = use_batch_env and not DEVELOPMENT_MODE
+    profile = resolve_mode(args.mode)
+    paper_limit = args.limit if args.limit is not None else profile.paper_limit
 
-    if DEVELOPMENT_MODE:
-        print(f"[phase3:summarize] DEVELOPMENT_MODE active — capping at "
-              f"{DEV_MODE_PAPER_LIMIT} papers, forcing real-time.")
-        paper_limit = DEV_MODE_PAPER_LIMIT
-    else:
-        paper_limit = None
+    print(profile.banner())
+    if args.limit is not None:
+        print(f"[phase3:summarize] --limit {args.limit} overrides mode default.")
 
-    if not confirm_real_batch(use_batch=effective_batch, force=args.force):
+    if not confirm_real_batch(profile, force=args.force):
         return 1
 
-    if effective_batch:
+    if profile.use_batch:
         # Lazy import so unit tests don't need the batch dependencies loaded.
         from batch_utils import run_batch_summarisation
         run_batch_summarisation(

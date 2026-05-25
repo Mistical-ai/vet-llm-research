@@ -29,11 +29,14 @@ cleanly. When the model still slips in conversational text, a regex
 fallback extracts each field by name. If even regex fails, quality_score
 is set to 99 — the sentinel flag for manual review in Phase 5.
 
-DEVELOPMENT_MODE CAPS PAPERS
+PHASE3_MODE CONTROLS THE RUN
 -----------------------------
-Like the summariser, this module hardcodes DEVELOPMENT_MODE = True. When
-active, the evaluator only processes the same 2 DOIs the summariser
-caps to, so a dev run is end-to-end self-consistent.
+Like the summariser, this module reads ``PHASE3_MODE`` from .env and
+respects ``--mode`` / ``--limit`` on the CLI. Test mode short-circuits
+to mocks; single/dev caps the paper count; batch is informational here
+(the evaluator does not submit a separate batch job — judge requests
+are submitted by ``batch_utils`` alongside the summariser pass, and
+results are collected by ``check_batch_status.py``).
 """
 
 from __future__ import annotations
@@ -53,10 +56,7 @@ from typing import Any
 from models_config import compute_cost, get_model_spec  # noqa: E402
 from file_paths import doi_to_slug  # noqa: E402
 from utils import BudgetGuard, log_error, sleep_for_model  # noqa: E402
-
-# Hardcoded development guardrail — see summarizer.py for the rationale.
-DEVELOPMENT_MODE: bool = True
-DEV_MODE_PAPER_LIMIT: int = 2
+from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
@@ -71,8 +71,15 @@ JUDGE_MODELS = [
 
 
 def _is_dry_run() -> bool:
-    """Read DRY_RUN at call time so tests can flip it without re-importing."""
-    return os.getenv("DRY_RUN", "true").lower() == "true"
+    """
+    Read DRY_RUN at call time so tests (and the user toggling .env between
+    runs) get the current value. ``PHASE3_MODE=test`` ALSO forces dry-run
+    via ``resolve_mode().dry_run`` — the same last-guardrail rule as the
+    summariser.
+    """
+    if os.getenv("DRY_RUN", "true").lower() == "true":
+        return True
+    return resolve_mode().dry_run
 
 
 DRY_RUN = _is_dry_run()
@@ -411,17 +418,17 @@ def _iter_summaries(path: Path | None = None):
                 continue
 
 
-def _read_cached_text(slug: str) -> str | None:
-    path = PROCESSED_DIR / f"{slug}.jsonl"
-    if not path.exists():
-        return None
-    line = path.read_text(encoding="utf-8").strip()
-    if not line:
-        return None
-    try:
-        return json.loads(line).get("text")
-    except (json.JSONDecodeError, AttributeError):
-        return None
+def _read_cached_text(record_or_doi) -> str | None:
+    """
+    Locate this paper's cleaned-text cache and return its body.
+
+    ``record_or_doi`` is normally a row from ``data/summaries.jsonl`` —
+    those rows carry ``journal`` and ``title``, so the descriptive
+    filename lookup succeeds. Falls back to the legacy
+    ``{doi_to_slug(doi)}.jsonl`` name automatically.
+    """
+    from prepare_texts import read_cached_text as _shared_read
+    return _shared_read(record_or_doi)
 
 
 def already_evaluated(doi: str, summariser: str, judge: str) -> bool:
@@ -444,9 +451,12 @@ def already_evaluated(doi: str, summariser: str, judge: str) -> bool:
     return False
 
 
-def confirm_real_judge(force: bool) -> bool:
-    """Mirror summarizer's confirmation: only triggers in true-production mode."""
-    if _is_dry_run() or DEVELOPMENT_MODE:
+def confirm_real_judge(profile: ModeProfile, force: bool) -> bool:
+    """
+    Mirror summarizer's confirmation: only triggers when the profile both
+    requires confirmation AND is not short-circuited to mocks.
+    """
+    if profile.dry_run or not profile.requires_confirm:
         return True
     if force:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -480,8 +490,10 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
         doi = str(entry.get("doi", "")).strip()
         if not doi:
             continue
-        slug = entry.get("custom_id") or doi_to_slug(doi)
-        reference_text = _read_cached_text(slug)
+        # Summary entries carry journal+title, so they resolve to the
+        # descriptive cache filename. The legacy slug name is the
+        # automatic fallback inside read_cached_text.
+        reference_text = _read_cached_text(entry)
         if reference_text is None:
             counts["no_text"] += 1
             continue
@@ -533,24 +545,32 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase 3 — blind judge evaluator.")
+    parser.add_argument("--mode", choices=VALID_MODES, default=None,
+                        help="Override PHASE3_MODE from .env: test|single|dev|batch.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Override the mode's default paper_limit.")
     parser.add_argument("--judges", default=",".join(JUDGE_MODELS),
                         help="Comma-separated judge provider keys.")
     parser.add_argument("--no-resume", action="store_true",
                         help="Re-evaluate even pairs already in evaluations.jsonl.")
     parser.add_argument("--force", action="store_true",
-                        help="Bypass interactive confirmation in production mode.")
+                        help="Bypass interactive confirmation. USE WITH CAUTION.")
     args = parser.parse_args(argv)
 
     judges = [j.strip() for j in args.judges.split(",") if j.strip()]
 
-    if DEVELOPMENT_MODE:
-        print(f"[phase3:evaluate] DEVELOPMENT_MODE active — capping at "
-              f"{DEV_MODE_PAPER_LIMIT} papers (same set as summarizer).")
-        paper_limit = DEV_MODE_PAPER_LIMIT
-    else:
-        paper_limit = None
+    profile = resolve_mode(args.mode)
+    paper_limit = args.limit if args.limit is not None else profile.paper_limit
 
-    if not confirm_real_judge(force=args.force):
+    print(profile.banner())
+    if profile.use_batch:
+        print("[phase3:evaluate] mode=batch: this script only runs the real-time judge "
+              "loop. Judge batch jobs are submitted by run_phase3 summarize and collected "
+              "by check_batch_status.py.")
+    if args.limit is not None:
+        print(f"[phase3:evaluate] --limit {args.limit} overrides mode default.")
+
+    if not confirm_real_judge(profile, force=args.force):
         return 1
 
     run_evaluation(

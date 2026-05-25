@@ -7,7 +7,7 @@ Critical assertions:
     Penny test: BudgetGuard.add_cost() called with response-derived tokens
         matches the per-MTok pricing in models_config.
     DRY_RUN: mock summary has the same dict shape as a real success.
-    DEVELOPMENT_MODE: the hardcoded cap holds at 2 papers.
+    PHASE3_MODE=dev: paper_limit honours PHASE3_DEV_LIMIT.
 """
 
 from __future__ import annotations
@@ -65,7 +65,12 @@ def _fake_openai_response(specific_version: str = "gpt-5.5-0325-preview") -> Sim
 
 
 def test_drift_openai_model_version_from_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Drop both safeguards so the real-time path is exercised. PHASE3_MODE=single
+    # is the lightest live mode; without flipping it the test-mode last-guardrail
+    # in _is_dry_run() would short-circuit to a mock and the drift assertion
+    # would fail with "gpt-5.5-DRYRUN".
     monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("PHASE3_MODE", "single")
     monkeypatch.setattr(summarizer, "DRY_RUN", False)
 
     fake_response = _fake_openai_response("gpt-5.5-0325-preview")
@@ -110,11 +115,27 @@ def test_penny_budget_matches_models_config_pricing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DEVELOPMENT_MODE cap
+# PHASE3_MODE=dev paper cap
 # ---------------------------------------------------------------------------
 
-def test_development_mode_caps_at_two_papers(tmp_path: Path,
-                                              monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dev_mode_caps_paper_count(tmp_path: Path,
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Replaces the old DEVELOPMENT_MODE=True cap test. With ``PHASE3_MODE=dev``
+    and ``PHASE3_DEV_LIMIT=2`` the run should process exactly 2 papers
+    regardless of how many are in the manifest.
+    """
+    import prepare_texts
+    from phase3_mode import resolve_mode
+
+    monkeypatch.setenv("PHASE3_MODE", "dev")
+    monkeypatch.setenv("PHASE3_DEV_LIMIT", "2")
+
+    # Sanity: the resolved profile reports limit=2.
+    profile = resolve_mode()
+    assert profile.name == "dev"
+    assert profile.paper_limit == 2
+
     # Build a fake manifest with 5 papers.
     manifest = tmp_path / "manifest.jsonl"
     processed = tmp_path / "processed"
@@ -125,7 +146,8 @@ def test_development_mode_caps_at_two_papers(tmp_path: Path,
         for d in dois:
             f.write(json.dumps({"doi": d, "journal": "TEST"}) + "\n")
 
-    # Pre-populate processed/{slug}.jsonl for all five so we'd hit the model loop.
+    # Pre-populate the legacy {slug}.jsonl cache (these records lack a title
+    # so the descriptive path resolves back to the legacy slug name).
     from file_paths import doi_to_slug
     for d in dois:
         slug = doi_to_slug(d)
@@ -133,17 +155,17 @@ def test_development_mode_caps_at_two_papers(tmp_path: Path,
         (processed / f"{slug}.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
 
     monkeypatch.setattr(summarizer, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed)
     monkeypatch.setattr(summarizer, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
     monkeypatch.setattr(summarizer, "MANIFEST_PATH", manifest)
 
     counts = summarizer.run_realtime(
         manifest_path=manifest,
         resume=False,
-        paper_limit=summarizer.DEV_MODE_PAPER_LIMIT,
+        paper_limit=profile.paper_limit,
         providers=["openai"],
     )
 
-    # Cap == 2 papers × 1 provider = 2 successful calls.
     assert counts["success"] == 2
     assert counts["failed"] == 0
 

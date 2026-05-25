@@ -6,7 +6,7 @@ Critical assertions:
     JSON fallback: response with extra conversational text still yields a score.
     99 sentinel: completely malformed response triggers manual-review flag.
     requires_human_review: confidence < 3 triggers the flag.
-    DEVELOPMENT_MODE: evaluator also caps at 2 papers.
+    PHASE3_MODE=dev: evaluator honours the dev paper cap.
 """
 
 from __future__ import annotations
@@ -161,12 +161,25 @@ def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DEVELOPMENT_MODE cap
+# PHASE3_MODE=dev paper cap
 # ---------------------------------------------------------------------------
 
-def test_development_mode_caps_at_two_papers(tmp_path: Path,
-                                              monkeypatch: pytest.MonkeyPatch) -> None:
-    """Build fake summaries with 5 papers; evaluator should only process 2."""
+def test_dev_mode_caps_paper_count(tmp_path: Path,
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Replaces the old DEVELOPMENT_MODE cap test. Build fake summaries with
+    5 papers; with PHASE3_MODE=dev and PHASE3_DEV_LIMIT=2 the evaluator
+    should only process 2.
+    """
+    import prepare_texts
+    from phase3_mode import resolve_mode
+
+    monkeypatch.setenv("PHASE3_MODE", "dev")
+    monkeypatch.setenv("PHASE3_DEV_LIMIT", "2")
+
+    profile = resolve_mode()
+    assert profile.paper_limit == 2
+
     summaries_path = tmp_path / "summaries.jsonl"
     evaluations_path = tmp_path / "evaluations.jsonl"
     processed_dir = tmp_path / "processed"
@@ -179,6 +192,9 @@ def test_development_mode_caps_at_two_papers(tmp_path: Path,
             doi = f"10.9999/eval.{i:04d}"
             slug = doi_to_slug(doi)
             entry = {"doi": doi, "slug": slug, "text": "Reference body content. " * 30}
+            # Cache file under legacy slug name. The summary entry below
+            # has no journal/title, so the descriptive path resolves back
+            # to the legacy slug naming and this file is found.
             (processed_dir / f"{slug}.jsonl").write_text(
                 json.dumps(entry) + "\n", encoding="utf-8")
             f.write(json.dumps({
@@ -197,10 +213,11 @@ def test_development_mode_caps_at_two_papers(tmp_path: Path,
     monkeypatch.setattr(evaluator, "SUMMARIES_PATH", summaries_path)
     monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
     monkeypatch.setattr(evaluator, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
 
     counts = evaluator.run_evaluation(
         judges=["openai"], resume=False,
-        paper_limit=evaluator.DEV_MODE_PAPER_LIMIT,
+        paper_limit=profile.paper_limit,
     )
 
     assert counts["evaluated"] == 2  # 2 papers × 1 summariser × 1 judge
