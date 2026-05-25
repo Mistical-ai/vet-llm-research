@@ -13,7 +13,7 @@
 - All Phase 3 code lives in the top-level `llm-sum/` folder (sibling of `src/`, `data/`, `tests/`). Outputs are written to `data/` (`summaries.jsonl`, `evaluations.jsonl`, `batch_jobs.jsonl`, `processed/`).
 - Never execute any script that makes live API calls to OpenAI, Anthropic, or Gemini. This includes `llm-sum/summarizer.py`, `llm-sum/evaluator.py`, `llm-sum/check_batch_status.py`, and `llm-sum/run_phase3.py`. The user runs all live commands manually in PowerShell.
 - Running unit tests under `tests/` is allowed because mocks replace every external API call. Verify mocking is in place before running.
-- `DEVELOPMENT_MODE = True` is hardcoded at the top of `llm-sum/summarizer.py` and `llm-sum/evaluator.py`. Do not change this default in code; it is the last guardrail before a full-corpus run.
+- **Phase 3 mode rule:** Claude may run Phase 3 scripts only with `PHASE3_MODE=test` (mocks only, no network). Modes `single`, `dev`, and `batch` make live API calls and must be executed manually by the user in PowerShell. The interactive confirm prompt is the last guardrail before a live run. The previous `DEVELOPMENT_MODE` constant has been removed; the same safety intent now lives in `llm-sum/phase3_mode.py` and the safest mode (`test`) is the default.
 - All paid API calls must flow through `BudgetGuard.add_cost()` from `src/utils.py`. Token counts must come from the provider response, never from estimation.
 - Append-only output: never overwrite `data/summaries.jsonl` or `data/evaluations.jsonl`. New writes append one JSON line at a time.
 - The judge prompt must never contain a summariser model identifier. The blind protocol is non-negotiable for study validity.

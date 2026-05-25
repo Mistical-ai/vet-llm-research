@@ -52,6 +52,10 @@ data/incoming_manuals/    →    auto_ingest_workflow.py    →    data/raw/
 
 The workflow script is smart: before trying to match each PDF, it looks up the paper's DOI in CrossRef and adds it to the catalogue automatically. This means PDFs that used to get stuck in a `failed/` folder will now be matched and accepted.
 
+### Phase 3 (LLM summarisation & evaluation)
+
+Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. See **[docs/phase3/README.md](docs/phase3/README.md)** for the mode cheat-sheet, three named recipes (single-paper test, dev run, full batch), and a guide per script.
+
 ---
 
 ## First-time setup
