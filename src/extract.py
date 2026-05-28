@@ -87,6 +87,14 @@ MAX_CHARS = 12_000
 # debugging if you suspect the pattern is matching too early.
 REMOVE_REFERENCES: bool = os.getenv("REMOVE_REFERENCES", "true").lower() == "true"
 
+# When True, ask pdfplumber/pdfminer to preserve the PDF's text flow. This is
+# important for two-column journals (JVIM, VRU), where default extraction can
+# interleave left and right columns into scrambled sentences.
+PDFPLUMBER_USE_TEXT_FLOW: bool = (
+    os.getenv("PDFPLUMBER_USE_TEXT_FLOW", "true").lower() == "true"
+)
+_TEXT_FLOW_WARNING_SHOWN = False
+
 # Path to the dry-run fixture.  In dry-run mode we return the cleaned text
 # from this file instead of reading a real PDF.
 FIXTURE_PATH = Path("tests") / "fixtures" / "sample_paper.json"
@@ -162,7 +170,7 @@ def clean_publisher_noise(text: str) -> str:
     return cleaned
 
 
-def remove_references_section(text: str) -> str:
+def remove_references_section(text: str, doi: str | None = None) -> str:
     """
     Find the LAST occurrence of a reference/bibliography heading and return
     only the text that precedes it.
@@ -188,15 +196,20 @@ def remove_references_section(text: str) -> str:
     str — The text with everything from the last References heading onward removed.
     """
     matches = list(REFERENCES_PATTERN.finditer(text))
+    used_inline_fallback = False
     if not matches:
         # Fallback: two-column layout may have merged "REFERENCES" mid-line.
         matches = list(REFERENCES_INLINE_RE.finditer(text))
+        used_inline_fallback = bool(matches)
 
     if matches:
         # Use the LAST match — the bibliography is always the final section.
         match = matches[-1]
         cleaned = text[: match.start()].rstrip()
         chars_removed = len(text) - len(cleaned)
+        if used_inline_fallback:
+            label = doi or "unknown DOI"
+            print(f"  [extract] used inline reference fallback for {label}.")
         print(f"  [extract] Removed references section ({chars_removed:,} chars stripped).")
         return cleaned
 
@@ -278,7 +291,7 @@ def extract_text_from_pdf(pdf_path: Path) -> str | None:
         with pdfplumber.open(pdf_path) as pdf:
             pages: list[str] = []
             for page in pdf.pages:
-                page_text = page.extract_text()
+                page_text = _extract_page_text(page)
                 if page_text:
                     pages.append(page_text)
             raw_text = "\n".join(pages)
@@ -287,6 +300,40 @@ def extract_text_from_pdf(pdf_path: Path) -> str | None:
     except Exception as exc:
         log_error(str(pdf_path.stem), "extract", f"pdfplumber failed: {exc}")
         return None
+
+
+def _extract_page_text(page) -> str | None:
+    """
+    Extract one PDF page while preserving reading order in two-column layouts.
+
+    Preferred path uses pdfplumber/pdfminer's text-flow mode. Older pdfplumber
+    versions may not accept ``use_text_flow``; when that happens we warn once
+    and use tighter character-based tolerances instead.
+    """
+    if PDFPLUMBER_USE_TEXT_FLOW:
+        try:
+            text = page.extract_text(layout=True, use_text_flow=True)
+        except TypeError:
+            _warn_text_flow_not_supported()
+            return page.extract_text(x_tolerance=3, y_tolerance=3) or page.extract_text()
+        if text:
+            return text
+        return page.extract_text()
+
+    return page.extract_text(x_tolerance=3, y_tolerance=3) or page.extract_text()
+
+
+def _warn_text_flow_not_supported() -> None:
+    """Print the text-flow compatibility warning once per process."""
+    global _TEXT_FLOW_WARNING_SHOWN
+    if _TEXT_FLOW_WARNING_SHOWN:
+        return
+    print(
+        "  [extract] WARNING: PDFPLUMBER_USE_TEXT_FLOW=true but this "
+        "pdfplumber version does not support use_text_flow; falling back to "
+        "x_tolerance=3, y_tolerance=3."
+    )
+    _TEXT_FLOW_WARNING_SHOWN = True
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +427,8 @@ def _extract_dry_run(doi: str) -> str | None:
 
     print(f"[extract] DRY_RUN — using fixture text ({len(raw_text):,} chars).")
 
-    text_no_refs = remove_references_section(raw_text) if REMOVE_REFERENCES else raw_text
+    raw_text = clean_publisher_noise(raw_text)
+    text_no_refs = remove_references_section(raw_text, doi) if REMOVE_REFERENCES else raw_text
     # No truncation here — the cache should hold the full cleaned text.
     # Summarizer applies MAX_INPUT_CHARS when building the LLM prompt.
     return text_no_refs
@@ -408,7 +456,8 @@ def _extract_live(doi: str) -> str | None:
     if raw_text is None:
         return None  # Error already logged inside extract_text_from_pdf.
 
-    text_no_refs = remove_references_section(raw_text) if REMOVE_REFERENCES else raw_text
+    raw_text = clean_publisher_noise(raw_text)
+    text_no_refs = remove_references_section(raw_text, doi) if REMOVE_REFERENCES else raw_text
     return text_no_refs
 
 

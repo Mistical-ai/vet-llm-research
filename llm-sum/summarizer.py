@@ -71,6 +71,7 @@ PROMPT_FILE = Path(os.getenv("PROMPT_FILE", "llm-sum/prompts/summarization_v1.tx
 # full cached text). Set via MAX_INPUT_CHARS in .env to tune cost vs coverage.
 # 40 000 chars ≈ 10 000 tokens ≈ a full 15-page research article.
 MAX_INPUT_CHARS: int = int(os.getenv("MAX_INPUT_CHARS", "0"))
+VALID_INPUT_SOURCES = ("processed", "raw_text")
 
 
 def _is_dry_run() -> bool:
@@ -329,12 +330,29 @@ def _empty_model_slot() -> dict:
     }
 
 
-def _new_summary_entry(record: dict) -> dict:
+def _custom_id_for_source(doi: str, input_source: str) -> str:
+    """Keep legacy custom_id for processed text; suffix raw comparison rows."""
+    slug = doi_to_slug(doi)
+    return slug if input_source == "processed" else f"{slug}__{input_source}"
+
+
+def _summary_key(doi: str, input_source: str) -> str:
+    return f"{doi}::{input_source}"
+
+
+def _entry_key(entry: dict) -> str:
+    doi = str(entry.get("doi", "")).strip()
+    source = str(entry.get("input_source") or "processed")
+    return _summary_key(doi, source)
+
+
+def _new_summary_entry(record: dict, input_source: str = "processed") -> dict:
     """Build an empty summary row from a manifest record."""
     doi = str(record.get("doi", "")).strip()
     return {
         "doi": doi,
-        "custom_id": doi_to_slug(doi),
+        "custom_id": _custom_id_for_source(doi, input_source),
+        "input_source": input_source,
         "journal": record.get("journal"),
         "species": record.get("species"),
         "study_design": record.get("study_design"),
@@ -344,12 +362,13 @@ def _new_summary_entry(record: dict) -> dict:
     }
 
 
-def load_existing_summaries(path: Path = SUMMARIES_PATH) -> dict[str, dict]:
-    """Load existing summaries keyed by DOI for resume support."""
-    if not path.exists():
+def load_existing_summaries(path: Path | None = None) -> dict[str, dict]:
+    """Load existing summaries keyed by DOI + input source for resume support."""
+    resolved = path if path is not None else SUMMARIES_PATH
+    if not resolved.exists():
         return {}
     out: dict[str, dict] = {}
-    with open(path, encoding="utf-8") as f:
+    with open(resolved, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -360,7 +379,7 @@ def load_existing_summaries(path: Path = SUMMARIES_PATH) -> dict[str, dict]:
                 continue
             doi = str(entry.get("doi", "")).strip()
             if doi:
-                out[doi] = entry
+                out[_entry_key(entry)] = entry
     return out
 
 
@@ -437,7 +456,7 @@ def _iter_manifest(path: Path):
                 continue
 
 
-def _read_cached_text(record_or_doi) -> str | None:
+def _read_cached_text(record_or_doi, input_source: str = "processed") -> str | None:
     """
     Locate this paper's cleaned-text cache and return its body.
 
@@ -448,7 +467,7 @@ def _read_cached_text(record_or_doi) -> str | None:
     lookup) or a bare DOI string (legacy fallback only).
     """
     from prepare_texts import read_cached_text as _shared_read
-    return _shared_read(record_or_doi)
+    return _shared_read(record_or_doi, input_source=input_source)
 
 
 def run_realtime(
@@ -457,13 +476,16 @@ def run_realtime(
     resume: bool = False,
     paper_limit: int | None = None,
     providers: list[str] | None = None,
+    input_source: str = "processed",
 ) -> dict[str, int]:
     """
     Sequentially summarise each paper across each provider in real time.
     """
     providers = providers or list(all_providers())
     prompt_template = load_prompt()
-    existing = load_existing_summaries() if resume else {}
+    # Always keep rows from other papers/input sources. ``resume`` only decides
+    # whether already-successful model slots are skipped or refreshed.
+    existing = load_existing_summaries()
     guard = BudgetGuard()
 
     counts = {"success": 0, "failed": 0, "skipped": 0, "no_text": 0}
@@ -483,16 +505,17 @@ def run_realtime(
         # Pass the full manifest record so we can find the descriptive-named
         # cache file. Falls back to legacy {slug}.jsonl if a record is
         # missing journal/title or the migration hasn't happened yet.
-        article_text = _read_cached_text(record)
+        article_text = _read_cached_text(record, input_source=input_source)
         if article_text is None:
             counts["no_text"] += 1
             log_error(doi, "summarize",
-                      f"No cached text for {slug} (looked for descriptive "
-                      f"name + legacy {slug}.jsonl)")
+                      f"No {input_source} cached text for {slug} (looked for "
+                      f"descriptive name + legacy {slug}.jsonl)")
             continue
 
-        entry = summaries_by_doi.get(doi) or _new_summary_entry(record)
-        summaries_by_doi[doi] = entry
+        key = _summary_key(doi, input_source)
+        entry = summaries_by_doi.get(key) or _new_summary_entry(record, input_source)
+        summaries_by_doi[key] = entry
 
         processed_papers += 1
         print(f"\n[phase3:summarize] paper {processed_papers}: {doi}")
@@ -547,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--providers", default=",".join(all_providers()),
                         help="Comma-separated provider keys (subset of openai,anthropic,gemini).")
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument("--input-source", choices=VALID_INPUT_SOURCES, default="processed",
+                        help="Text cache to summarize: processed (default) or raw_text.")
     args = parser.parse_args(argv)
 
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
@@ -557,6 +582,10 @@ def main(argv: list[str] | None = None) -> int:
     print(profile.banner())
     if args.limit is not None:
         print(f"[phase3:summarize] --limit {args.limit} overrides mode default.")
+    if args.input_source == "raw_text" and profile.name not in {"test", "single", "dev"}:
+        print("[phase3:summarize] raw_text input is limited to test/single/dev comparison runs.")
+        return 1
+    print(f"[phase3:summarize] input_source={args.input_source}")
 
     if not confirm_real_batch(profile, force=args.force):
         return 1
@@ -576,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         resume=args.resume,
         paper_limit=paper_limit,
         providers=providers,
+        input_source=args.input_source,
     )
     return 0
 

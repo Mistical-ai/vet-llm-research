@@ -2,11 +2,17 @@
 
 ## What it does
 
-Walks every PDF in `data/raw/` and writes the cleaned full-text body to a one-line JSONL cache file at `data/processed/<descriptive_stem>.jsonl`. The cleaning step strips the References section and Wiley/publisher boilerplate; nothing is truncated at this stage — that happens later inside the summariser when `MAX_INPUT_CHARS` is applied per call.
+Walks every PDF in `data/raw/` and writes two one-line JSONL cache files:
+
+* `data/raw_text/<descriptive_stem>.jsonl` contains the raw column-aware `pdfplumber` extraction.
+* `data/processed/<descriptive_stem>.jsonl` contains the cleaned full-text body after publisher noise and references are removed.
+
+Nothing is truncated at this stage — that happens later inside the summariser when `MAX_INPUT_CHARS` is applied per call.
 
 The on-disk filename mirrors the source PDF stem exactly:
 ```
 data/raw/jvim__title__10_1111_jvim_16872.pdf
+data/raw_text/jvim__title__10_1111_jvim_16872.jsonl
 data/processed/jvim__title__10_1111_jvim_16872.jsonl
 ```
 So you can glance at `data/processed/` and immediately see which PDF each cache came from. The DOI-derived `slug` is still stored *inside* the JSON body (it's the stable join key for downstream summariser custom_ids).
@@ -23,13 +29,14 @@ So you can glance at `data/processed/` and immediately see which PDF each cache 
 |-----------------------|-------------------------------------------------|
 | `data/raw/*.pdf`      | Source PDFs from Phase 2.                       |
 | `data/manifest.jsonl` | Used only to enrich the DOI for each PDF. Optional — orphan PDFs still get cached. |
-| `.env`                | `REMOVE_REFERENCES` (default `true`), `MIN_WORD_COUNT_WARN` (default `1000`). |
+| `.env`                | `PDFPLUMBER_USE_TEXT_FLOW` (default `true`), `REMOVE_REFERENCES` (default `true`), `MIN_WORD_COUNT_WARN` (default `1000`). |
 
 ## Outputs
 
 | Path                                          | Schema                                                          |
 |-----------------------------------------------|-----------------------------------------------------------------|
-| `data/processed/<descriptive_stem>.jsonl`    | One JSON line: `doi`, `slug`, `text`, `word_count`, `char_count`, `pdf_filename`, `pdf_source`, `extracted_at`. |
+| `data/raw_text/<descriptive_stem>.jsonl`     | Raw extracted text before cleaning, useful for quality/cost comparison. |
+| `data/processed/<descriptive_stem>.jsonl`    | Cleaned body text for normal summaries. |
 
 ## CLI
 
@@ -43,7 +50,7 @@ There's no `--mode` flag here — this script does not call any API, so all four
 
 ## Cache-freshness rule
 
-The script skips a PDF when `data/processed/<stem>.jsonl` already exists *and* its mtime is `>=` the PDF mtime. To force a re-extract: delete the cache file or `touch` the PDF.
+The script skips a PDF when both `data/raw_text/<stem>.jsonl` and `data/processed/<stem>.jsonl` already exist *and* their mtimes are `>=` the PDF mtime. To force a re-extract: delete either cache file or `touch` the PDF.
 
 ## Common errors and fixes
 

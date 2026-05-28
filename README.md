@@ -54,7 +54,7 @@ The workflow script is smart: before trying to match each PDF, it looks up the p
 
 ### Phase 3 (LLM summarisation & evaluation)
 
-Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. See **[docs/phase3/README.md](docs/phase3/README.md)** for the mode cheat-sheet, three named recipes (single-paper test, dev run, full batch), and a guide per script.
+Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. Extraction is column-aware for two-column journals such as JVIM and VRU, writes raw extracted text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with publisher noise and references removed. All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. See **[docs/phase3/README.md](docs/phase3/README.md)** for the mode cheat-sheet, raw-vs-processed comparison workflow, and a guide per script.
 
 ---
 
@@ -356,6 +356,8 @@ vet-llm-research/
 │   │       └── YYYY-MM-DD/       ← Failed PDFs archived by date
 │   │
 │   ├── quarantine/               ← PDFs moved out by audit_article_types.py
+│   ├── raw_text/                 ← Phase 3 raw column-aware extracted text
+│   ├── processed/                ← Phase 3 cleaned text for LLM summaries
 │   └── logs/
 │       └── auto_ingest_workflow.log  ← Full run log
 │
@@ -421,6 +423,17 @@ That just means you haven't reached 200 primary PDFs yet — it's not a crash. K
 ### "I accidentally ran collect.py twice and have duplicates in manifest.jsonl"
 
 Not a problem — the rest of the pipeline deduplicates by DOI. Duplicate lines in `manifest.jsonl` are safely ignored.
+
+### "verify_extraction.py shows WARN or FAIL"
+
+Run this after Phase 3 extraction and before any paid summaries:
+
+```powershell
+python llm-sum/run_phase3.py extract
+python scripts/verify_extraction.py --limit 20
+```
+
+`WARN` can be legitimate for short communications, case reports, and other article types that may still exist in `data/raw/` but are excluded from the final corpus. `FAIL` needs investigation before spending money. Compare `data/raw_text/<name>.jsonl` against `data/processed/<name>.jsonl`: if Methods, Results, or Discussion disappeared, reference stripping or watermark cleanup needs adjustment; if the raw text itself is tiny, the PDF is probably scanned or not a full research article.
 
 ---
 
@@ -507,6 +520,7 @@ Copy `.env.template` to `.env` and fill in your values. The most important ones:
 | `MAX_FAILED_PER_JOURNAL` | `300` | Stop-loss: give up on a journal after this many download failures |
 | `MIN_PAGES` | `3` | Reject PDFs shorter than this many pages |
 | `MIN_EXTRACTED_WORDS` | `3000` | Reject PDFs with fewer than this many words (after removing references) |
+| `PDFPLUMBER_USE_TEXT_FLOW` | `true` | Preserve reading order in two-column PDFs during Phase 3 extraction |
 | `EXCLUDE_ARTICLE_TYPE_PATTERNS` | *(see template)* | Comma-separated title phrases that mark non-primary articles |
 
 Full list in `.env.template`.

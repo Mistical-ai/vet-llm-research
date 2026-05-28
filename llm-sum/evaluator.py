@@ -369,11 +369,13 @@ def _call_judge_gemini(user_message: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_evaluation_row(*, doi: str, summariser: str, judge: str,
+                         input_source: str = "processed",
                          reference_text: str, candidate_summary: str,
                          judge_response: dict) -> dict:
     parsed = parse_judge_response(judge_response["raw_text"])
     return {
         "doi": doi,
+        "input_source": input_source,
         "summarizer": summariser,
         "judge": judge,
         "judge_model_version": judge_response["model_version"],
@@ -428,10 +430,14 @@ def _read_cached_text(record_or_doi) -> str | None:
     ``{doi_to_slug(doi)}.jsonl`` name automatically.
     """
     from prepare_texts import read_cached_text as _shared_read
-    return _shared_read(record_or_doi)
+    source = "processed"
+    if not isinstance(record_or_doi, str):
+        source = str(record_or_doi.get("input_source") or "processed")
+    return _shared_read(record_or_doi, input_source=source)
 
 
-def already_evaluated(doi: str, summariser: str, judge: str) -> bool:
+def already_evaluated(doi: str, summariser: str, judge: str,
+                      input_source: str = "processed") -> bool:
     """Check evaluations.jsonl to support a manual resume."""
     if not EVALUATIONS_PATH.exists():
         return False
@@ -445,6 +451,7 @@ def already_evaluated(doi: str, summariser: str, judge: str) -> bool:
             except json.JSONDecodeError:
                 continue
             if (row.get("doi") == doi
+                    and (row.get("input_source") or "processed") == input_source
                     and row.get("summarizer") == summariser
                     and row.get("judge") == judge):
                 return True
@@ -490,6 +497,7 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
         doi = str(entry.get("doi", "")).strip()
         if not doi:
             continue
+        input_source = str(entry.get("input_source") or "processed")
         # Summary entries carry journal+title, so they resolve to the
         # descriptive cache filename. The legacy slug name is the
         # automatic fallback inside read_cached_text.
@@ -505,7 +513,7 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
             candidate_summary = slot["summary"]
 
             for judge in judges:
-                if resume and already_evaluated(doi, summariser, judge):
+                if resume and already_evaluated(doi, summariser, judge, input_source):
                     counts["skipped"] += 1
                     continue
                 sleep_for_model(judge)
@@ -521,6 +529,7 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
 
                 row = build_evaluation_row(
                     doi=doi, summariser=summariser, judge=judge,
+                    input_source=input_source,
                     reference_text=reference_text,
                     candidate_summary=candidate_summary,
                     judge_response=response,

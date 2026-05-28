@@ -80,6 +80,56 @@ def test_no_references_section_returns_full_text() -> None:
     assert cleaned == text
 
 
+def test_inline_reference_fallback_logs_doi(capsys) -> None:
+    text = (
+        "Discussion\nThe study findings were clinically useful.\n"
+        "ORCID iD REFERENCES\n"
+        "1. Smith J et al. Journal. 2023.\n"
+    )
+    cleaned = remove_references_section(text, doi="10.9999/inline.0001")
+    out = capsys.readouterr().out
+    assert "used inline reference fallback for 10.9999/inline.0001" in out
+    assert "Smith J et al." not in cleaned
+    assert "Discussion" in cleaned
+
+
+def test_page_extraction_uses_text_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakePage:
+        def extract_text(self, **kwargs):
+            calls.append(kwargs)
+            if kwargs.get("layout") and kwargs.get("use_text_flow"):
+                return "left column then right column"
+            return "plain"
+
+    monkeypatch.setattr(extract, "PDFPLUMBER_USE_TEXT_FLOW", True)
+    assert extract._extract_page_text(FakePage()) == "left column then right column"
+    assert calls[0] == {"layout": True, "use_text_flow": True}
+
+
+def test_page_extraction_falls_back_when_text_flow_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    calls = []
+
+    class FakePage:
+        def extract_text(self, **kwargs):
+            calls.append(kwargs)
+            if kwargs.get("use_text_flow"):
+                raise TypeError("unexpected keyword")
+            if kwargs == {"x_tolerance": 3, "y_tolerance": 3}:
+                return "tolerance fallback"
+            return "plain"
+
+    monkeypatch.setattr(extract, "PDFPLUMBER_USE_TEXT_FLOW", True)
+    monkeypatch.setattr(extract, "_TEXT_FLOW_WARNING_SHOWN", False)
+    assert extract._extract_page_text(FakePage()) == "tolerance fallback"
+    assert "does not support use_text_flow" in capsys.readouterr().out
+    assert {"x_tolerance": 3, "y_tolerance": 3} in calls
+
+
 # ---------------------------------------------------------------------------
 # Full-paper extraction (no truncation in extract_clean_text)
 # ---------------------------------------------------------------------------

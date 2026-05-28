@@ -39,8 +39,9 @@ scripts/     two helper tools you run by hand (verify, migrate)
  PDFs become      each paper →        each summary →    read-only
  clean text       3 summaries         a judge score     scoreboard
 
- data/raw/*.pdf   data/processed/  →  data/summaries  → data/evaluations
-                  *.jsonl             .jsonl            .jsonl
+ data/raw/*.pdf   data/raw_text/   →  data/summaries  → data/evaluations
+                  data/processed/     .jsonl            .jsonl
+                  *.jsonl
 ```
 
 You can run each step two ways — **pick one style and stick with it**:
@@ -148,12 +149,15 @@ If all of that works, your pipeline is healthy and you're ready to spend real mo
 python llm-sum/run_phase3.py extract
 ```
 
-Reads every PDF in `data/raw/`, strips the references section and publisher boilerplate, and saves the clean text to `data/processed/<name>.jsonl`. The output file is named after the PDF so you can always tell which is which:
+Reads every PDF in `data/raw/`, extracts the full text with column-aware `pdfplumber` settings, strips the references section and publisher boilerplate, and saves the clean text to `data/processed/<name>.jsonl`. It also saves the raw extracted text to `data/raw_text/<name>.jsonl` so you can compare “what came straight out of the PDF” against “what the LLM normally receives.”
 
 ```
 data/raw/jvim__pre_illness_diet__10_1111_jvim_16872.pdf
+data/raw_text/jvim__pre_illness_diet__10_1111_jvim_16872.jsonl
 data/processed/jvim__pre_illness_diet__10_1111_jvim_16872.jsonl
 ```
+
+Two-column papers are handled automatically. JVIM and VRU often print articles in two columns; the extractor asks `pdfplumber` to follow text flow so the left column is read before the right column instead of mixing the two together.
 
 *Expect:* one `.jsonl` per PDF, and a final `extracted=… cached=… failed=…` line. Re-running is cheap and safe — it skips PDFs that haven't changed.
 
@@ -165,9 +169,9 @@ data/processed/jvim__pre_illness_diet__10_1111_jvim_16872.jsonl
 python scripts/verify_extraction.py
 ```
 
-Compares the raw PDF text against the cleaned cache and flags anything suspicious as PASS / WARN / **FAIL**. A FAIL usually means an image-only PDF or text that got over-trimmed.
+Compares the column-aware raw PDF extraction against the cleaned cache and flags anything suspicious as PASS / WARN / **FAIL**. A FAIL usually means an image-only PDF, column scrambling, a watermark pattern that needs cleaning, or text that got over-trimmed.
 
-*Expect:* a table plus a tally. Investigate every FAIL before paying to summarise — a garbled input produces a garbage summary you paid for.
+*Expect:* a table plus a tally. Investigate every FAIL before paying to summarise — a garbled input produces a garbage summary you paid for. WARN rows can be legitimate for short communications or case reports that still exist in `data/raw/` but are excluded from the final corpus.
 
 *Why this matters for the project:* the whole study rests on the summaries being of *real* paper text. This check is your guarantee that you're not silently feeding the models broken inputs.
 
@@ -179,6 +183,14 @@ python llm-sum/run_phase3.py summarize              # do it
 ```
 
 Sends each paper's clean text to all three models with identical settings (`temperature=0`, fixed seed) and records each summary plus the exact model version and token counts.
+
+By default, summarization uses `data/processed/` because that is the research-quality input: full body text, publisher boilerplate removed, references removed. For a small quality/cost comparison, run `single` or `dev` mode with `--input-source raw_text` to send the raw extracted JSONL instead:
+
+```powershell
+python llm-sum/run_phase3.py summarize --mode single --input-source processed
+python llm-sum/run_phase3.py summarize --mode single --input-source raw_text
+python llm-sum/run_phase3.py summarize --mode single --estimate --input-source raw_text
+```
 
 *Expect (in `single` mode):*
 ```
@@ -284,6 +296,7 @@ One-shot helper (not part of the normal flow): [`scripts/migrate_processed_filen
 
 ```
 data/
+├── raw_text/<name>.jsonl           ← extract  : raw column-aware PDF text
 ├── processed/<name>.jsonl          ← extract  : cleaned text, one file per PDF
 ├── summaries.jsonl                 ← summarize: all 3 models' summaries per paper
 ├── evaluations.jsonl               ← evaluate : the judge scores
@@ -297,7 +310,34 @@ data/
 
 ---
 
-## 9. If something goes wrong
+## 9. Troubleshooting
+
+### `verify_extraction.py` shows WARN
+
+A WARN means “check this before a paid run,” not automatically “bad paper.” Common causes:
+
+| Message | Most likely meaning | What to do |
+|---------|---------------------|------------|
+| `cleaned 1500-2999 words` | The PDF may be a short communication, case report, brief report, or imaging note. | Confirm the article type. If it is not primary research, quarantine/exclude it from the final corpus. |
+| `ratio 0.30-0.49` | References, Wiley boilerplate, or a very long appendix may have been removed. | Open `data/processed/<name>.jsonl` and spot-check Methods/Results/Discussion. |
+| many WARN rows from one journal | That journal may have a repeated watermark or unusual two-column layout. | Re-run extract, then inspect the raw and processed JSONL side by side. |
+
+### `verify_extraction.py` shows FAIL
+
+Investigate every FAIL before paying for summaries:
+
+| Message | Most likely meaning | What to do |
+|---------|---------------------|------------|
+| `no cache` | `extract` has not run for that PDF, or the cache was deleted. | Run `python llm-sum/run_phase3.py extract`. |
+| `raw words < 500` | Scanned image PDF, corrupted PDF, or no selectable text. | Re-download a text-based publisher PDF or remove it from the corpus. |
+| `cleaned words < 1500` | Reference stripping or watermark cleaning removed too much, or the article is genuinely short. | Compare `data/raw_text/` and `data/processed/`; if body sections disappeared, fix the extraction/cleaning rule before summarizing. |
+| `ratio < 0.30` | The body may have been over-stripped, often because a reference heading was detected too early. | Check where the processed text stops. If it stops before Results/Discussion, debug reference removal. |
+
+### Raw vs processed summaries look different
+
+That is expected. `raw_text` includes references and publisher boilerplate, so it usually costs more and can distract the LLM. `processed` is the intended research input because it preserves the paper body while removing the reference section and noise. Use raw comparisons only in `single` or `dev` mode to prove the cleaning step is improving quality and cost.
+
+## 10. If something else goes wrong
 
 * **Re-run safely.** Every step is resumable. `summarize --resume` and `evaluate` (resume is on by default) skip work that already succeeded, so you never pay twice for the same paper.
 * **Check `data/error_log.jsonl`** — every failure across the project is logged there with the DOI and the stage it failed at.

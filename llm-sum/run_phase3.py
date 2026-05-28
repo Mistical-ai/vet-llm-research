@@ -57,7 +57,11 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         import os
         from cost_estimator import run as run_estimate
         judges = [j.strip() for j in os.getenv("JUDGE_MODELS", "openai").split(",") if j.strip()]
-        run_estimate(batched=profile.use_batch, judge_providers=judges)
+        run_estimate(
+            batched=profile.use_batch,
+            judge_providers=judges,
+            input_source=args.input_source,
+        )
         return 0
 
     from summarizer import main as summarize_main
@@ -72,6 +76,8 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         delegate += ["--providers", args.providers]
     if args.manifest:
         delegate += ["--manifest", str(args.manifest)]
+    if args.input_source:
+        delegate += ["--input-source", args.input_source]
     return summarize_main(delegate)
 
 
@@ -102,7 +108,9 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     print(resolve_mode(args.mode).banner())
+    raw_text = list(RAW_TEXT_DIR.glob("*.jsonl")) if RAW_TEXT_DIR.exists() else []
     processed = list(PROCESSED_DIR.glob("*.jsonl")) if PROCESSED_DIR.exists() else []
+    print(f"[phase3:status] data/raw_text/*.jsonl  : {len(raw_text)} files")
     print(f"[phase3:status] data/processed/*.jsonl : {len(processed)} files")
 
     per_model = {p: {"success": 0, "failed": 0, "pending": 0} for p in all_providers()}
@@ -201,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum.add_argument("--providers", default=None,
                        help="Comma-separated subset of providers.")
     p_sum.add_argument("--manifest", type=Path, default=None)
+    p_sum.add_argument("--input-source", choices=("processed", "raw_text"), default="processed",
+                       help="Text cache to use: processed (default) or raw_text for comparison.")
     p_sum.set_defaults(func=cmd_summarize)
 
     p_eval = sub.add_parser("evaluate", help="Run the blind judge.")

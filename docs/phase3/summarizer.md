@@ -2,7 +2,7 @@
 
 ## What it does
 
-For each paper in `data/manifest.jsonl`, sends the cleaned text from `data/processed/` to **three LLMs** (OpenAI, Anthropic, Gemini) with identical prompts, identical temperature/seed, and identical max-output budget. Records the exact provider-returned model version, response tokens, and the summary text. Output goes to `data/summaries.jsonl` — one row per paper with one slot per model.
+For each paper in `data/manifest.jsonl`, sends text to **three LLMs** (OpenAI, Anthropic, Gemini) with identical prompts, identical temperature/seed, and identical max-output budget. By default it uses cleaned body text from `data/processed/`. For small comparison runs, `--input-source raw_text` sends the raw extracted JSONL from `data/raw_text/` instead, so you can compare quality and cost. Records the exact provider-returned model version, response tokens, input source, and the summary text. Output goes to `data/summaries.jsonl` — one row per paper/input-source with one slot per model.
 
 Two paths inside the same script:
 
@@ -21,6 +21,7 @@ Two paths inside the same script:
 |-------------------------------------|----------------------------------------------------------------|
 | `data/manifest.jsonl`               | Paper list — iterates one record per line.                     |
 | `data/processed/*.jsonl`            | Cleaned text bodies.                                           |
+| `data/raw_text/*.jsonl`             | Optional raw extracted text for `single`/`dev` comparison runs. |
 | `data/summaries.jsonl` (if exists)  | Read for `--resume` so success slots aren't re-run.            |
 | `llm-sum/prompts/summarization_v1.txt` | Prompt template — must contain `{ARTICLE_TEXT}`.            |
 | `.env`                              | `PHASE3_MODE`, `PHASE3_DEV_LIMIT`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `TEMPERATURE`, `SEED`, `MAX_INPUT_CHARS`, `MAX_OUTPUT_TOKENS`. |
@@ -42,9 +43,10 @@ python llm-sum/summarizer.py --mode dev --limit 1         # 1 paper, real-time
 python llm-sum/summarizer.py --mode batch --force         # bypass interactive 'yes'
 python llm-sum/summarizer.py --resume                     # skip already-success slots
 python llm-sum/summarizer.py --providers openai,anthropic # subset of providers
+python llm-sum/summarizer.py --mode single --input-source raw_text
 ```
 
-`--limit N` always wins. `--force` writes an audit line to `data/logs/phase3_safety.log`.
+`--limit N` always wins. `--input-source processed` is the default and is the production path. `--input-source raw_text` is for `test`, `single`, and `dev` comparison runs only. `--force` writes an audit line to `data/logs/phase3_safety.log`.
 
 ## Behaviour per PHASE3_MODE
 
@@ -54,6 +56,17 @@ python llm-sum/summarizer.py --providers openai,anthropic # subset of providers
 | `single` | 1 paper, real-time, 3 providers → 3 API calls. Prompts for `yes` before the first call. |
 | `dev`    | `PHASE3_DEV_LIMIT` papers, real-time. Same confirm prompt. Budget-guarded.       |
 | `batch`  | Full corpus. Builds and submits OpenAI + Anthropic batch JSONL; Gemini still goes through real-time in the same run. Confirm prompt required. |
+
+Raw-vs-processed comparison workflow:
+
+```powershell
+python llm-sum/run_phase3.py summarize --mode single --estimate --input-source processed
+python llm-sum/run_phase3.py summarize --mode single --estimate --input-source raw_text
+python llm-sum/run_phase3.py summarize --mode single --input-source processed
+python llm-sum/run_phase3.py summarize --mode single --input-source raw_text
+```
+
+The raw-text run usually costs more because it includes references and publisher boilerplate. The processed run is the scientifically intended input because it keeps the article body while removing text that should not influence the summary.
 
 ## Scientific controls (don't change between runs you want to compare)
 

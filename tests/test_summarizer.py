@@ -171,3 +171,54 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
 
     out_lines = (tmp_path / "summaries.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(out_lines) == 2
+
+
+def test_raw_text_input_source_writes_separate_summary_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prepare_texts
+
+    manifest = tmp_path / "manifest.jsonl"
+    processed = tmp_path / "processed"
+    raw_text = tmp_path / "raw_text"
+    processed.mkdir()
+    raw_text.mkdir()
+
+    doi = "10.9999/source.0001"
+    manifest.write_text(json.dumps({"doi": doi, "journal": "TEST"}) + "\n", encoding="utf-8")
+
+    from file_paths import doi_to_slug
+    slug = doi_to_slug(doi)
+    (processed / f"{slug}.jsonl").write_text(
+        json.dumps({"doi": doi, "slug": slug, "text": "processed body " * 20}) + "\n",
+        encoding="utf-8",
+    )
+    (raw_text / f"{slug}.jsonl").write_text(
+        json.dumps({"doi": doi, "slug": slug, "text": "raw body with references " * 20}) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+    monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(prepare_texts, "RAW_TEXT_DIR", raw_text)
+
+    summarizer.run_realtime(
+        manifest_path=manifest,
+        providers=["openai"],
+        paper_limit=1,
+        input_source="processed",
+    )
+    summarizer.run_realtime(
+        manifest_path=manifest,
+        providers=["openai"],
+        paper_limit=1,
+        input_source="raw_text",
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "summaries.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert {row["input_source"] for row in rows} == {"processed", "raw_text"}
+    assert {row["custom_id"] for row in rows} == {slug, f"{slug}__raw_text"}

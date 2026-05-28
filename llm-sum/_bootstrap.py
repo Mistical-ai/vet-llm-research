@@ -51,6 +51,7 @@ REPO_ROOT = _REPO_ROOT
 LLM_SUM_DIR = _HERE
 SRC_DIR = _SRC
 DATA_DIR = _REPO_ROOT / "data"
+RAW_TEXT_DIR = DATA_DIR / "raw_text"
 PROCESSED_DIR = DATA_DIR / "processed"
 BATCH_DIR = DATA_DIR / "batch"
 LOGS_DIR = DATA_DIR / "logs"
@@ -60,6 +61,7 @@ __all__ = [
     "LLM_SUM_DIR",
     "SRC_DIR",
     "DATA_DIR",
+    "RAW_TEXT_DIR",
     "PROCESSED_DIR",
     "BATCH_DIR",
     "LOGS_DIR",

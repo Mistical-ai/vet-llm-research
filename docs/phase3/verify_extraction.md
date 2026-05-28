@@ -2,7 +2,7 @@
 
 ## What it does
 
-Audits `data/raw/*.pdf` against the cleaned cache in `data/processed/*.jsonl`. For each PDF it extracts the *raw* pdfplumber text (no cleaning), compares the word count against the cached cleaned word count, and assigns a PASS / WARN / FAIL status. No API calls; safe to re-run; read-only.
+Audits `data/raw/*.pdf` against the cleaned cache in `data/processed/*.jsonl`. For each PDF it extracts the raw text with the same column-aware `pdfplumber` helper used by Phase 3, compares the word count against the cached cleaned word count, and assigns a PASS / WARN / FAIL status. No API calls; safe to re-run.
 
 Healthy papers land at ratio 0.70-0.90 (references + publisher noise removed = ~15-25% of raw text). The thresholds are conservative — a tight 0.90 rule would flag every paper.
 
@@ -17,6 +17,7 @@ Healthy papers land at ratio 0.70-0.90 (references + publisher noise removed = ~
 | Path                       | Role                                       |
 |----------------------------|--------------------------------------------|
 | `data/raw/*.pdf`           | Source PDFs.                               |
+| `data/raw_text/*.jsonl`    | Raw extracted cache for manual side-by-side inspection. |
 | `data/processed/*.jsonl`   | Cleaned cache files written by `prepare_texts.py`. |
 | `data/manifest.jsonl`      | Used to match PDF → cache filename.        |
 
@@ -40,7 +41,7 @@ python scripts/verify_extraction.py --quiet        # only print WARN/FAIL rows
 | Status | Rule                                                              | What it means                                              |
 |--------|-------------------------------------------------------------------|------------------------------------------------------------|
 | `PASS` | ratio ≥ 0.50 AND cleaned_words ≥ 3000                             | Cleaning behaved as expected.                              |
-| `WARN` | ratio 0.30-0.49, OR cleaned_words 1500-2999                       | Aggressive cleaning or a genuinely short paper; eyeball it.|
+| `WARN` | ratio 0.30-0.49, OR cleaned_words 1500-2999                       | Aggressive cleaning, a genuinely short paper, short communication, or case report; eyeball it.|
 | `FAIL` | ratio < 0.30 OR cleaned_words < 1500 OR cache missing OR raw_words < 500 | Broken: image-only PDF, eaten body text, or pipeline never ran. |
 
 Exit code: `0` if zero FAILs; `1` if any FAIL (so CI / scripted runs can gate on it).
@@ -51,9 +52,9 @@ Exit code: `0` if zero FAILs; `1` if any FAIL (so CI / scripted runs can gate on
 |-------------------------------------------------------------|--------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
 | FAIL with `no cache`                                        | `prepare_texts.py` has not run for this PDF.                       | `python llm-sum/run_phase3.py extract`.                                                          |
 | FAIL with `raw words ... < 500`                             | The PDF is image-only or has no extractable text.                  | OCR the file, or remove it from `data/raw/` and rerun Phase 2 supplementation.                   |
-| FAIL with `ratio < 0.30 (cleaning ate the body?)`           | The "References" header pattern matched something in the discussion. | Set `REMOVE_REFERENCES=false` in `.env`, delete the cache file, re-extract just that PDF.        |
+| FAIL with `ratio < 0.30 (cleaning ate the body?)`           | The "References" header pattern matched something in the discussion, or a new watermark pattern dominated the text. | Compare `data/raw_text/` and `data/processed/`; if body sections vanished, fix the cleaning rule and re-extract. |
 | FAIL with `pdfplumber could not open`                       | Corrupt / encrypted / unreadable PDF.                              | Try opening it manually; if broken, replace via Phase 2 supplementation.                         |
-| Lots of WARN rows                                           | Reference stripping is borderline on this corpus.                  | Spot-check a couple; if they look fine, ignore.                                                  |
+| Lots of WARN rows                                           | Reference stripping is borderline, or the sample contains excluded short article types. | Spot-check a couple; if they are short communications/case reports, quarantine them or ignore them for the final corpus. |
 
 ## Worked example
 

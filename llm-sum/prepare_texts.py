@@ -57,6 +57,7 @@ from utils import log_error  # noqa: E402
 
 RAW_DIR = DATA_DIR / "raw"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
+VALID_INPUT_SOURCES = ("processed", "raw_text")
 
 MIN_WORD_COUNT_WARN = int(os.getenv("MIN_WORD_COUNT_WARN", "1000"))
 
@@ -66,7 +67,7 @@ MIN_WORD_COUNT_WARN = int(os.getenv("MIN_WORD_COUNT_WARN", "1000"))
 # ---------------------------------------------------------------------------
 
 def read_processed_jsonl(path: Path) -> str | None:
-    """Return the `text` field from one data/processed/*.jsonl cache file."""
+    """Return the `text` field from one JSONL text cache file."""
     if not path.exists():
         return None
     line = path.read_text(encoding="utf-8").strip()
@@ -99,6 +100,32 @@ def processed_jsonl_path(record_or_doi) -> Path:
     return PROCESSED_DIR / f"{doi_to_slug(doi)}.jsonl"
 
 
+def raw_text_jsonl_path(record_or_doi) -> Path:
+    """
+    Return the descriptive ``data/raw_text/*.jsonl`` path for a paper.
+
+    This mirrors processed_jsonl_path(), but points at the raw column-aware
+    extraction before publisher-noise and reference stripping.
+    """
+    if (not isinstance(record_or_doi, str)
+            and record_or_doi.get("journal")
+            and record_or_doi.get("title")):
+        return RAW_TEXT_DIR / f"{descriptive_stem(record_or_doi)}.jsonl"
+
+    doi = record_or_doi if isinstance(record_or_doi, str) else str(
+        record_or_doi.get("doi", "") or ""
+    )
+    return RAW_TEXT_DIR / f"{doi_to_slug(doi)}.jsonl"
+
+
+def _cache_path(record_or_doi, input_source: str) -> Path:
+    if input_source == "processed":
+        return processed_jsonl_path(record_or_doi)
+    if input_source == "raw_text":
+        return raw_text_jsonl_path(record_or_doi)
+    raise ValueError(f"Unknown input_source={input_source!r}. Valid: {VALID_INPUT_SOURCES}")
+
+
 def find_processed_jsonl(record_or_doi) -> Path | None:
     """
     Locate the cache file for a paper on disk, trying both naming schemes.
@@ -120,14 +147,41 @@ def find_processed_jsonl(record_or_doi) -> Path | None:
     return None
 
 
-def read_cached_text(record_or_doi) -> str | None:
+def find_cached_jsonl(record_or_doi, input_source: str = "processed") -> Path | None:
+    """
+    Locate a text cache for a paper, trying descriptive then legacy names.
+
+    ``input_source='processed'`` returns cleaned body text. ``'raw_text'``
+    returns the raw column-aware extraction used only for small comparison
+    experiments.
+    """
+    if input_source == "processed":
+        return find_processed_jsonl(record_or_doi)
+
+    if input_source != "raw_text":
+        raise ValueError(f"Unknown input_source={input_source!r}. Valid: {VALID_INPUT_SOURCES}")
+
+    preferred = raw_text_jsonl_path(record_or_doi)
+    if preferred.exists():
+        return preferred
+
+    if not isinstance(record_or_doi, str):
+        doi = str(record_or_doi.get("doi", "") or "")
+        if doi:
+            legacy = RAW_TEXT_DIR / f"{doi_to_slug(doi)}.jsonl"
+            if legacy.exists() and legacy != preferred:
+                return legacy
+    return None
+
+
+def read_cached_text(record_or_doi, input_source: str = "processed") -> str | None:
     """
     Return the cleaned-text body of the cache file for a paper, or None.
 
     Convenience wrapper around find_processed_jsonl + read_processed_jsonl
     so callers don't need to know which filename convention is on disk.
     """
-    path = find_processed_jsonl(record_or_doi)
+    path = find_cached_jsonl(record_or_doi, input_source=input_source)
     return read_processed_jsonl(path) if path is not None else None
 
 
@@ -160,6 +214,19 @@ def iter_processed_texts(processed_dir: Path | None = None) -> Iterable[tuple[st
         if not (isinstance(slug, str) and slug):
             slug = path.stem  # last resort for malformed lines
         yield slug, text
+
+
+def iter_cached_texts(input_source: str = "processed",
+                      root: Path | None = None) -> Iterable[tuple[str, str]]:
+    """
+    Yield ``(slug, text)`` from either processed or raw extracted-text caches.
+    """
+    if input_source == "processed":
+        yield from iter_processed_texts(root if root is not None else PROCESSED_DIR)
+        return
+    if input_source != "raw_text":
+        raise ValueError(f"Unknown input_source={input_source!r}. Valid: {VALID_INPUT_SOURCES}")
+    yield from iter_processed_texts(root if root is not None else RAW_TEXT_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +312,31 @@ def _jsonl_is_fresh(jsonl_path: Path, pdf_path: Path) -> bool:
     return jsonl_path.stat().st_mtime >= pdf_path.stat().st_mtime
 
 
+def _write_text_cache(
+    *,
+    path: Path,
+    doi: str,
+    slug: str,
+    text: str,
+    pdf_path: Path,
+    source: str,
+) -> None:
+    """Write one text cache JSONL row with shared metadata."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "doi": doi,
+        "slug": slug,
+        "text": text,
+        "word_count": len(text.split()),
+        "char_count": len(text),
+        "pdf_filename": pdf_path.name,
+        "pdf_source": str(pdf_path),
+        "input_source": source,
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Core extraction
 # ---------------------------------------------------------------------------
@@ -258,8 +350,9 @@ def prepare_one_pdf(pdf_path: Path, doi: str, record: dict) -> dict:
     """
     slug = doi_to_slug(doi) if doi else _slug_from_pdf(pdf_path)
     jsonl_path = PROCESSED_DIR / _output_filename(pdf_path, doi, record)
+    raw_jsonl_path = RAW_TEXT_DIR / _output_filename(pdf_path, doi, record)
 
-    if _jsonl_is_fresh(jsonl_path, pdf_path):
+    if _jsonl_is_fresh(jsonl_path, pdf_path) and _jsonl_is_fresh(raw_jsonl_path, pdf_path):
         return {"doi": doi, "slug": slug, "status": "cached"}
 
     raw_text = extract_text_from_pdf(pdf_path)
@@ -267,26 +360,31 @@ def prepare_one_pdf(pdf_path: Path, doi: str, record: dict) -> dict:
         log_error(doi or slug, "extract", f"pdfplumber failed for {pdf_path.name}")
         return {"doi": doi, "slug": slug, "status": "failed"}
 
+    _write_text_cache(
+        path=raw_jsonl_path,
+        doi=doi,
+        slug=slug,
+        text=raw_text,
+        pdf_path=pdf_path,
+        source="raw_text",
+    )
+
     raw_text = clean_publisher_noise(raw_text)
-    cleaned = remove_references_section(raw_text) if REMOVE_REFERENCES else raw_text
+    cleaned = remove_references_section(raw_text, doi or slug) if REMOVE_REFERENCES else raw_text
     word_count = len(cleaned.split())
 
     if word_count < MIN_WORD_COUNT_WARN:
         print(f"  [prepare] WARNING: {slug} has only {word_count} words after "
               "extraction — check PDF quality or set REMOVE_REFERENCES=false to debug.")
 
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "doi": doi,
-        "slug": slug,
-        "text": cleaned,
-        "word_count": word_count,
-        "char_count": len(cleaned),
-        "pdf_filename": pdf_path.name,
-        "pdf_source": str(pdf_path),
-        "extracted_at": datetime.now(timezone.utc).isoformat(),
-    }
-    jsonl_path.write_text(json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_text_cache(
+        path=jsonl_path,
+        doi=doi,
+        slug=slug,
+        text=cleaned,
+        pdf_path=pdf_path,
+        source="processed",
+    )
 
     return {"doi": doi, "slug": slug, "status": "extracted",
             "chars": len(cleaned), "words": word_count}

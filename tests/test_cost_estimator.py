@@ -58,6 +58,23 @@ def test_estimate_summarisation_returns_one_row_per_provider(tmp_path: Path,
         assert r.min_input_tokens <= r.avg_input_tokens <= r.max_input_tokens
 
 
+def test_estimate_summarisation_can_use_raw_text_cache(tmp_path: Path,
+                                                       monkeypatch) -> None:
+    raw_text = tmp_path / "raw_text"
+    raw_text.mkdir()
+    _write_processed_jsonl(raw_text / "p1.jsonl", "raw extracted body " * 100)
+
+    monkeypatch.setattr(cost_estimator, "RAW_TEXT_DIR", raw_text)
+
+    rows = cost_estimator.estimate_summarisation(
+        processed_dir=raw_text,
+        batched=False,
+        input_source="raw_text",
+    )
+    assert {r.provider for r in rows} == set(all_providers())
+    assert all(r.paper_count == 1 for r in rows)
+
+
 def test_estimate_evaluation_scales_with_summariser_count(tmp_path: Path,
                                                            monkeypatch) -> None:
     processed = tmp_path / "processed"

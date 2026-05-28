@@ -27,6 +27,7 @@ def fake_pdf_and_processed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(prepare_texts, "RAW_DIR", raw)
     monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(prepare_texts, "RAW_TEXT_DIR", tmp_path / "raw_text")
 
     doi = "10.9999/test.0001"
     slug = doi_to_slug(doi)
@@ -49,10 +50,16 @@ def test_extracts_when_no_cache_exists(fake_pdf_and_processed) -> None:
     assert result["status"] == "extracted"
     jsonl = fp["processed"] / f"{fp['slug']}.jsonl"
     assert jsonl.exists(), ".jsonl cache file must be created"
+    raw_jsonl = fp["raw"].parent / "raw_text" / f"{fp['slug']}.jsonl"
+    assert raw_jsonl.exists(), "raw extracted-text cache file must be created"
 
     entry = json.loads(jsonl.read_text(encoding="utf-8"))
     assert entry["doi"] == fp["doi"]
     assert entry["text"] == cleaned_text
+    assert entry["input_source"] == "processed"
+    raw_entry = json.loads(raw_jsonl.read_text(encoding="utf-8"))
+    assert raw_entry["text"] == cleaned_text
+    assert raw_entry["input_source"] == "raw_text"
     assert "word_count" in entry
     assert "char_count" in entry
     assert "extracted_at" in entry
@@ -63,10 +70,14 @@ def test_cache_hit_when_jsonl_newer_than_pdf(fake_pdf_and_processed) -> None:
     jsonl = fp["processed"] / f"{fp['slug']}.jsonl"
     entry = {"doi": fp["doi"], "slug": fp["slug"], "text": "cached body"}
     jsonl.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    raw_jsonl = fp["raw"].parent / "raw_text" / f"{fp['slug']}.jsonl"
+    raw_jsonl.parent.mkdir()
+    raw_jsonl.write_text(json.dumps(entry) + "\n", encoding="utf-8")
 
     # Make .jsonl mtime strictly after the PDF mtime.
     pdf_mtime = fp["pdf_path"].stat().st_mtime
     os.utime(jsonl, (pdf_mtime + 10, pdf_mtime + 10))
+    os.utime(raw_jsonl, (pdf_mtime + 10, pdf_mtime + 10))
 
     with patch("prepare_texts.extract_text_from_pdf") as mock_extract:
         result = prepare_texts.prepare_one_pdf(fp["pdf_path"], fp["doi"], {})
@@ -119,6 +130,7 @@ def test_run_produces_one_jsonl_per_pdf(tmp_path: Path,
     processed.mkdir()
     monkeypatch.setattr(prepare_texts, "RAW_DIR", raw)
     monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(prepare_texts, "RAW_TEXT_DIR", tmp_path / "raw_text")
     monkeypatch.setattr(prepare_texts, "MANIFEST_PATH", tmp_path / "manifest.jsonl")
 
     # Create 3 fake PDFs.
@@ -135,3 +147,5 @@ def test_run_produces_one_jsonl_per_pdf(tmp_path: Path,
     assert counts["failed"] == 0
     jsonls = list(processed.glob("*.jsonl"))
     assert len(jsonls) == 3, f"Expected 3 .jsonl files, got {len(jsonls)}"
+    raw_jsonls = list((tmp_path / "raw_text").glob("*.jsonl"))
+    assert len(raw_jsonls) == 3, f"Expected 3 raw_text files, got {len(raw_jsonls)}"

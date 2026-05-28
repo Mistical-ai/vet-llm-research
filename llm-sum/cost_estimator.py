@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from models_config import all_providers, compute_cost, get_model_spec  # noqa: E402
-from prepare_texts import iter_processed_texts  # noqa: E402
+from prepare_texts import iter_cached_texts  # noqa: E402
 from utils import BUDGET_HARD_STOP  # noqa: E402
 
 # A conservative GPT-family ratio for English scientific text:
@@ -73,11 +73,15 @@ def estimate_summarisation(
     processed_dir: Path = PROCESSED_DIR,
     *,
     batched: bool,
+    input_source: str = "processed",
 ) -> list[CostBreakdown]:
     """
     Estimate per-provider summarisation cost across all cached texts.
     """
-    token_counts = [count_tokens(text) for _slug, text in iter_processed_texts(processed_dir)]
+    token_counts = [
+        count_tokens(text)
+        for _slug, text in iter_cached_texts(input_source, processed_dir)
+    ]
     if not token_counts:
         return []
 
@@ -114,11 +118,15 @@ def estimate_evaluation(
     judge_providers: list[str],
     summariser_providers: list[str],
     batched: bool,
+    input_source: str = "processed",
 ) -> float:
     """
     Estimate judge cost. Each judge scores each (paper, summariser) pair.
     """
-    paper_token_counts = [count_tokens(t) for _, t in iter_processed_texts(processed_dir)]
+    paper_token_counts = [
+        count_tokens(t)
+        for _, t in iter_cached_texts(input_source, processed_dir)
+    ]
     if not paper_token_counts:
         return 0.0
 
@@ -139,6 +147,7 @@ def print_report(
     evaluation_total: float,
     *,
     batched: bool,
+    input_source: str,
 ) -> None:
     """Pretty-print the forecast in a single readable block."""
     if not summarisation:
@@ -149,6 +158,7 @@ def print_report(
     n_papers = summarisation[0].paper_count
     print(f"\n[phase3:estimate] Cost forecast for {n_papers} paper(s)")
     print(f"  Mode: {'BATCH (50% off where supported)' if batched else 'REAL-TIME'}")
+    print(f"  Input source: {input_source}")
     print(f"  Output tokens per summary: {MAX_OUTPUT_TOKENS}\n")
 
     summ_total = 0.0
@@ -175,12 +185,20 @@ def print_report(
         print("  Budget hard stop       : $0.00  (set BUDGET_HARD_STOP in .env before running)")
 
 
-def run(*, batched: bool, judge_providers: list[str]) -> None:
+def run(*, batched: bool, judge_providers: list[str],
+        input_source: str = "processed") -> None:
     """Top-level convenience used by run_phase3.py."""
-    summ = estimate_summarisation(batched=batched)
+    root = RAW_TEXT_DIR if input_source == "raw_text" else PROCESSED_DIR
+    summ = estimate_summarisation(
+        processed_dir=root,
+        batched=batched,
+        input_source=input_source,
+    )
     eval_total = estimate_evaluation(
+        processed_dir=root,
         judge_providers=judge_providers,
         summariser_providers=list(all_providers()),
         batched=batched,
+        input_source=input_source,
     )
-    print_report(summ, eval_total, batched=batched)
+    print_report(summ, eval_total, batched=batched, input_source=input_source)

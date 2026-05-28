@@ -59,7 +59,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "llm-sum"))
 
-import pdfplumber  # noqa: E402
+from extract import extract_text_from_pdf  # noqa: E402
 from file_paths import descriptive_stem, doi_to_slug  # noqa: E402
 
 DATA_DIR = REPO_ROOT / "data"
@@ -170,17 +170,17 @@ def _read_cleaned_counts(jsonl_path: Path) -> tuple[int, int] | None:
 
 def _raw_pdf_stats(pdf_path: Path) -> tuple[int, int] | None:
     """
-    Return ``(page_count, raw_word_count)`` from an unfiltered pdfplumber pass.
+    Return ``(page_count, raw_word_count)`` from the same column-aware
+    pdfplumber extraction path used by Phase 3.
     """
     try:
+        import pdfplumber  # noqa: E402
         with pdfplumber.open(pdf_path) as pdf:
             pages = len(pdf.pages)
-            chunks: list[str] = []
-            for page in pdf.pages:
-                chunk = page.extract_text() or ""
-                chunks.append(chunk)
-            raw_text = "\n".join(chunks)
     except Exception:
+        return None
+    raw_text = extract_text_from_pdf(pdf_path)
+    if raw_text is None:
         return None
     return pages, len(raw_text.split())
 
