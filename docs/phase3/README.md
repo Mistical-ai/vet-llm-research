@@ -184,13 +184,20 @@ python llm-sum/run_phase3.py summarize              # do it
 
 Sends each paper's clean text to all three models with identical settings (`temperature=0`, fixed seed) and records each summary plus the exact model version and token counts.
 
-By default, summarization uses `data/processed/` because that is the research-quality input: full body text, publisher boilerplate removed, references removed. For a small quality/cost comparison, run `single` or `dev` mode with `--input-source raw_text` to send the raw extracted JSONL instead:
+The real-time summariser asks every provider to fill the same structured `VeterinarySummary` schema. This means each model slot contains a normal readable `summary` for judging and a `structured_summary` dictionary with fields like `headline`, `sample_size`, `key_findings`, and `clinical_significance`. The schema catches malformed outputs before they enter `data/summaries.jsonl`.
+
+By default, summarization uses `data/processed/` because that is the research-quality input: full body text, publisher boilerplate removed, references removed. For a small quality/cost comparison, you can also run against either the raw extracted JSONL or the original PDF.
 
 ```powershell
 python llm-sum/run_phase3.py summarize --mode single --input-source processed
 python llm-sum/run_phase3.py summarize --mode single --input-source raw_text
 python llm-sum/run_phase3.py summarize --mode single --estimate --input-source raw_text
+python llm-sum/run_phase3.py summarize --mode single --input-source pdf
 ```
+
+For your 6-summary PDF-vs-JSONL check, run the processed JSONL command once and the direct PDF command once. Each command sends the same paper to OpenAI, Anthropic, and Gemini, so `processed` gives 3 summaries and `pdf` gives 3 more. Direct PDF input is intentionally limited to `test` and `single`; it is not available in `dev` or `batch`.
+
+If you want the summaries to follow your own human-written style, paste your sample summary into `llm-sum/prompts/guide_summary_template.txt` before running `summarize`. The guide is treated as a template for section order, headings, tone, and detail level only. The prompt explicitly warns the LLM not to copy facts, numbers, species, diseases, treatments, outcomes, or conclusions from the guide into summaries for other papers.
 
 *Expect (in `single` mode):*
 ```
@@ -333,9 +340,9 @@ Investigate every FAIL before paying for summaries:
 | `cleaned words < 1500` | Reference stripping or watermark cleaning removed too much, or the article is genuinely short. | Compare `data/raw_text/` and `data/processed/`; if body sections disappeared, fix the extraction/cleaning rule before summarizing. |
 | `ratio < 0.30` | The body may have been over-stripped, often because a reference heading was detected too early. | Check where the processed text stops. If it stops before Results/Discussion, debug reference removal. |
 
-### Raw vs processed summaries look different
+### PDF, raw_text, and processed summaries look different
 
-That is expected. `raw_text` includes references and publisher boilerplate, so it usually costs more and can distract the LLM. `processed` is the intended research input because it preserves the paper body while removing the reference section and noise. Use raw comparisons only in `single` or `dev` mode to prove the cleaning step is improving quality and cost.
+That is expected. `pdf` sends the original PDF file directly to the provider, `raw_text` sends the uncleaned extracted text, and `processed` sends the cleaned article body. `raw_text` includes references and publisher boilerplate, so it usually costs more and can distract the LLM. `processed` is the intended research input because it preserves the paper body while removing the reference section and noise. Use direct PDF comparisons only in `test` or `single` mode to measure whether provider PDF handling is worth the cost.
 
 ## 10. If something else goes wrong
 

@@ -4,6 +4,8 @@
 
 Forecasts the USD cost of a summarisation + evaluation run **without making any API calls**. By default it reads cached cleaned text from `data/processed/*.jsonl`; with `--input-source raw_text` through `run_phase3.py`, it reads `data/raw_text/*.jsonl` so you can compare how much extra it would cost to send raw extracted PDF text. It tokenises with `tiktoken` (or falls back to `words × 1.33` if tiktoken is missing), and applies the per-million-token prices from [`llm-sum/models_config.py`](../../llm-sum/models_config.py).
 
+Direct PDF input is different: `--input-source pdf` sends the actual PDF file to each provider's PDF ingestion path, so this offline estimator cannot reliably predict the token count. For PDF comparisons, use `--mode single --input-source pdf`; the summarizer records real token counts and cost from the provider responses.
+
 The forecast respects the current `PHASE3_MODE`: in `batch` mode the per-provider batch discount is applied where supported.
 
 ## When to run it
@@ -18,6 +20,7 @@ The forecast respects the current `PHASE3_MODE`: in `batch` mode the per-provide
 |----------------------------|-------------------------------------------------------------------------|
 | `data/processed/*.jsonl`   | Cached cleaned text; iterated for token counts.                         |
 | `data/raw_text/*.jsonl`    | Optional raw extracted text when estimating with `--input-source raw_text`. |
+| `data/raw/*.pdf`           | Not estimated offline; direct PDF token counts come from live provider responses. |
 | `llm-sum/models_config.py` | Prices per million tokens, batch discount flags.                        |
 | `.env`                     | `BUDGET_HARD_STOP`, `MAX_OUTPUT_TOKENS`, `JUDGE_MODELS`.                 |
 
@@ -32,6 +35,7 @@ This script is normally invoked indirectly:
 ```powershell
 python llm-sum/run_phase3.py summarize --estimate
 python llm-sum/run_phase3.py summarize --estimate --input-source raw_text
+# Not supported: python llm-sum/run_phase3.py summarize --estimate --input-source pdf
 ```
 
 You can also call it directly:
@@ -54,6 +58,7 @@ python llm-sum/cost_estimator.py     # works if you import + invoke its run() fu
 | Symptom                                                              | Cause                                              | Fix                                                              |
 |----------------------------------------------------------------------|----------------------------------------------------|------------------------------------------------------------------|
 | `No cached texts in data/processed/` or `data/raw_text/`             | `prepare_texts.py` has not run, or raw caches predate this feature. | `python llm-sum/run_phase3.py extract`.                          |
+| `Direct PDF cost cannot be estimated offline`                        | PDF token counts are provider-specific and only known after a live call. | Run `python llm-sum/run_phase3.py summarize --mode single --input-source pdf`. |
 | Token counts look ~5-10% off                                         | Fallback to `words × 1.33` because tiktoken isn't installed. | `pip install tiktoken` (already in `requirements.txt`).      |
 | Forecast says `OVER BUDGET`                                          | Real cost would exceed `BUDGET_HARD_STOP`.         | Either raise the budget in `.env` or reduce paper count via `--mode dev` / `--limit`. |
 

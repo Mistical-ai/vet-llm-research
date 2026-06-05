@@ -45,6 +45,7 @@ from __future__ import annotations
 from _bootstrap import *  # noqa: F401,F403
 
 import argparse
+import base64
 import json
 import os
 import sys
@@ -53,25 +54,162 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from models_config import all_providers, compute_cost, get_model_spec  # noqa: E402
-from file_paths import doi_to_slug  # noqa: E402
+from file_paths import doi_to_slug, resolve_existing_pdf_path  # noqa: E402
 from utils import BudgetGuard, log_error, sleep_for_model  # noqa: E402
 from extract import truncate_to_limit  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
+RAW_DIR = DATA_DIR / "raw"
 
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 SEED = int(os.getenv("SEED", "42"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "500"))
 PROMPT_FILE = Path(os.getenv("PROMPT_FILE", "llm-sum/prompts/summarization_v1.txt"))
+GUIDE_SUMMARY_FILE = Path(
+    os.getenv("GUIDE_SUMMARY_FILE", "llm-sum/prompts/guide_summary_template.txt")
+)
 
 # Maximum characters of article text sent to the LLM. 0 = no limit (use
 # full cached text). Set via MAX_INPUT_CHARS in .env to tune cost vs coverage.
 # 40 000 chars ≈ 10 000 tokens ≈ a full 15-page research article.
 MAX_INPUT_CHARS: int = int(os.getenv("MAX_INPUT_CHARS", "0"))
-VALID_INPUT_SOURCES = ("processed", "raw_text")
+VALID_INPUT_SOURCES = ("processed", "raw_text", "pdf")
+
+
+# ---------------------------------------------------------------------------
+# Structured summary schema
+# ---------------------------------------------------------------------------
+
+class VeterinarySummary(BaseModel):
+    """
+    One provider-independent schema for every Phase 3 clinical summary.
+
+    The native structured-output APIs use this model as their contract. The
+    local code also validates every provider response against it before writing
+    to data/summaries.jsonl, so downstream analysis receives a predictable
+    database-shaped object instead of provider-specific prose.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    headline: str = Field(
+        description=(
+            "One concise sentence stating the most clinically important takeaway "
+            "from the article. Use only information supported by the article text."
+        ),
+    )
+    objective: str = Field(
+        description=(
+            "The article's research question, objective, or hypothesis. Write "
+            "'Not reported' if the article does not state one clearly."
+        ),
+    )
+    study_design: str = Field(
+        description=(
+            "The study design reported by the article, such as retrospective "
+            "cohort, randomized trial, cross-sectional survey, case-control, "
+            "experimental study, or 'Not reported'."
+        ),
+    )
+    species: str = Field(
+        description=(
+            "Animal species or population studied, for example dogs, cats, "
+            "horses, cattle, mixed species, or 'Not reported'."
+        ),
+    )
+    sample_size: int | None = Field(
+        default=None,
+        description=(
+            "Number of animals, samples, records, owners, or cases analyzed. "
+            "Use null if no sample size is reported. Do not guess."
+        ),
+    )
+    key_methods: list[str] = Field(
+        description=(
+            "Main methods, interventions, exposures, measurements, comparisons, "
+            "or statistical approach. Each item must be directly supported by "
+            "the article text."
+        ),
+    )
+    key_findings: list[str] = Field(
+        description=(
+            "Most important findings, prioritizing quantitative results and "
+            "clinically meaningful outcomes. Include exact numbers only when "
+            "they appear in the source text."
+        ),
+    )
+    clinical_significance: str = Field(
+        description=(
+            "How a practicing veterinarian should interpret or apply the "
+            "findings. Avoid advice that goes beyond the article."
+        ),
+    )
+    limitations: list[str] = Field(
+        description=(
+            "Important limitations, caveats, population constraints, or sources "
+            "of uncertainty stated or directly implied by the article."
+        ),
+    )
+    summary_text: str = Field(
+        description=(
+            "A readable clinical prose summary under 400 words. It must include "
+            "Objective, Key Methods, Primary Results, and Clinical Significance, "
+            "and must not include unsupported facts."
+        ),
+    )
+
+
+def veterinary_summary_to_result(parsed: VeterinarySummary) -> dict:
+    """
+    Convert a validated Pydantic summary into the repo's provider result shape.
+
+    Beginners' guide:
+      - parsed.model_dump() turns the Pydantic object into a normal dict.
+      - parsed.model_dump_json() turns it into a perfect JSON string for JSONL.
+      - The plain-prose summary remains available at parsed.summary_text so the
+        existing blind evaluator can keep judging readable summaries.
+    """
+    parsed = VeterinarySummary.model_validate(parsed)
+    return {
+        "summary": parsed.summary_text,
+        "structured_summary": parsed.model_dump(),
+    }
+
+
+def append_veterinary_summary_jsonl_example(parsed: VeterinarySummary, path: Path) -> None:
+    """
+    Educational example: append one schema-perfect summary row to a JSONL file.
+
+    The production pipeline writes richer rows that include DOI, model name,
+    token counts, and timestamps. This helper intentionally shows only the core
+    Pydantic pattern for learning purposes.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(parsed.model_dump_json() + "\n")
+
+
+def _successful_summary_result(
+    *,
+    parsed: VeterinarySummary,
+    input_tokens: int,
+    output_tokens: int,
+    model_version: str,
+) -> dict:
+    """Wrap a validated summary with provider metadata used downstream."""
+    result = veterinary_summary_to_result(parsed)
+    result.update({
+        "status": "success",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "model_version": model_version,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return result
 
 
 def _is_dry_run() -> bool:
@@ -112,6 +250,71 @@ def load_prompt(prompt_file: Path = PROMPT_FILE) -> str:
     return template
 
 
+def _resolve_repo_path(path: Path) -> Path:
+    """Resolve relative config paths from the repository root, not the shell cwd."""
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def load_optional_guide_summary(guide_file: Path | None = GUIDE_SUMMARY_FILE) -> str | None:
+    """
+    Load the user's human-written format guide, if one exists.
+
+    This is intentionally optional. If the file is missing or empty, the pipeline
+    behaves exactly like before. That lets the user add a guide for prompt
+    experiments without changing the production summarisation path by accident.
+    """
+    if guide_file is None:
+        return None
+
+    path = _resolve_repo_path(guide_file)
+    if not path.exists():
+        return None
+
+    guide = path.read_text(encoding="utf-8").strip()
+    return guide or None
+
+
+def apply_guide_summary_to_prompt(template: str, guide_summary: str | None) -> str:
+    """
+    Add a format-only guide summary to the prompt without making it source data.
+
+    The guide is wrapped in a warning block that tells the LLM to copy only the
+    section order, tone, and level of detail. The important research-safety rule:
+    no species, diseases, numbers, treatments, or conclusions from the guide may
+    appear in a new summary unless they are also in the target article.
+    """
+    if not guide_summary:
+        return template
+
+    guide_block = (
+        "Format guide summary (structure only, not source evidence):\n"
+        "The following human-written summary is ONLY a formatting example. Use it "
+        "for section names, section order, tone, and level of detail. Do NOT copy "
+        "its species, diseases, treatments, numbers, outcomes, conclusions, or "
+        "any other factual claims. Every fact in your output must come from the "
+        "target article/PDF, not from this guide.\n"
+        "<FORMAT_GUIDE_SUMMARY>\n"
+        f"{guide_summary}\n"
+        "</FORMAT_GUIDE_SUMMARY>"
+    )
+
+    article_marker = "Article text:\n{ARTICLE_TEXT}"
+    if article_marker in template:
+        return template.replace(
+            article_marker,
+            f"{guide_block}\n\n{article_marker}",
+            1,
+        )
+
+    # Fallback for future prompt templates: keep the guide before the article
+    # content so the target paper remains the final source material in the prompt.
+    return template.replace(
+        "{ARTICLE_TEXT}",
+        f"{guide_block}\n\nTarget article:\n{{ARTICLE_TEXT}}",
+        1,
+    )
+
+
 def build_user_message(article_text: str, template: str | None = None) -> str:
     """
     Substitute the article text into the prompt template, applying
@@ -125,6 +328,24 @@ def build_user_message(article_text: str, template: str | None = None) -> str:
         article_text = truncate_to_limit(article_text, MAX_INPUT_CHARS)
     tmpl = template if template is not None else load_prompt()
     return tmpl.replace("{ARTICLE_TEXT}", article_text)
+
+
+def build_pdf_user_message(template: str | None = None) -> str:
+    """
+    Build the same summarisation instructions for a directly attached PDF.
+
+    The normal prompt has a slot named ``{ARTICLE_TEXT}`` because text-cache
+    runs paste the article body into the prompt. For direct-PDF runs, the paper
+    travels as a separate file attachment instead. We replace the slot with a
+    plain-English pointer so every provider gets the same task instructions
+    while reading the attached PDF itself.
+    """
+    tmpl = template if template is not None else load_prompt()
+    return tmpl.replace(
+        "{ARTICLE_TEXT}",
+        "The article is attached as a PDF file. Read the attached PDF and use "
+        "only information supported by that document.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,17 +362,38 @@ def _mock_summary(model_name: str, article_text: str, title_hint: str = "") -> d
     spec = get_model_spec(model_name)
     snippet = (article_text.strip().split("\n", 1)[0])[:120]
     summary = f"[MOCK {model_name}] {title_hint or snippet or 'summary'}".strip()
-    return {
-        "status": "success",
-        "summary": summary,
-        # Deterministic fake token counts proportional to input size so cost
-        # estimates from DRY_RUN are non-zero and the smoke test catches
-        # missing usage fields.
-        "input_tokens": max(100, len(article_text) // 4),
-        "output_tokens": 120,
-        "model_version": f"{spec.model_id}-DRYRUN",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    parsed = VeterinarySummary(
+        headline=summary,
+        objective="Not reported",
+        study_design="Not reported",
+        species="Not reported",
+        sample_size=None,
+        key_methods=["Mock dry-run method placeholder."],
+        key_findings=["Mock dry-run finding placeholder."],
+        clinical_significance="Mock dry-run clinical significance placeholder.",
+        limitations=["Mock dry-run limitation placeholder."],
+        summary_text=summary,
+    )
+    # Deterministic fake token counts proportional to input size so cost
+    # estimates from DRY_RUN are non-zero and the smoke test catches missing
+    # usage fields.
+    return _successful_summary_result(
+        parsed=parsed,
+        input_tokens=max(100, len(article_text) // 4),
+        output_tokens=120,
+        model_version=f"{spec.model_id}-DRYRUN",
+    )
+
+
+def _mock_pdf_summary(model_name: str, pdf_path: Path) -> dict:
+    """
+    Free test-mode stand-in for a direct-PDF API call.
+
+    We do not open or parse the PDF here. Test mode's job is only to prove the
+    pipeline wiring is correct without spending money, so the filename is enough
+    to create a deterministic fake summary with the same shape as a live result.
+    """
+    return _mock_summary(model_name, f"PDF input: {pdf_path.name}", title_hint=pdf_path.stem)
 
 
 # ---------------------------------------------------------------------------
@@ -169,27 +411,30 @@ def _call_openai(article_text: str, *, prompt_template: str | None) -> dict:
     user_message = build_user_message(article_text, prompt_template)
     client = openai.OpenAI()  # picks up OPENAI_API_KEY from env
 
-    response = client.chat.completions.create(
+    response = client.beta.chat.completions.parse(
         model=spec.model_id,
         messages=[{"role": "user", "content": user_message}],
         temperature=TEMPERATURE,
         max_tokens=MAX_OUTPUT_TOKENS,
         seed=SEED,
+        response_format=VeterinarySummary,
     )
 
-    return {
-        "status": "success",
-        "summary": response.choices[0].message.content or "",
+    parsed = response.choices[0].message.parsed
+    if parsed is None:
+        raise ValueError("OpenAI returned no parsed VeterinarySummary object.")
+
+    return _successful_summary_result(
+        parsed=VeterinarySummary.model_validate(parsed),
         # Pull tokens FROM the response, not estimated. This is the only way
         # BudgetGuard.total_spent will match the OpenAI dashboard charge.
-        "input_tokens": int(response.usage.prompt_tokens),
-        "output_tokens": int(response.usage.completion_tokens),
+        input_tokens=int(response.usage.prompt_tokens),
+        output_tokens=int(response.usage.completion_tokens),
         # `response.model` is the exact version OpenAI routed to, e.g.
         # "gpt-5.5-0325-preview" — not the alias "gpt-5.5" we requested.
         # Logging this lets us detect silent model updates across runs.
-        "model_version": str(response.model),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+        model_version=str(response.model),
+    )
 
 
 def _call_anthropic(article_text: str, *, prompt_template: str | None) -> dict:
@@ -205,21 +450,48 @@ def _call_anthropic(article_text: str, *, prompt_template: str | None) -> dict:
         max_tokens=MAX_OUTPUT_TOKENS,
         temperature=TEMPERATURE,
         messages=[{"role": "user", "content": user_message}],
+        tools=[{
+            "name": "VeterinarySummary",
+            "description": (
+                "Return the veterinary article summary using exactly the "
+                "VeterinarySummary schema."
+            ),
+            "input_schema": VeterinarySummary.model_json_schema(),
+        }],
+        tool_choice={"type": "tool", "name": "VeterinarySummary"},
     )
 
-    # Anthropic returns content as a list of TextBlock objects.
-    summary_text = "".join(
-        block.text for block in response.content if getattr(block, "type", "") == "text"
+    tool_input = _extract_anthropic_tool_input(response.content)
+    parsed = VeterinarySummary(**tool_input)
+
+    return _successful_summary_result(
+        parsed=parsed,
+        input_tokens=int(response.usage.input_tokens),
+        output_tokens=int(response.usage.output_tokens),
+        model_version=str(response.model),
     )
 
-    return {
-        "status": "success",
-        "summary": summary_text,
-        "input_tokens": int(response.usage.input_tokens),
-        "output_tokens": int(response.usage.output_tokens),
-        "model_version": str(response.model),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+
+def _extract_anthropic_tool_input(content_blocks) -> dict:
+    """
+    Return the forced VeterinarySummary tool input from an Anthropic response.
+
+    The SDK may expose blocks as typed objects or dicts depending on version and
+    tests, so this helper accepts both forms.
+    """
+    for block in content_blocks:
+        block_type = getattr(block, "type", None)
+        block_name = getattr(block, "name", None)
+        block_input = getattr(block, "input", None)
+        if isinstance(block, dict):
+            block_type = block.get("type", block_type)
+            block_name = block.get("name", block_name)
+            block_input = block.get("input", block_input)
+        if block_type == "tool_use" and block_name == "VeterinarySummary":
+            if not isinstance(block_input, dict):
+                raise ValueError("Anthropic VeterinarySummary tool input was not a dict.")
+            return block_input
+    raise ValueError("Anthropic response did not include the VeterinarySummary tool call.")
 
 
 def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
@@ -236,26 +508,199 @@ def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
         generation_config={
             "temperature": TEMPERATURE,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "response_mime_type": "application/json",
+            "response_schema": VeterinarySummary,
             # Gemini exposes a `seed` parameter via REST but the Python SDK
             # may ignore it; we still set TEMPERATURE=0.0 for determinism.
         },
     )
 
     usage = response.usage_metadata
-    return {
-        "status": "success",
-        "summary": response.text or "",
-        "input_tokens": int(usage.prompt_token_count),
-        "output_tokens": int(usage.candidates_token_count),
-        "model_version": spec.model_id,  # Gemini does not return a version string.
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    parsed = VeterinarySummary.model_validate_json(response.text)
+    return _successful_summary_result(
+        parsed=parsed,
+        input_tokens=int(usage.prompt_token_count),
+        output_tokens=int(usage.candidates_token_count),
+        model_version=spec.model_id,  # Gemini does not return a version string.
+    )
+
+
+def _response_usage_int(usage: object, *names: str) -> int:
+    """
+    Read a token count from SDK usage objects that may use different names.
+
+    Provider SDKs expose usage as small objects, not normal dictionaries. This
+    helper keeps the token-accounting code readable while still failing loudly
+    if a provider stops returning the usage field we charge against.
+    """
+    for name in names:
+        value = getattr(usage, name, None)
+        if value is not None:
+            return int(value)
+    raise AttributeError(f"Missing usage token field; tried {', '.join(names)}")
+
+
+def _extract_openai_parsed_summary(response: object) -> VeterinarySummary:
+    """
+    Return the parsed VeterinarySummary from OpenAI's SDK response.
+
+    Text runs use Chat Completions, while PDF runs use the newer Responses API.
+    The two response shapes store the parsed object in different places, so this
+    tiny adapter keeps the rest of the code provider-independent.
+    """
+    parsed = getattr(response, "output_parsed", None)
+    if parsed is not None:
+        return VeterinarySummary.model_validate(parsed)
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        parsed = getattr(choices[0].message, "parsed", None)
+        if parsed is not None:
+            return VeterinarySummary.model_validate(parsed)
+
+    raise ValueError("OpenAI returned no parsed VeterinarySummary object.")
+
+
+def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
+    """
+    Real-time OpenAI direct-PDF call.
+
+    We upload the PDF as ``purpose='user_data'`` and then ask the Responses API
+    to fill the same Pydantic schema used for text runs. This keeps PDF and
+    JSONL summaries comparable: same schema, same temperature, same output cap.
+    """
+    import openai  # type: ignore[import-not-found]
+
+    spec = get_model_spec("openai")
+    user_message = build_pdf_user_message(prompt_template)
+    client = openai.OpenAI()
+
+    with open(pdf_path, "rb") as f:
+        upload = client.files.create(file=f, purpose="user_data")
+
+    response = client.responses.parse(
+        model=spec.model_id,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_file", "file_id": upload.id},
+                {"type": "input_text", "text": user_message},
+            ],
+        }],
+        temperature=TEMPERATURE,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        text_format=VeterinarySummary,
+    )
+
+    parsed = _extract_openai_parsed_summary(response)
+    usage = response.usage
+    return _successful_summary_result(
+        parsed=parsed,
+        input_tokens=_response_usage_int(usage, "input_tokens", "prompt_tokens"),
+        output_tokens=_response_usage_int(usage, "output_tokens", "completion_tokens"),
+        model_version=str(getattr(response, "model", spec.model_id)),
+    )
+
+
+def _call_anthropic_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
+    """
+    Real-time Anthropic direct-PDF call.
+
+    Anthropic accepts PDFs as a base64 ``document`` block. We put that document
+    block before the text instructions so the model sees the source paper first
+    and then the exact schema-focused task it must complete.
+    """
+    import anthropic  # type: ignore[import-not-found]
+
+    spec = get_model_spec("anthropic")
+    user_message = build_pdf_user_message(prompt_template)
+    pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
+    client = anthropic.Anthropic()
+
+    response = client.messages.create(
+        model=spec.model_id,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        temperature=TEMPERATURE,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": pdf_b64,
+                    },
+                },
+                {"type": "text", "text": user_message},
+            ],
+        }],
+        tools=[{
+            "name": "VeterinarySummary",
+            "description": (
+                "Return the veterinary article summary using exactly the "
+                "VeterinarySummary schema."
+            ),
+            "input_schema": VeterinarySummary.model_json_schema(),
+        }],
+        tool_choice={"type": "tool", "name": "VeterinarySummary"},
+    )
+
+    tool_input = _extract_anthropic_tool_input(response.content)
+    return _successful_summary_result(
+        parsed=VeterinarySummary(**tool_input),
+        input_tokens=int(response.usage.input_tokens),
+        output_tokens=int(response.usage.output_tokens),
+        model_version=str(response.model),
+    )
+
+
+def _call_gemini_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
+    """
+    Real-time Gemini direct-PDF call.
+
+    Gemini's SDK uploads the PDF first, then the model receives a two-item input:
+    the uploaded file and the same instructions used everywhere else. The output
+    is still validated against VeterinarySummary before it is written to disk.
+    """
+    import google.generativeai as genai  # type: ignore[import-not-found]
+
+    spec = get_model_spec("gemini")
+    user_message = build_pdf_user_message(prompt_template)
+
+    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+    uploaded = genai.upload_file(path=str(pdf_path), mime_type="application/pdf")
+    model = genai.GenerativeModel(spec.model_id)
+    response = model.generate_content(
+        [uploaded, user_message],
+        generation_config={
+            "temperature": TEMPERATURE,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "response_mime_type": "application/json",
+            "response_schema": VeterinarySummary,
+        },
+    )
+
+    usage = response.usage_metadata
+    parsed = VeterinarySummary.model_validate_json(response.text)
+    return _successful_summary_result(
+        parsed=parsed,
+        input_tokens=int(usage.prompt_token_count),
+        output_tokens=int(usage.candidates_token_count),
+        model_version=spec.model_id,
+    )
 
 
 PROVIDER_CALLERS: dict[str, Callable[..., dict]] = {
     "openai": _call_openai,
     "anthropic": _call_anthropic,
     "gemini": _call_gemini,
+}
+
+PROVIDER_PDF_CALLERS: dict[str, Callable[..., dict]] = {
+    "openai": _call_openai_pdf,
+    "anthropic": _call_anthropic_pdf,
+    "gemini": _call_gemini_pdf,
 }
 
 
@@ -303,6 +748,56 @@ def generate_summary(
         doi="N/A",
         stage=f"summarize_{model_name}",
         message=f"All {max_retries} attempts failed: {last_error}",
+    )
+    return {
+        "status": "failed",
+        "error": str(last_error),
+        "summary": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "model_version": None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def generate_summary_from_pdf(
+    model_name: str,
+    pdf_path: Path,
+    *,
+    prompt_template: str | None = None,
+    max_retries: int = 3,
+) -> dict:
+    """
+    Route one directly attached PDF to a provider and return the normal result.
+
+    This is separate from ``generate_summary`` because direct PDF handling is
+    provider-specific: OpenAI uploads a file ID, Anthropic sends base64, and
+    Gemini uses ``upload_file``. Keeping it in one router means the run loop
+    still records costs and summaries exactly the same way for all input types.
+    """
+    if model_name not in PROVIDER_PDF_CALLERS:
+        raise KeyError(f"Unknown provider '{model_name}'")
+
+    if DRY_RUN or _is_dry_run():
+        return _mock_pdf_summary(model_name, pdf_path)
+
+    caller = PROVIDER_PDF_CALLERS[model_name]
+    last_error: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return caller(pdf_path, prompt_template=prompt_template)
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"[phase3:summarize] {model_name} PDF attempt {attempt+1} failed: {exc}; "
+                      f"retrying in {wait}s")
+                time.sleep(wait)
+
+    log_error(
+        doi="N/A",
+        stage=f"summarize_pdf_{model_name}",
+        message=f"All {max_retries} PDF attempts failed: {last_error}",
     )
     return {
         "status": "failed",
@@ -470,6 +965,17 @@ def _read_cached_text(record_or_doi, input_source: str = "processed") -> str | N
     return _shared_read(record_or_doi, input_source=input_source)
 
 
+def _read_pdf_path(record_or_doi) -> Path | None:
+    """
+    Locate the source PDF for a manifest record.
+
+    The shared path helper checks both current descriptive filenames and older
+    DOI-only filenames, so users do not have to rename existing files before
+    trying a direct-PDF comparison.
+    """
+    return resolve_existing_pdf_path(RAW_DIR, record_or_doi)
+
+
 def run_realtime(
     *,
     manifest_path: Path = MANIFEST_PATH,
@@ -477,12 +983,17 @@ def run_realtime(
     paper_limit: int | None = None,
     providers: list[str] | None = None,
     input_source: str = "processed",
+    guide_summary_path: Path | None = GUIDE_SUMMARY_FILE,
 ) -> dict[str, int]:
     """
     Sequentially summarise each paper across each provider in real time.
     """
     providers = providers or list(all_providers())
-    prompt_template = load_prompt()
+    guide_summary_path = guide_summary_path or GUIDE_SUMMARY_FILE
+    guide_summary = load_optional_guide_summary(guide_summary_path)
+    prompt_template = apply_guide_summary_to_prompt(load_prompt(), guide_summary)
+    if guide_summary:
+        print(f"[phase3:summarize] using format guide: {_resolve_repo_path(guide_summary_path)}")
     # Always keep rows from other papers/input sources. ``resume`` only decides
     # whether already-successful model slots are skipped or refreshed.
     existing = load_existing_summaries()
@@ -505,8 +1016,23 @@ def run_realtime(
         # Pass the full manifest record so we can find the descriptive-named
         # cache file. Falls back to legacy {slug}.jsonl if a record is
         # missing journal/title or the migration hasn't happened yet.
-        article_text = _read_cached_text(record, input_source=input_source)
-        if article_text is None:
+        article_text: str | None = None
+        pdf_path: Path | None = None
+        if input_source == "pdf":
+            pdf_path = _read_pdf_path(record)
+        else:
+            # Pass the full manifest record so we can find the descriptive-named
+            # cache file. Falls back to legacy {slug}.jsonl if a record is
+            # missing journal/title or the migration hasn't happened yet.
+            article_text = _read_cached_text(record, input_source=input_source)
+
+        if input_source == "pdf" and pdf_path is None:
+            counts["no_text"] += 1
+            log_error(doi, "summarize",
+                      f"No PDF file found for {slug} in data/raw (looked for "
+                      "descriptive name + legacy DOI filename)")
+            continue
+        if input_source != "pdf" and article_text is None:
             counts["no_text"] += 1
             log_error(doi, "summarize",
                       f"No {input_source} cached text for {slug} (looked for "
@@ -528,7 +1054,13 @@ def run_realtime(
                 continue
 
             sleep_for_model(provider)
-            result = generate_summary(provider, article_text, prompt_template=prompt_template)
+            if input_source == "pdf":
+                # pdf_path is known to be present because missing PDFs were
+                # skipped above. This branch is the only place live direct-PDF
+                # calls happen, which keeps batch/dev runs safely text-only.
+                result = generate_summary_from_pdf(provider, pdf_path, prompt_template=prompt_template)
+            else:
+                result = generate_summary(provider, article_text, prompt_template=prompt_template)
 
             entry["models"][provider] = result
 
@@ -571,7 +1103,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Comma-separated provider keys (subset of openai,anthropic,gemini).")
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--input-source", choices=VALID_INPUT_SOURCES, default="processed",
-                        help="Text cache to summarize: processed (default) or raw_text.")
+                        help="Input to summarize: processed (default), raw_text, or pdf.")
+    parser.add_argument("--guide-summary", type=Path, default=GUIDE_SUMMARY_FILE,
+                        help=("Optional human-written format guide. If the file exists and "
+                              "has text, it is used for structure only, never as source facts."))
     args = parser.parse_args(argv)
 
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
@@ -585,6 +1120,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.input_source == "raw_text" and profile.name not in {"test", "single", "dev"}:
         print("[phase3:summarize] raw_text input is limited to test/single/dev comparison runs.")
         return 1
+    if args.input_source == "pdf" and profile.name not in {"test", "single"}:
+        print("[phase3:summarize] direct PDF input is limited to test/single comparison runs.")
+        return 1
+    if args.input_source == "pdf" and profile.use_batch:
+        print("[phase3:summarize] direct PDF input is real-time only; batch mode is not supported.")
+        return 1
     print(f"[phase3:summarize] input_source={args.input_source}")
 
     if not confirm_real_batch(profile, force=args.force):
@@ -597,6 +1138,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest_path=args.manifest,
             resume=args.resume,
             providers=providers,
+            guide_summary_path=args.guide_summary,
         )
         return 0
 
@@ -606,6 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
         paper_limit=paper_limit,
         providers=providers,
         input_source=args.input_source,
+        guide_summary_path=args.guide_summary,
     )
     return 0
 

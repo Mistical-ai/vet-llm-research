@@ -210,6 +210,7 @@ def run_batch_summarisation(
     manifest_path: Path = MANIFEST_PATH,
     resume: bool = False,
     providers: list[str] | None = None,
+    guide_summary_path: Path | None = None,
 ) -> dict:
     """
     Build & submit summarisation batch jobs for OpenAI and Anthropic. Gemini
@@ -222,13 +223,20 @@ def run_batch_summarisation(
     from summarizer import (  # noqa: E402
         load_existing_summaries,
         load_prompt,
+        load_optional_guide_summary,
+        apply_guide_summary_to_prompt,
         build_user_message,
+        GUIDE_SUMMARY_FILE,
         _new_summary_entry,
         _write_all_summaries,
     )
 
     providers = providers or ["openai", "anthropic"]
-    prompt_template = load_prompt()
+    guide_summary_path = guide_summary_path or GUIDE_SUMMARY_FILE
+    guide_summary = load_optional_guide_summary(guide_summary_path)
+    prompt_template = apply_guide_summary_to_prompt(load_prompt(), guide_summary)
+    if guide_summary:
+        print(f"[phase3:batch] using format guide: {guide_summary_path}")
     existing = load_existing_summaries() if resume else {}
     summaries_by_doi: dict[str, dict] = dict(existing)
 

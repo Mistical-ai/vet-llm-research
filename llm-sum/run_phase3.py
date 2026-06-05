@@ -52,7 +52,21 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     profile = resolve_mode(args.mode)
     print(profile.banner())
 
+    if args.input_source == "pdf" and profile.name not in {"test", "single"}:
+        print("[phase3:summarize] direct PDF input is limited to test/single comparison runs.")
+        return 1
+    if args.input_source == "pdf" and profile.use_batch:
+        print("[phase3:summarize] direct PDF input is real-time only; batch mode is not supported.")
+        return 1
+
     if args.estimate:
+        if args.input_source == "pdf":
+            # Direct-PDF billing depends on each provider's file-ingestion path,
+            # so an offline tokenizer cannot predict it reliably. The live
+            # single-paper run records real token counts and cost after each call.
+            print("[phase3:estimate] Direct PDF cost cannot be estimated offline. "
+                  "Run single mode to record real token counts from the providers.")
+            return 1
         # Import lazily so a missing tiktoken / SDK doesn't break other commands.
         import os
         from cost_estimator import run as run_estimate
@@ -78,6 +92,8 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         delegate += ["--manifest", str(args.manifest)]
     if args.input_source:
         delegate += ["--input-source", args.input_source]
+    if args.guide_summary:
+        delegate += ["--guide-summary", str(args.guide_summary)]
     return summarize_main(delegate)
 
 
@@ -209,8 +225,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum.add_argument("--providers", default=None,
                        help="Comma-separated subset of providers.")
     p_sum.add_argument("--manifest", type=Path, default=None)
-    p_sum.add_argument("--input-source", choices=("processed", "raw_text"), default="processed",
-                       help="Text cache to use: processed (default) or raw_text for comparison.")
+    p_sum.add_argument("--input-source", choices=("processed", "raw_text", "pdf"),
+                       default="processed",
+                       help=("Input to summarize: processed JSONL (default), raw_text JSONL, "
+                             "or pdf for direct PDF comparison in test/single only."))
+    p_sum.add_argument("--guide-summary", type=Path, default=None,
+                       help=("Optional human-written format guide file. The guide controls "
+                             "section style only; facts must still come from the target paper."))
     p_sum.set_defaults(func=cmd_summarize)
 
     p_eval = sub.add_parser("evaluate", help="Run the blind judge.")

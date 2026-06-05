@@ -38,6 +38,7 @@ python llm-sum/run_phase3.py evaluate --help      # evaluate args
 python llm-sum/run_phase3.py extract
 python llm-sum/run_phase3.py summarize --estimate
 python llm-sum/run_phase3.py summarize --mode single
+python llm-sum/run_phase3.py summarize --mode single --input-source pdf
 python llm-sum/run_phase3.py summarize --mode dev --limit 3
 python llm-sum/run_phase3.py summarize --mode batch
 python llm-sum/run_phase3.py evaluate --mode dev
@@ -45,7 +46,7 @@ python llm-sum/run_phase3.py status
 python llm-sum/run_phase3.py clean
 ```
 
-Every subcommand accepts `--mode {test,single,dev,batch}` and most accept `--limit N`.
+Every subcommand accepts `--mode {test,single,dev,batch}` and most accept `--limit N`. For summarization, `--input-source processed` is the default, `--input-source raw_text` uses the raw extracted JSONL cache, and `--input-source pdf` sends the original PDF directly to providers. Direct PDF input is only allowed in `test` and `single`.
 
 ## The mode banner
 
