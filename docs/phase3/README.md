@@ -27,6 +27,14 @@ llm-sum/     the Phase 3 engine (summariser, judge, orchestrator, ...)
 scripts/     two helper tools you run by hand (verify, migrate)
 ```
 
+If you need a plain-English explanation of the project structure and methods, read the project-level guide first:
+
+```text
+docs/GUIDE.md
+```
+
+It explains the structure, methods, provider clients, safety controls, PDF-vs-JSONL comparison, and where outputs are stored.
+
 ---
 
 ## 2. The pipeline is four steps, always in this order
@@ -204,9 +212,9 @@ If you want the summaries to follow your own human-written style, paste your sam
 [phase3] mode=single | limit=1 | real-time | confirm-required
 [phase3:safety] About to submit REAL real-time API calls (limit=1).
   Type 'yes' to confirm: yes
-  openai: success    (in=4521, out=487, ver=gpt-5.5-0325-preview, $0.0223)
-  anthropic: success (in=4521, out=475, ver=claude-opus-4-6-..., $0.0214)
-  gemini: success    (in=4612, out=482, ver=gemini-3.1-pro, $0.0165)
+  openai: success    (in=4521, out=487, ver=gpt-5.4-0325-preview, $0.0223)
+  anthropic: success (in=4521, out=475, ver=claude-sonnet-4-6-..., $0.0214)
+  gemini: success    (in=4612, out=482, ver=gemini-3.5-flash, $0.0165)
 ```
 
 *Why `--estimate` first:* it tokenises your cached texts offline and tells you the projected bill *before* you commit. Cheap insurance against a surprise charge.

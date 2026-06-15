@@ -113,11 +113,18 @@ def test_missing_guide_summary_file_leaves_prompt_unchanged(tmp_path: Path) -> N
     assert summarizer.apply_guide_summary_to_prompt(template, None) == template
 
 
+def test_default_prompt_file_loads_and_keeps_article_placeholder() -> None:
+    template = summarizer.load_prompt()
+    assert "{ARTICLE_TEXT}" in template
+    prompt_template, _guide_summary, _guide_path = summarizer.load_prompt_with_optional_guide(None)
+    assert "{ARTICLE_TEXT}" in prompt_template
+
+
 # ---------------------------------------------------------------------------
 # Drift test: model_version comes from the response, not the request
 # ---------------------------------------------------------------------------
 
-def _fake_openai_response(specific_version: str = "gpt-5.5-0325-preview") -> SimpleNamespace:
+def _fake_openai_response(specific_version: str = "gpt-5.4-0325-preview") -> SimpleNamespace:
     parsed = summarizer.VeterinarySummary(**_valid_summary_dict())
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))],
@@ -130,12 +137,12 @@ def test_drift_openai_model_version_from_response(monkeypatch: pytest.MonkeyPatc
     # Drop both safeguards so the real-time path is exercised. PHASE3_MODE=single
     # is the lightest live mode; without flipping it the test-mode last-guardrail
     # in _is_dry_run() would short-circuit to a mock and the drift assertion
-    # would fail with "gpt-5.5-DRYRUN".
+    # would fail with "gpt-5.4-DRYRUN".
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("PHASE3_MODE", "single")
     monkeypatch.setattr(summarizer, "DRY_RUN", False)
 
-    fake_response = _fake_openai_response("gpt-5.5-0325-preview")
+    fake_response = _fake_openai_response("gpt-5.4-0325-preview")
     captured_kwargs = {}
 
     class _FakeCompletions:
@@ -154,13 +161,15 @@ def test_drift_openai_model_version_from_response(monkeypatch: pytest.MonkeyPatc
                                              prompt_template="X {ARTICLE_TEXT} Y")
 
     assert result["status"] == "success"
-    # Exact-version string preserved — NOT the alias "gpt-5.5".
-    assert result["model_version"] == "gpt-5.5-0325-preview"
+    # Exact-version string preserved — NOT the alias "gpt-5.4".
+    assert result["model_version"] == "gpt-5.4-0325-preview"
     assert result["model_version"] != "gpt-5"
     assert result["input_tokens"] == 1234
     assert result["output_tokens"] == 456
     assert result["summary"] == result["structured_summary"]["summary_text"]
     assert captured_kwargs["response_format"] is summarizer.VeterinarySummary
+    assert captured_kwargs["max_completion_tokens"] == summarizer.MAX_OUTPUT_TOKENS
+    assert "max_tokens" not in captured_kwargs
 
 
 def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,12 +179,11 @@ def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch
 
     captured_generation_config = {}
 
-    class _FakeGeminiModel:
-        def __init__(self, model_id):
-            self.model_id = model_id
-
-        def generate_content(self, _message, generation_config):
-            captured_generation_config.update(generation_config)
+    class _FakeModels:
+        def generate_content(self, model, contents, config):
+            captured_generation_config.update(config)
+            captured_generation_config["model"] = model
+            captured_generation_config["contents"] = contents
             return SimpleNamespace(
                 text=json.dumps(_valid_summary_dict()),
                 usage_metadata=SimpleNamespace(
@@ -184,14 +192,25 @@ def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch
                 ),
             )
 
+    class _FakeGeminiClient:
+        def __init__(self, api_key=None):
+            self.api_key = api_key
+            self.models = _FakeModels()
+
+    class _FakeTypes:
+        @staticmethod
+        def GenerateContentConfig(**kwargs):
+            return kwargs
+
     fake_genai = SimpleNamespace(
-        configure=lambda api_key=None: None,
-        GenerativeModel=_FakeGeminiModel,
+        Client=_FakeGeminiClient,
+        types=_FakeTypes,
     )
 
     with patch.dict("sys.modules", {
-        "google": SimpleNamespace(generativeai=fake_genai),
-        "google.generativeai": fake_genai,
+        "google": SimpleNamespace(genai=fake_genai),
+        "google.genai": fake_genai,
+        "google.genai.types": _FakeTypes,
     }):
         result = summarizer.generate_summary("gemini", "Article body.",
                                              prompt_template="X {ARTICLE_TEXT} Y")
@@ -201,7 +220,11 @@ def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch
     assert result["output_tokens"] == 22
     assert result["structured_summary"]["sample_size"] == 42
     assert captured_generation_config["response_mime_type"] == "application/json"
-    assert captured_generation_config["response_schema"] is summarizer.VeterinarySummary
+    assert captured_generation_config["contents"] == "X Article body. Y"
+    response_schema = captured_generation_config["response_schema"]
+    assert isinstance(response_schema, dict)
+    assert response_schema["properties"]["headline"]["type"] == "string"
+    assert "default" not in json.dumps(response_schema)
 
 
 def test_anthropic_tool_call_returns_validated_summary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -226,7 +249,7 @@ def test_anthropic_tool_call_returns_validated_summary(monkeypatch: pytest.Monke
                     )
                 ],
                 usage=SimpleNamespace(input_tokens=222, output_tokens=33),
-                model="claude-opus-4-6-test",
+                model="claude-sonnet-4-6-test",
             )
 
     with patch.dict("sys.modules", {
@@ -242,6 +265,22 @@ def test_anthropic_tool_call_returns_validated_summary(monkeypatch: pytest.Monke
     assert captured_kwargs["tool_choice"] == {"type": "tool", "name": "VeterinarySummary"}
     assert captured_kwargs["tools"][0]["name"] == "VeterinarySummary"
     assert "input_schema" in captured_kwargs["tools"][0]
+
+
+def test_partial_provider_payload_is_repaired_without_inventing_facts() -> None:
+    parsed = summarizer.coerce_veterinary_summary({
+        "headline": "Dietary carbohydrates were associated with disease.",
+        "objective": "Assess diet associations.",
+        "study_design": "Case-control study.",
+        "species": "Dogs",
+        "sample_size": 42,
+        "key_methods": ["Compared owner-reported diets."],
+    })
+
+    assert parsed.key_findings == []
+    assert parsed.clinical_significance == "Not reported"
+    assert parsed.limitations == []
+    assert parsed.summary_text.startswith("Objective: Assess diet associations.")
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +481,7 @@ def test_openai_pdf_call_uploads_file_and_parses_schema(
             return SimpleNamespace(
                 output_parsed=summarizer.VeterinarySummary(**_valid_summary_dict()),
                 usage=SimpleNamespace(input_tokens=3210, output_tokens=210),
-                model="gpt-5.5-pdf-test",
+                model="gpt-5.4-pdf-test",
             )
 
     class _FakeClient:
@@ -460,7 +499,7 @@ def test_openai_pdf_call_uploads_file_and_parses_schema(
     assert result["status"] == "success"
     assert result["input_tokens"] == 3210
     assert result["output_tokens"] == 210
-    assert result["model_version"] == "gpt-5.5-pdf-test"
+    assert result["model_version"] == "gpt-5.4-pdf-test"
     assert captured["file_purpose"] == "user_data"
     assert captured["file_name"] == "paper.pdf"
     content = captured["response_kwargs"]["input"][0]["content"]
@@ -531,13 +570,16 @@ def test_gemini_pdf_call_uploads_pdf(
     pdf_path.write_bytes(b"%PDF-1.4 direct pdf")
     captured = {}
 
-    class _FakeGeminiModel:
-        def __init__(self, model_id):
-            self.model_id = model_id
+    class _FakeFiles:
+        def upload(self, file):
+            captured["upload"] = {"file": file}
+            return SimpleNamespace(name="uploaded-paper")
 
-        def generate_content(self, parts, generation_config):
-            captured["parts"] = parts
-            captured["generation_config"] = generation_config
+    class _FakeModels:
+        def generate_content(self, model, contents, config):
+            captured["model"] = model
+            captured["contents"] = contents
+            captured["generation_config"] = config
             return SimpleNamespace(
                 text=json.dumps(_valid_summary_dict()),
                 usage_metadata=SimpleNamespace(
@@ -546,17 +588,26 @@ def test_gemini_pdf_call_uploads_pdf(
                 ),
             )
 
+    class _FakeGeminiClient:
+        def __init__(self, api_key=None):
+            self.api_key = api_key
+            self.files = _FakeFiles()
+            self.models = _FakeModels()
+
+    class _FakeTypes:
+        @staticmethod
+        def GenerateContentConfig(**kwargs):
+            return kwargs
+
     fake_genai = SimpleNamespace(
-        configure=lambda api_key=None: None,
-        upload_file=lambda path, mime_type: captured.setdefault(
-            "upload", {"path": path, "mime_type": mime_type}
-        ),
-        GenerativeModel=_FakeGeminiModel,
+        Client=_FakeGeminiClient,
+        types=_FakeTypes,
     )
 
     with patch.dict("sys.modules", {
-        "google": SimpleNamespace(generativeai=fake_genai),
-        "google.generativeai": fake_genai,
+        "google": SimpleNamespace(genai=fake_genai),
+        "google.genai": fake_genai,
+        "google.genai.types": _FakeTypes,
     }):
         result = summarizer.generate_summary_from_pdf(
             "gemini",
@@ -567,7 +618,458 @@ def test_gemini_pdf_call_uploads_pdf(
     assert result["status"] == "success"
     assert result["input_tokens"] == 5432
     assert result["output_tokens"] == 234
-    assert captured["upload"]["path"] == str(pdf_path)
-    assert captured["upload"]["mime_type"] == "application/pdf"
-    assert captured["generation_config"]["response_schema"] is summarizer.VeterinarySummary
-    assert "attached as a PDF" in captured["parts"][1]
+    assert captured["upload"]["file"] == str(pdf_path)
+    response_schema = captured["generation_config"]["response_schema"]
+    assert isinstance(response_schema, dict)
+    assert "default" not in json.dumps(response_schema)
+    assert captured["contents"][0].name == "uploaded-paper"
+    assert "attached as a PDF" in captured["contents"][1]
+
+
+# ---------------------------------------------------------------------------
+# Gemini schema: additionalProperties must also be stripped
+# ---------------------------------------------------------------------------
+
+def test_gemini_schema_strips_additional_properties() -> None:
+    schema = summarizer.gemini_response_schema()
+    schema_str = json.dumps(schema)
+    assert "additionalProperties" not in schema_str, (
+        "Gemini schema must not contain 'additionalProperties'; "
+        "it causes SDK validation errors."
+    )
+    assert "default" not in schema_str
+    # Core VeterinarySummary fields must still be present.
+    assert "properties" in schema
+    assert "headline" in schema["properties"]
+    assert "key_methods" in schema["properties"]
+
+
+# ---------------------------------------------------------------------------
+# OpenAI temperature retry
+# ---------------------------------------------------------------------------
+
+def test_openai_temperature_retry_omits_temperature_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When OpenAI rejects temperature, the caller retries without it."""
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("PHASE3_MODE", "single")
+    monkeypatch.setattr(summarizer, "DRY_RUN", False)
+
+    call_count = [0]
+    captured_kwargs: list[dict] = []
+
+    class _FakeCompletions:
+        def parse(self, **kwargs):
+            call_count[0] += 1
+            captured_kwargs.append(dict(kwargs))
+            if call_count[0] == 1:
+                raise Exception(
+                    "Unsupported parameter: temperature is not supported with this model"
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(
+                        parsed=summarizer.VeterinarySummary(**_valid_summary_dict())
+                    )
+                )],
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=50),
+                model="gpt-o1-test",
+            )
+
+    class _FakeClient:
+        def __init__(self):
+            self.beta = SimpleNamespace(
+                chat=SimpleNamespace(completions=_FakeCompletions())
+            )
+
+    with patch.dict("sys.modules", {"openai": SimpleNamespace(OpenAI=_FakeClient)}):
+        result = summarizer.generate_summary(
+            "openai", "Article body.", prompt_template="X {ARTICLE_TEXT} Y"
+        )
+
+    assert result["status"] == "success"
+    assert call_count[0] == 2, "Expected exactly two calls: one failed, one retry"
+    assert "temperature" in captured_kwargs[0], "First call must include temperature"
+    assert "temperature" not in captured_kwargs[1], "Retry must omit temperature"
+
+
+def test_openai_is_temperature_error_detection() -> None:
+    """Helper correctly identifies temperature-related errors only."""
+    assert summarizer._openai_is_temperature_error(
+        Exception("Unsupported parameter: temperature is not supported with this model")
+    )
+    assert summarizer._openai_is_temperature_error(
+        Exception("invalid_request_error: temperature is not supported")
+    )
+    assert not summarizer._openai_is_temperature_error(
+        Exception("Authentication error: invalid API key")
+    )
+    assert not summarizer._openai_is_temperature_error(
+        Exception("Rate limit exceeded")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Human-readable format
+# ---------------------------------------------------------------------------
+
+def test_format_human_readable_produces_numbered_sections() -> None:
+    structured = _valid_summary_dict()
+    text = summarizer._format_human_readable(structured)
+
+    assert "1. Objective" in text
+    assert "2. Key Methods" in text
+    assert "3. Primary Results" in text
+    assert "4. Clinical Significance" in text
+    assert "5. Limitations" in text
+    # Lists should be bullet-pointed.
+    assert "- Medical records were reviewed." in text
+    assert "- Clinical signs improved in 30 of 42 dogs." in text
+    # Sections must appear in order.
+    assert text.index("1. Objective") < text.index("2. Key Methods")
+    assert text.index("2. Key Methods") < text.index("3. Primary Results")
+    assert text.index("3. Primary Results") < text.index("4. Clinical Significance")
+    assert text.index("4. Clinical Significance") < text.index("5. Limitations")
+
+
+def test_enrich_result_adds_human_readable_on_success() -> None:
+    result = summarizer._mock_summary("openai", "Some article text.")
+    enriched = summarizer._enrich_result_with_human_readable(result)
+    assert "human_readable" in enriched
+    assert "1. Objective" in enriched["human_readable"]
+
+
+def test_enrich_result_skips_human_readable_on_failure() -> None:
+    failed = {
+        "status": "failed",
+        "error": "API error",
+        "summary": None,
+        "structured_summary": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "model_version": None,
+        "timestamp": "2026-06-14T00:00:00+00:00",
+    }
+    enriched = summarizer._enrich_result_with_human_readable(failed)
+    assert "human_readable" not in enriched
+
+
+# ---------------------------------------------------------------------------
+# Folder-based summarize_all_pdfs (test mode — no API calls)
+# ---------------------------------------------------------------------------
+
+def test_summarize_all_pdfs_test_mode_writes_output_files(
+    tmp_path: Path,
+) -> None:
+    """In test (DRY_RUN) mode every PDF gets 3 provider slots and a JSON output."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "paper1.pdf").write_bytes(b"%PDF-1.4 fake pdf 1")
+    (raw_dir / "paper2.pdf").write_bytes(b"%PDF-1.4 fake pdf 2")
+
+    pdf_output = tmp_path / "summaries_pdf"
+
+    counts = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai", "anthropic", "gemini"],
+    )
+
+    # 2 PDFs × 3 providers = 6 successes
+    assert counts["success"] == 6
+    assert counts["failed"] == 0
+
+    # One JSON file per PDF
+    assert (pdf_output / "paper1.json").exists()
+    assert (pdf_output / "paper2.json").exists()
+
+    for stem in ("paper1", "paper2"):
+        data = json.loads((pdf_output / f"{stem}.json").read_text(encoding="utf-8"))
+        assert data["source_type"] == "pdf"
+        assert data["source_filename"] == f"{stem}.pdf"
+        assert set(data["models"].keys()) == {"openai", "anthropic", "gemini"}
+        for prov_data in data["models"].values():
+            assert prov_data["status"] == "success"
+            assert "human_readable" in prov_data
+            assert "1. Objective" in prov_data["human_readable"]
+
+
+def test_summarize_all_pdfs_each_pdf_has_all_three_providers(
+    tmp_path: Path,
+) -> None:
+    """Every PDF output has all three provider keys regardless of which providers were requested."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "study.pdf").write_bytes(b"%PDF-1.4")
+
+    pdf_output = tmp_path / "summaries_pdf"
+    summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai", "anthropic", "gemini"],
+    )
+
+    data = json.loads((pdf_output / "study.json").read_text(encoding="utf-8"))
+    assert "openai" in data["models"]
+    assert "anthropic" in data["models"]
+    assert "gemini" in data["models"]
+
+
+def test_summarize_all_pdfs_resume_skips_successful_slots(
+    tmp_path: Path,
+) -> None:
+    """Resume skips provider slots that already have status=success."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "paper.pdf").write_bytes(b"%PDF-1.4")
+    pdf_output = tmp_path / "summaries_pdf"
+
+    # First run — all providers succeed.
+    counts_first = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai", "anthropic", "gemini"],
+    )
+    assert counts_first["success"] == 3
+
+    # Second run with resume — all slots already successful, so all are skipped.
+    counts_resume = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai", "anthropic", "gemini"],
+        resume=True,
+    )
+    assert counts_resume["skipped"] == 3
+    assert counts_resume["success"] == 0
+
+
+def test_summarize_all_pdfs_limit_respected(tmp_path: Path) -> None:
+    """limit= processes only the first N PDFs."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    for i in range(4):
+        (raw_dir / f"paper{i}.pdf").write_bytes(b"%PDF-1.4")
+
+    pdf_output = tmp_path / "summaries_pdf"
+    counts = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai"],
+        limit=2,
+    )
+    assert counts["success"] == 2
+    json_files = list(pdf_output.glob("*.json"))
+    assert len(json_files) == 2
+
+
+# ---------------------------------------------------------------------------
+# Folder-based summarize_all_processed_texts (test mode — no API calls)
+# ---------------------------------------------------------------------------
+
+def test_summarize_all_processed_texts_test_mode_writes_output_files(
+    tmp_path: Path,
+) -> None:
+    """In test mode every processed JSONL gets 3 provider slots by source stem."""
+    from file_paths import doi_to_slug
+
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+
+    dois = ["10.9999/alpha.0001", "10.9999/beta.0002"]
+    source_records = []
+    for doi in dois:
+        slug = doi_to_slug(doi)
+        source_stem = f"journal__study_title__{slug}"
+        source_records.append((doi, slug, source_stem))
+        entry = {"doi": doi, "slug": slug, "text": "Clinical trial body. " * 30}
+        (processed_dir / f"{source_stem}.jsonl").write_text(
+            json.dumps(entry) + "\n", encoding="utf-8"
+        )
+
+    txt_output = tmp_path / "summaries_txt"
+    counts = summarizer.summarize_all_processed_texts(
+        output_dir=txt_output,
+        processed_dir=processed_dir,
+        providers=["openai", "anthropic", "gemini"],
+    )
+
+    assert counts["success"] == 6
+    assert counts["failed"] == 0
+
+    json_files = list(txt_output.glob("*.json"))
+    assert len(json_files) == 2
+
+    for doi, slug, source_stem in source_records:
+        data = json.loads((txt_output / f"{source_stem}.json").read_text(encoding="utf-8"))
+        assert data["source_type"] == "processed_text"
+        assert data["source_filename"] == f"{source_stem}.jsonl"
+        assert data["doi"] == doi
+        assert data["slug"] == slug
+        assert set(data["models"].keys()) == {"openai", "anthropic", "gemini"}
+        for prov_data in data["models"].values():
+            assert prov_data["status"] == "success"
+            assert "human_readable" in prov_data
+
+
+def test_summarize_all_processed_texts_writes_to_summaries_txt_dir(
+    tmp_path: Path,
+) -> None:
+    """Processed outputs mirror the processed source stem in summaries_txt."""
+    from file_paths import doi_to_slug
+
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    doi = "10.9999/gamma.0003"
+    slug = doi_to_slug(doi)
+    source_stem = f"jvim__gamma_article__{slug}"
+    entry = {"doi": doi, "slug": slug, "text": "Some text. " * 40}
+    (processed_dir / f"{source_stem}.jsonl").write_text(
+        json.dumps(entry) + "\n", encoding="utf-8"
+    )
+
+    txt_output = tmp_path / "summaries_txt"
+    summarizer.summarize_all_processed_texts(
+        output_dir=txt_output,
+        processed_dir=processed_dir,
+        providers=["openai"],
+    )
+    assert (txt_output / f"{source_stem}.json").exists()
+    assert not (txt_output / f"{slug}.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Failed provider does not stop other providers or other files
+# ---------------------------------------------------------------------------
+
+def test_failed_provider_does_not_stop_other_providers_or_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    If one provider raises an unexpected error for one paper, the other
+    providers and other papers must still run and produce output.
+    """
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("PHASE3_MODE", "single")
+    monkeypatch.setattr(summarizer, "DRY_RUN", False)
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "paper1.pdf").write_bytes(b"%PDF-1.4")
+    (raw_dir / "paper2.pdf").write_bytes(b"%PDF-1.4")
+
+    call_tracker: list[tuple[str, str]] = []
+
+    def _fake_pdf_summary(provider: str, pdf_path: Path, **_kwargs) -> dict:
+        call_tracker.append((provider, pdf_path.name))
+        if provider == "anthropic" and pdf_path.name == "paper1.pdf":
+            raise RuntimeError("Simulated Anthropic failure")
+        return summarizer._mock_pdf_summary(provider, pdf_path)
+
+    monkeypatch.setattr(summarizer, "generate_summary_from_pdf", _fake_pdf_summary)
+
+    pdf_output = tmp_path / "summaries_pdf"
+    counts = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai", "anthropic", "gemini"],
+    )
+
+    # 2 papers × 3 providers = 6 calls total; 1 failed
+    assert len(call_tracker) == 6
+    assert counts["success"] == 5
+    assert counts["failed"] == 1
+
+    # paper1: anthropic slot is failed, others success
+    data1 = json.loads((pdf_output / "paper1.json").read_text(encoding="utf-8"))
+    assert data1["models"]["openai"]["status"] == "success"
+    assert data1["models"]["anthropic"]["status"] == "failed"
+    assert data1["models"]["gemini"]["status"] == "success"
+
+    # paper2: all success
+    data2 = json.loads((pdf_output / "paper2.json").read_text(encoding="utf-8"))
+    for prov in ("openai", "anthropic", "gemini"):
+        assert data2["models"][prov]["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# summarize-all CLI command (test mode)
+# ---------------------------------------------------------------------------
+
+def test_run_phase3_summarize_all_single_mode_limits_both_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """single mode means 1 PDF + 1 processed text, for 6 summaries total."""
+    import run_phase3
+
+    captured: dict[str, int | None] = {}
+
+    def _fake_load_prompt(_path=None):
+        return "Prompt {ARTICLE_TEXT}", None, Path("guide.txt")
+
+    def _fake_confirm(_profile, force=False):
+        return True
+
+    def _fake_pdfs(**kwargs):
+        captured["pdf_limit"] = kwargs["limit"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _fake_texts(**kwargs):
+        captured["txt_limit"] = kwargs["limit"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    monkeypatch.setattr(summarizer, "load_prompt_with_optional_guide", _fake_load_prompt)
+    monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
+    monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
+    monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+
+    ret = run_phase3.main(["summarize-all", "--mode", "single"])
+    assert ret == 0
+    assert captured == {"pdf_limit": 1, "txt_limit": 1}
+
+
+def test_run_phase3_summarize_all_rejects_batch_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """summarize-all must not silently turn batch mode into real-time PDF calls."""
+    import run_phase3
+
+    called = {"pdfs": False, "texts": False}
+
+    monkeypatch.setattr(
+        summarizer,
+        "summarize_all_pdfs",
+        lambda **_kwargs: called.__setitem__("pdfs", True),
+    )
+    monkeypatch.setattr(
+        summarizer,
+        "summarize_all_processed_texts",
+        lambda **_kwargs: called.__setitem__("texts", True),
+    )
+
+    ret = run_phase3.main(["summarize-all", "--mode", "batch"])
+    assert ret == 1
+    assert called == {"pdfs": False, "texts": False}
+
+
+# ---------------------------------------------------------------------------
+# Folder I/O helpers
+# ---------------------------------------------------------------------------
+
+def test_write_and_load_folder_output_round_trip(tmp_path: Path) -> None:
+    entry = {
+        "source_type": "pdf",
+        "source_filename": "test.pdf",
+        "doi": None,
+        "slug": "test",
+        "generated_at": "2026-06-14T00:00:00+00:00",
+        "models": {"openai": {"status": "success", "summary": "A mock summary."}},
+    }
+    summarizer._write_folder_output(tmp_path, "test", entry)
+    loaded = summarizer._load_folder_output(tmp_path, "test")
+    assert loaded == entry
+
+
+def test_load_folder_output_returns_none_when_missing(tmp_path: Path) -> None:
+    assert summarizer._load_folder_output(tmp_path, "nonexistent") is None

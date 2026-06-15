@@ -9,22 +9,23 @@
 ## Table of Contents
 
 1. [How the pipeline works (plain English)](#how-the-pipeline-works-plain-english)
-2. [First-time setup](#first-time-setup)
-3. [The 4 commands you need to know](#the-4-commands-you-need-to-know)
-4. [Step-by-step guide](#step-by-step-guide)
+2. [Project guide](#project-guide)
+3. [First-time setup](#first-time-setup)
+4. [The 4 commands you need to know](#the-4-commands-you-need-to-know)
+5. [Step-by-step guide](#step-by-step-guide)
    - [Step 1 — Build the paper list](#step-1--build-the-paper-list)
    - [Step 2 — Auto-download open-access PDFs](#step-2--auto-download-open-access-pdfs)
    - [Step 3 — Check your progress](#step-3--check-your-progress)
    - [Step 4 — Find out what's still missing](#step-4--find-out-whats-still-missing)
    - [Step 5 — Add papers manually](#step-5--add-papers-manually)
    - [Step 6 — Repeat until done](#step-6--repeat-until-done)
-5. [Understanding the folders](#understanding-the-folders)
-6. [Troubleshooting failed PDFs](#troubleshooting-failed-pdfs)
-7. [Optional / advanced commands](#optional--advanced-commands)
-8. [Corpus design](#corpus-design)
-9. [All environment variables (.env)](#all-environment-variables-env)
-10. [Design decisions](#design-decisions)
-11. [Glossary](#glossary)
+6. [Understanding the folders](#understanding-the-folders)
+7. [Troubleshooting failed PDFs](#troubleshooting-failed-pdfs)
+8. [Optional / advanced commands](#optional--advanced-commands)
+9. [Corpus design](#corpus-design)
+10. [All environment variables (.env)](#all-environment-variables-env)
+11. [Design decisions](#design-decisions)
+12. [Glossary](#glossary)
 
 ---
 
@@ -55,6 +56,25 @@ The workflow script is smart: before trying to match each PDF, it looks up the p
 ### Phase 3 (LLM summarisation & evaluation)
 
 Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. Extraction is column-aware for two-column journals such as JVIM and VRU, writes raw extracted text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with publisher noise and references removed. All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. See **[docs/phase3/README.md](docs/phase3/README.md)** for the mode cheat-sheet, raw-vs-processed comparison workflow, and a guide per script.
+
+---
+
+## Project guide
+
+If you need a simple explanation of the project structure and methods, start here:
+
+**[docs/GUIDE.md](docs/GUIDE.md)**
+
+That guide explains:
+
+- how the folders connect,
+- how data moves from PDF to text to summary to evaluation,
+- why JSONL files are used,
+- how OpenAI, Anthropic, and Gemini are called,
+- how the six-summary PDF-vs-JSONL comparison works,
+- how the format guide summary is used without copying facts,
+- how safety modes prevent accidental API spending,
+- and how to describe the project in a meeting.
 
 ---
 

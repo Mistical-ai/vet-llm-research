@@ -62,7 +62,7 @@ def build_openai_request(custom_id: str, user_message: str, model_id: str) -> di
             "model": model_id,
             "messages": [{"role": "user", "content": user_message}],
             "temperature": TEMPERATURE,
-            "max_tokens": MAX_OUTPUT_TOKENS,
+            "max_completion_tokens": MAX_OUTPUT_TOKENS,
             "seed": SEED,
         },
     }
@@ -222,9 +222,7 @@ def run_batch_summarisation(
     # have run first.
     from summarizer import (  # noqa: E402
         load_existing_summaries,
-        load_prompt,
-        load_optional_guide_summary,
-        apply_guide_summary_to_prompt,
+        load_prompt_with_optional_guide,
         build_user_message,
         GUIDE_SUMMARY_FILE,
         _new_summary_entry,
@@ -232,11 +230,11 @@ def run_batch_summarisation(
     )
 
     providers = providers or ["openai", "anthropic"]
-    guide_summary_path = guide_summary_path or GUIDE_SUMMARY_FILE
-    guide_summary = load_optional_guide_summary(guide_summary_path)
-    prompt_template = apply_guide_summary_to_prompt(load_prompt(), guide_summary)
+    prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(
+        guide_summary_path or GUIDE_SUMMARY_FILE
+    )
     if guide_summary:
-        print(f"[phase3:batch] using format guide: {guide_summary_path}")
+        print(f"[phase3:batch] using format guide: {resolved_guide_path}")
     existing = load_existing_summaries() if resume else {}
     summaries_by_doi: dict[str, dict] = dict(existing)
 

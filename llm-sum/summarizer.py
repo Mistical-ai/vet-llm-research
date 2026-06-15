@@ -9,7 +9,10 @@ provider (OpenAI, Anthropic, Gemini) is called with:
     - the same max output tokens.
 
 Every successful call returns the SAME dict shape so downstream code never
-branches on provider:
+branches on provider. Manifest-driven runs persist to ``data/summaries.jsonl``;
+folder-driven ``summarize-all`` runs persist one JSON file per source article
+under ``data/summaries_pdf/`` and ``data/summaries_txt/`` so the raw-PDF and
+processed-text comparisons stay separate.
 
     {
         "status": "success",
@@ -28,7 +31,7 @@ DESIGN DECISIONS
   fact that ``test`` is the resolved mode when ``PHASE3_MODE`` is unset.
 
 * Model versions are recorded EXACTLY as the provider returns them
-  (e.g. "gpt-5.5-0325-preview", not "gpt-5"). Providers silently update
+  (e.g. "gpt-5.4-0325-preview", not "gpt-5"). Providers silently update
   models behind a stable alias — logging the exact string is how we detect
   performance drift across reruns.
 
@@ -46,6 +49,7 @@ from _bootstrap import *  # noqa: F401,F403
 
 import argparse
 import base64
+import copy
 import json
 import os
 import sys
@@ -65,6 +69,8 @@ from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 RAW_DIR = DATA_DIR / "raw"
+SUMMARIES_PDF_DIR = DATA_DIR / "summaries_pdf"
+SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
 
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 SEED = int(os.getenv("SEED", "42"))
@@ -178,6 +184,82 @@ def veterinary_summary_to_result(parsed: VeterinarySummary) -> dict:
         "summary": parsed.summary_text,
         "structured_summary": parsed.model_dump(),
     }
+
+
+def _as_list(value: Any) -> list[str]:
+    """
+    Normalize provider output into a list of strings.
+
+    Some providers return a single paragraph where our schema expects a list.
+    Instead of throwing away an otherwise useful summary, this helper wraps that
+    text as one list item. Missing values become an empty list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _summary_text_from_payload(payload: dict[str, Any]) -> str:
+    """
+    Build readable prose when a provider omits the summary_text field.
+
+    This is a repair path for live model responses that mostly followed the
+    schema but left out one required field. The facts still come only from the
+    provider's extracted fields; we just assemble them into the prose field that
+    downstream evaluation expects.
+    """
+    parts = []
+    for label, key in (
+        ("Objective", "objective"),
+        ("Key Methods", "key_methods"),
+        ("Primary Results", "key_findings"),
+        ("Clinical Significance", "clinical_significance"),
+    ):
+        value = payload.get(key)
+        if isinstance(value, list):
+            value = " ".join(str(item).strip() for item in value if str(item).strip())
+        value = str(value or "").strip()
+        if value and value != "Not reported":
+            parts.append(f"{label}: {value}")
+    return " ".join(parts) or str(payload.get("headline") or "Not reported")
+
+
+def coerce_veterinary_summary(payload: Any) -> VeterinarySummary:
+    """
+    Validate provider output, filling safe placeholders for omitted fields.
+
+    The LLM APIs sometimes return a partial tool/schema object even when the
+    request says every field is required. This function keeps a real run from
+    failing just because one provider omitted, for example, ``limitations``.
+    Missing facts become "Not reported" or empty lists; we never invent numbers
+    or conclusions.
+    """
+    if isinstance(payload, VeterinarySummary):
+        return payload
+    if hasattr(payload, "model_dump"):
+        payload = payload.model_dump()
+    if not isinstance(payload, dict):
+        raise ValueError("VeterinarySummary payload was not a dict-like object.")
+
+    repaired = dict(payload)
+    repaired["headline"] = str(repaired.get("headline") or "Not reported")
+    repaired["objective"] = str(repaired.get("objective") or "Not reported")
+    repaired["study_design"] = str(repaired.get("study_design") or "Not reported")
+    repaired["species"] = str(repaired.get("species") or "Not reported")
+    repaired["sample_size"] = repaired.get("sample_size")
+    repaired["key_methods"] = _as_list(repaired.get("key_methods"))
+    repaired["key_findings"] = _as_list(repaired.get("key_findings"))
+    repaired["clinical_significance"] = str(
+        repaired.get("clinical_significance") or "Not reported"
+    )
+    repaired["limitations"] = _as_list(repaired.get("limitations"))
+    repaired["summary_text"] = str(
+        repaired.get("summary_text") or _summary_text_from_payload(repaired)
+    )
+    return VeterinarySummary.model_validate(repaired)
 
 
 def append_veterinary_summary_jsonl_example(parsed: VeterinarySummary, path: Path) -> None:
@@ -315,6 +397,23 @@ def apply_guide_summary_to_prompt(template: str, guide_summary: str | None) -> s
     )
 
 
+def load_prompt_with_optional_guide(
+    guide_summary_path: Path | None = GUIDE_SUMMARY_FILE,
+) -> tuple[str, str | None, Path]:
+    """
+    Load the final prompt template that will be sent to providers.
+
+    This small wrapper lets the CLI validate prompt files before asking the user
+    to confirm a paid run. If the required ``{ARTICLE_TEXT}`` placeholder is
+    missing, the script now fails early instead of waiting until after the user
+    types ``yes``.
+    """
+    resolved_guide_path = _resolve_repo_path(guide_summary_path or GUIDE_SUMMARY_FILE)
+    guide_summary = load_optional_guide_summary(guide_summary_path or GUIDE_SUMMARY_FILE)
+    prompt_template = apply_guide_summary_to_prompt(load_prompt(), guide_summary)
+    return prompt_template, guide_summary, resolved_guide_path
+
+
 def build_user_message(article_text: str, template: str | None = None) -> str:
     """
     Substitute the article text into the prompt template, applying
@@ -346,6 +445,42 @@ def build_pdf_user_message(template: str | None = None) -> str:
         "The article is attached as a PDF file. Read the attached PDF and use "
         "only information supported by that document.",
     )
+
+
+def _openai_completion_token_arg() -> dict[str, int]:
+    """
+    Return the output-token parameter used by current OpenAI chat models.
+
+    Newer reasoning-capable OpenAI models reject the older ``max_tokens`` name
+    and ask for ``max_completion_tokens`` instead. Keeping the choice in one
+    helper makes both real-time and batch request builders easy to update.
+    """
+    return {"max_completion_tokens": MAX_OUTPUT_TOKENS}
+
+
+def _remove_json_schema_keys(value: Any, blocked: set[str]) -> Any:
+    """
+    Recursively remove JSON-schema keys unsupported by a provider SDK.
+
+    Gemini's older ``google.generativeai`` SDK rejects Pydantic schema metadata
+    such as ``default``. Removing only metadata keeps the real required fields
+    intact while avoiding the SDK-side validation error.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _remove_json_schema_keys(item, blocked)
+            for key, item in value.items()
+            if key not in blocked
+        }
+    if isinstance(value, list):
+        return [_remove_json_schema_keys(item, blocked) for item in value]
+    return value
+
+
+def gemini_response_schema() -> dict[str, Any]:
+    """Return a Gemini-compatible copy of the VeterinarySummary JSON schema."""
+    schema = copy.deepcopy(VeterinarySummary.model_json_schema())
+    return _remove_json_schema_keys(schema, {"default", "additionalProperties"})
 
 
 # ---------------------------------------------------------------------------
@@ -400,10 +535,22 @@ def _mock_pdf_summary(model_name: str, pdf_path: Path) -> dict:
 # Provider-specific real-time callers
 # ---------------------------------------------------------------------------
 
+def _openai_is_temperature_error(exc: Exception) -> bool:
+    """Return True when exc says this OpenAI model doesn't accept temperature."""
+    msg = str(exc).lower()
+    return "temperature" in msg and (
+        "unsupported" in msg or "not supported" in msg or "invalid" in msg
+    )
+
+
 def _call_openai(article_text: str, *, prompt_template: str | None) -> dict:
     """
     Real-time OpenAI call. Imports the SDK lazily so unit tests that mock
     this function don't require the package to be installed.
+
+    Newer reasoning models (o1, o3, o4-mini) reject explicit temperature.
+    We try with temperature first; if the provider returns a temperature-
+    related error we retry without it rather than failing the whole run.
     """
     import openai  # type: ignore[import-not-found]
 
@@ -411,27 +558,34 @@ def _call_openai(article_text: str, *, prompt_template: str | None) -> dict:
     user_message = build_user_message(article_text, prompt_template)
     client = openai.OpenAI()  # picks up OPENAI_API_KEY from env
 
-    response = client.beta.chat.completions.parse(
-        model=spec.model_id,
-        messages=[{"role": "user", "content": user_message}],
-        temperature=TEMPERATURE,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        seed=SEED,
-        response_format=VeterinarySummary,
-    )
+    base_kwargs: dict[str, Any] = {
+        "model": spec.model_id,
+        "messages": [{"role": "user", "content": user_message}],
+        "response_format": VeterinarySummary,
+        **_openai_completion_token_arg(),
+    }
+    try:
+        response = client.beta.chat.completions.parse(
+            **base_kwargs, temperature=TEMPERATURE, seed=SEED
+        )
+    except Exception as exc:
+        if not _openai_is_temperature_error(exc):
+            raise
+        print(f"[phase3:summarize] {spec.model_id} rejected temperature — retrying without it.")
+        response = client.beta.chat.completions.parse(**base_kwargs)
 
     parsed = response.choices[0].message.parsed
     if parsed is None:
         raise ValueError("OpenAI returned no parsed VeterinarySummary object.")
 
     return _successful_summary_result(
-        parsed=VeterinarySummary.model_validate(parsed),
+        parsed=coerce_veterinary_summary(parsed),
         # Pull tokens FROM the response, not estimated. This is the only way
         # BudgetGuard.total_spent will match the OpenAI dashboard charge.
         input_tokens=int(response.usage.prompt_tokens),
         output_tokens=int(response.usage.completion_tokens),
         # `response.model` is the exact version OpenAI routed to, e.g.
-        # "gpt-5.5-0325-preview" — not the alias "gpt-5.5" we requested.
+        # "gpt-5.4-0325-preview" — not the alias "gpt-5.4" we requested.
         # Logging this lets us detect silent model updates across runs.
         model_version=str(response.model),
     )
@@ -462,7 +616,7 @@ def _call_anthropic(article_text: str, *, prompt_template: str | None) -> dict:
     )
 
     tool_input = _extract_anthropic_tool_input(response.content)
-    parsed = VeterinarySummary(**tool_input)
+    parsed = coerce_veterinary_summary(tool_input)
 
     return _successful_summary_result(
         parsed=parsed,
@@ -496,27 +650,29 @@ def _extract_anthropic_tool_input(content_blocks) -> dict:
 
 def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
     """Real-time Gemini call (no batch API)."""
-    import google.generativeai as genai  # type: ignore[import-not-found]
+    from google import genai  # type: ignore[import-not-found]
+    from google.genai import types  # type: ignore[import-not-found]
 
     spec = get_model_spec("gemini")
     user_message = build_user_message(article_text, prompt_template)
 
-    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    model = genai.GenerativeModel(spec.model_id)
-    response = model.generate_content(
-        user_message,
-        generation_config={
-            "temperature": TEMPERATURE,
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
-            "response_mime_type": "application/json",
-            "response_schema": VeterinarySummary,
-            # Gemini exposes a `seed` parameter via REST but the Python SDK
-            # may ignore it; we still set TEMPERATURE=0.0 for determinism.
-        },
+    # The newer google-genai SDK reads GEMINI_API_KEY automatically, but we pass
+    # it explicitly when present so .env-driven local runs are easy to reason
+    # about. This replaces the deprecated google.generativeai package.
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    response = client.models.generate_content(
+        model=spec.model_id,
+        contents=user_message,
+        config=types.GenerateContentConfig(
+            temperature=TEMPERATURE,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            response_mime_type="application/json",
+            response_schema=gemini_response_schema(),
+        ),
     )
 
     usage = response.usage_metadata
-    parsed = VeterinarySummary.model_validate_json(response.text)
+    parsed = coerce_veterinary_summary(json.loads(response.text))
     return _successful_summary_result(
         parsed=parsed,
         input_tokens=int(usage.prompt_token_count),
@@ -550,13 +706,13 @@ def _extract_openai_parsed_summary(response: object) -> VeterinarySummary:
     """
     parsed = getattr(response, "output_parsed", None)
     if parsed is not None:
-        return VeterinarySummary.model_validate(parsed)
+        return coerce_veterinary_summary(parsed)
 
     choices = getattr(response, "choices", None)
     if choices:
         parsed = getattr(choices[0].message, "parsed", None)
         if parsed is not None:
-            return VeterinarySummary.model_validate(parsed)
+            return coerce_veterinary_summary(parsed)
 
     raise ValueError("OpenAI returned no parsed VeterinarySummary object.")
 
@@ -578,19 +734,25 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     with open(pdf_path, "rb") as f:
         upload = client.files.create(file=f, purpose="user_data")
 
-    response = client.responses.parse(
-        model=spec.model_id,
-        input=[{
+    base_kwargs: dict[str, Any] = {
+        "model": spec.model_id,
+        "input": [{
             "role": "user",
             "content": [
                 {"type": "input_file", "file_id": upload.id},
                 {"type": "input_text", "text": user_message},
             ],
         }],
-        temperature=TEMPERATURE,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-        text_format=VeterinarySummary,
-    )
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "text_format": VeterinarySummary,
+    }
+    try:
+        response = client.responses.parse(**base_kwargs, temperature=TEMPERATURE)
+    except Exception as exc:
+        if not _openai_is_temperature_error(exc):
+            raise
+        print(f"[phase3:summarize] {spec.model_id} rejected temperature for PDF — retrying without it.")
+        response = client.responses.parse(**base_kwargs)
 
     parsed = _extract_openai_parsed_summary(response)
     usage = response.usage
@@ -648,7 +810,7 @@ def _call_anthropic_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
 
     tool_input = _extract_anthropic_tool_input(response.content)
     return _successful_summary_result(
-        parsed=VeterinarySummary(**tool_input),
+        parsed=coerce_veterinary_summary(tool_input),
         input_tokens=int(response.usage.input_tokens),
         output_tokens=int(response.usage.output_tokens),
         model_version=str(response.model),
@@ -663,26 +825,27 @@ def _call_gemini_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     the uploaded file and the same instructions used everywhere else. The output
     is still validated against VeterinarySummary before it is written to disk.
     """
-    import google.generativeai as genai  # type: ignore[import-not-found]
+    from google import genai  # type: ignore[import-not-found]
+    from google.genai import types  # type: ignore[import-not-found]
 
     spec = get_model_spec("gemini")
     user_message = build_pdf_user_message(prompt_template)
 
-    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    uploaded = genai.upload_file(path=str(pdf_path), mime_type="application/pdf")
-    model = genai.GenerativeModel(spec.model_id)
-    response = model.generate_content(
-        [uploaded, user_message],
-        generation_config={
-            "temperature": TEMPERATURE,
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
-            "response_mime_type": "application/json",
-            "response_schema": VeterinarySummary,
-        },
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    uploaded = client.files.upload(file=str(pdf_path))
+    response = client.models.generate_content(
+        model=spec.model_id,
+        contents=[uploaded, user_message],
+        config=types.GenerateContentConfig(
+            temperature=TEMPERATURE,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            response_mime_type="application/json",
+            response_schema=gemini_response_schema(),
+        ),
     )
 
     usage = response.usage_metadata
-    parsed = VeterinarySummary.model_validate_json(response.text)
+    parsed = coerce_veterinary_summary(json.loads(response.text))
     return _successful_summary_result(
         parsed=parsed,
         input_tokens=int(usage.prompt_token_count),
@@ -989,11 +1152,11 @@ def run_realtime(
     Sequentially summarise each paper across each provider in real time.
     """
     providers = providers or list(all_providers())
-    guide_summary_path = guide_summary_path or GUIDE_SUMMARY_FILE
-    guide_summary = load_optional_guide_summary(guide_summary_path)
-    prompt_template = apply_guide_summary_to_prompt(load_prompt(), guide_summary)
+    prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(
+        guide_summary_path
+    )
     if guide_summary:
-        print(f"[phase3:summarize] using format guide: {_resolve_repo_path(guide_summary_path)}")
+        print(f"[phase3:summarize] using format guide: {resolved_guide_path}")
     # Always keep rows from other papers/input sources. ``resume`` only decides
     # whether already-successful model slots are skipped or refreshed.
     existing = load_existing_summaries()
@@ -1086,6 +1249,333 @@ def run_realtime(
 
 
 # ---------------------------------------------------------------------------
+# Folder-based summarisation (summarize-all workflow)
+# ---------------------------------------------------------------------------
+
+def _format_human_readable(structured: dict) -> str:
+    """
+    Format a VeterinarySummary structured dict into numbered clinical sections.
+
+    Sections always appear in this fixed order so every output looks the same
+    regardless of which provider produced it. Lists are bullet-pointed; scalar
+    fields are left as prose.
+    """
+    parts: list[str] = []
+
+    objective = str(structured.get("objective") or "Not reported").strip()
+    parts.append(f"1. Objective\n{objective}")
+
+    methods = structured.get("key_methods") or []
+    if isinstance(methods, list):
+        body = "\n".join(f"- {m}" for m in methods) if methods else "Not reported"
+    else:
+        body = str(methods)
+    parts.append(f"2. Key Methods\n{body}")
+
+    findings = structured.get("key_findings") or []
+    if isinstance(findings, list):
+        body = "\n".join(f"- {f}" for f in findings) if findings else "Not reported"
+    else:
+        body = str(findings)
+    parts.append(f"3. Primary Results\n{body}")
+
+    significance = str(structured.get("clinical_significance") or "Not reported").strip()
+    parts.append(f"4. Clinical Significance\n{significance}")
+
+    limitations = structured.get("limitations") or []
+    if isinstance(limitations, list):
+        body = "\n".join(f"- {l}" for l in limitations) if limitations else "Not reported"
+    else:
+        body = str(limitations)
+    parts.append(f"5. Limitations\n{body}")
+
+    return "\n\n".join(parts)
+
+
+def _enrich_result_with_human_readable(result: dict) -> dict:
+    """Attach a human_readable field to a successful provider result."""
+    structured = result.get("structured_summary")
+    if structured and result.get("status") == "success":
+        result = dict(result)
+        result["human_readable"] = _format_human_readable(structured)
+    return result
+
+
+def _write_folder_output(output_dir: Path, stem: str, entry: dict) -> None:
+    """Atomically write one paper's multi-model summary to output_dir/stem.json."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"{stem}.json"
+    tmp_path = out_path.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    tmp_path.replace(out_path)
+
+
+def _load_folder_output(output_dir: Path, stem: str) -> dict | None:
+    """Load an existing folder output JSON for resume support, or return None."""
+    path = output_dir / f"{stem}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _slug_from_source_stem(stem: str) -> str:
+    """
+    Return the stable DOI slug embedded in descriptive corpus filenames.
+
+    Current files use ``journal__title__doi_slug`` stems, while older files may
+    be named by DOI slug alone. Keeping the source filename as the output stem
+    preserves the PDF/text pairing; this helper only supplies the internal join
+    key used inside each JSON payload.
+    """
+    parts = stem.split("__")
+    return parts[-1] if len(parts) > 1 else stem
+
+
+def _iter_processed_text_files(processed_dir: Path) -> list[dict[str, Any]]:
+    """
+    Read every ``data/processed/*.jsonl`` file with its filesystem metadata.
+
+    ``prepare_texts.iter_processed_texts`` yields only ``(slug, text)``, which is
+    enough for cost estimation but loses the real descriptive filename. The
+    summarize-all workflow needs that filename so each processed-text output can
+    mirror the matching PDF output by article stem.
+    """
+    records: list[dict[str, Any]] = []
+    if not processed_dir.exists():
+        return records
+
+    for path in sorted(processed_dir.glob("*.jsonl")):
+        try:
+            line = path.read_text(encoding="utf-8").strip()
+            payload = json.loads(line) if line else {}
+        except (OSError, json.JSONDecodeError):
+            log_error(path.stem, "summarize_all_processed", f"Could not read {path.name}")
+            continue
+
+        text = payload.get("text") if isinstance(payload, dict) else None
+        if not (isinstance(text, str) and text.strip()):
+            log_error(path.stem, "summarize_all_processed", f"No text field in {path.name}")
+            continue
+
+        slug = payload.get("slug") if isinstance(payload, dict) else None
+        records.append({
+            "path": path,
+            "stem": path.stem,
+            "source_filename": path.name,
+            "doi": payload.get("doi") if isinstance(payload, dict) else None,
+            "slug": slug if isinstance(slug, str) and slug else _slug_from_source_stem(path.stem),
+            "text": text,
+        })
+
+    return records
+
+
+def summarize_all_pdfs(
+    *,
+    output_dir: Path | None = None,
+    providers: list[str] | None = None,
+    resume: bool = False,
+    prompt_template: str | None = None,
+    limit: int | None = None,
+    raw_dir: Path | None = None,
+) -> dict[str, int]:
+    """
+    Summarise every PDF in data/raw/ using all three providers.
+
+    For each PDF the result is written to data/summaries_pdf/<stem>.json
+    containing status, structured_summary, and a human_readable section
+    for each provider. Failed provider slots are recorded in the output
+    but do not stop other providers or other PDFs from running.
+    """
+    out_dir = output_dir if output_dir is not None else SUMMARIES_PDF_DIR
+    pdf_dir = raw_dir if raw_dir is not None else RAW_DIR
+    provider_list = providers if providers is not None else list(all_providers())
+
+    counts: dict[str, int] = {"success": 0, "failed": 0, "skipped": 0, "no_source": 0}
+    guard = BudgetGuard()
+
+    pdfs = sorted(pdf_dir.glob("*.pdf"))
+    if not pdfs:
+        print(f"[phase3:summarize-all] No PDFs found in {pdf_dir}")
+        return counts
+
+    processed = 0
+    for pdf_path in pdfs:
+        if limit is not None and processed >= limit:
+            break
+
+        stem = pdf_path.stem
+        existing = _load_folder_output(out_dir, stem) if resume else None
+
+        entry: dict = existing or {
+            "source_type": "pdf",
+            "source_filename": pdf_path.name,
+            "doi": None,
+            "slug": _slug_from_source_stem(stem),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "models": {p: _empty_model_slot() for p in all_providers()},
+        }
+        entry.setdefault("models", {p: _empty_model_slot() for p in all_providers()})
+
+        processed += 1
+        print(f"\n[phase3:summarize-all] PDF {processed}: {pdf_path.name}")
+
+        for provider in provider_list:
+            slot = entry["models"].setdefault(provider, _empty_model_slot())
+            if resume and slot.get("status") == "success":
+                counts["skipped"] += 1
+                print(f"  {provider}: already success, skipping")
+                continue
+
+            sleep_for_model(provider)
+            try:
+                result = generate_summary_from_pdf(
+                    provider, pdf_path, prompt_template=prompt_template
+                )
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "error": str(exc),
+                    "summary": None,
+                    "structured_summary": None,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "model_version": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+            result = _enrich_result_with_human_readable(result)
+            entry["models"][provider] = result
+
+            if result["status"] == "success":
+                counts["success"] += 1
+                cost = compute_cost(
+                    provider,
+                    int(result["input_tokens"] or 0),
+                    int(result["output_tokens"] or 0),
+                    batched=False,
+                )
+                guard.add_cost(cost)
+                print(f"  {provider}: success "
+                      f"(in={result['input_tokens']}, out={result['output_tokens']}, "
+                      f"ver={result['model_version']}, ${cost:.4f})")
+            else:
+                counts["failed"] += 1
+                print(f"  {provider}: FAILED — {result.get('error')}")
+
+        _write_folder_output(out_dir, stem, entry)
+
+    print(f"\n[phase3:summarize-all] PDFs done. counts={counts}  "
+          f"budget_spent=${guard.total_spent:.4f}")
+    return counts
+
+
+def summarize_all_processed_texts(
+    *,
+    output_dir: Path | None = None,
+    providers: list[str] | None = None,
+    resume: bool = False,
+    prompt_template: str | None = None,
+    limit: int | None = None,
+    processed_dir: Path | None = None,
+) -> dict[str, int]:
+    """
+    Summarise every processed JSONL file in data/processed/ using all three providers.
+
+    For each file the result is written to data/summaries_txt/<source-stem>.json
+    containing status, structured_summary, and a human_readable section
+    for each provider. Failed provider slots are recorded in the output
+    but do not stop other providers or other files from running.
+    """
+    out_dir = output_dir if output_dir is not None else SUMMARIES_TXT_DIR
+    pdir = processed_dir if processed_dir is not None else PROCESSED_DIR
+    provider_list = providers if providers is not None else list(all_providers())
+
+    counts: dict[str, int] = {"success": 0, "failed": 0, "skipped": 0, "no_source": 0}
+    guard = BudgetGuard()
+
+    records = _iter_processed_text_files(pdir)
+    if not records:
+        print(f"[phase3:summarize-all] No processed JSONL files found in {pdir}")
+        return counts
+
+    processed_count = 0
+    for record in records:
+        if limit is not None and processed_count >= limit:
+            break
+
+        stem = str(record["stem"])
+        existing = _load_folder_output(out_dir, stem) if resume else None
+
+        entry: dict = existing or {
+            "source_type": "processed_text",
+            "source_filename": record["source_filename"],
+            "doi": record["doi"],
+            "slug": record["slug"],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "models": {p: _empty_model_slot() for p in all_providers()},
+        }
+        entry.setdefault("models", {p: _empty_model_slot() for p in all_providers()})
+
+        processed_count += 1
+        print(f"\n[phase3:summarize-all] Text {processed_count}: {record['source_filename']}")
+
+        for provider in provider_list:
+            slot = entry["models"].setdefault(provider, _empty_model_slot())
+            if resume and slot.get("status") == "success":
+                counts["skipped"] += 1
+                print(f"  {provider}: already success, skipping")
+                continue
+
+            sleep_for_model(provider)
+            try:
+                result = generate_summary(
+                    provider, str(record["text"]), prompt_template=prompt_template
+                )
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "error": str(exc),
+                    "summary": None,
+                    "structured_summary": None,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "model_version": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+            result = _enrich_result_with_human_readable(result)
+            entry["models"][provider] = result
+
+            if result["status"] == "success":
+                counts["success"] += 1
+                cost = compute_cost(
+                    provider,
+                    int(result["input_tokens"] or 0),
+                    int(result["output_tokens"] or 0),
+                    batched=False,
+                )
+                guard.add_cost(cost)
+                print(f"  {provider}: success "
+                      f"(in={result['input_tokens']}, out={result['output_tokens']}, "
+                      f"ver={result['model_version']}, ${cost:.4f})")
+            else:
+                counts["failed"] += 1
+                print(f"  {provider}: FAILED — {result.get('error')}")
+
+        _write_folder_output(out_dir, stem, entry)
+
+    print(f"\n[phase3:summarize-all] Texts done. counts={counts}  "
+          f"budget_spent=${guard.total_spent:.4f}")
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1127,6 +1617,16 @@ def main(argv: list[str] | None = None) -> int:
         print("[phase3:summarize] direct PDF input is real-time only; batch mode is not supported.")
         return 1
     print(f"[phase3:summarize] input_source={args.input_source}")
+
+    try:
+        _prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(
+            args.guide_summary
+        )
+    except Exception as exc:
+        print(f"[phase3:summarize] prompt validation failed: {exc}")
+        return 1
+    if guide_summary:
+        print(f"[phase3:summarize] format guide ready: {resolved_guide_path}")
 
     if not confirm_real_batch(profile, force=args.force):
         return 1

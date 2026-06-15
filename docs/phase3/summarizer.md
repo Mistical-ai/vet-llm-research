@@ -9,6 +9,38 @@ Real-time summarisation now uses a single Pydantic schema, `VeterinarySummary`, 
 * `summary` — readable prose from `VeterinarySummary.summary_text`, used by the blind evaluator.
 * `structured_summary` — the full schema as a clean dictionary for later analysis.
 
+## Method Map
+
+The summarizer is built from a few simple methods that work together:
+
+1. **Load the prompt**  
+   `load_prompt()` reads `llm-sum/prompts/summarization_v1.txt` and checks that it still contains `{ARTICLE_TEXT}`. That placeholder is required because it marks where the target paper text will be inserted.
+
+2. **Optionally add your guide summary**  
+   `load_optional_guide_summary()` reads `llm-sum/prompts/guide_summary_template.txt` if it has text. `apply_guide_summary_to_prompt()` wraps that guide with warnings saying "format only, do not copy facts."
+
+3. **Build the provider message**  
+   `build_user_message()` inserts processed JSONL text into the prompt. `build_pdf_user_message()` keeps the same instructions but tells the provider to read the attached PDF.
+
+4. **Call each provider**  
+   `generate_summary()` routes text inputs to OpenAI, Anthropic, or Gemini. `generate_summary_from_pdf()` routes direct-PDF inputs to the provider-specific PDF code.
+
+5. **Normalize the output**  
+   `coerce_veterinary_summary()` repairs partial structured responses by filling missing fields with safe placeholders such as `"Not reported"` or empty lists. It never invents findings.
+
+6. **Write results**  
+   `run_realtime()` writes one row per paper/input source to `data/summaries.jsonl`. Each row has one slot for OpenAI, one for Anthropic, and one for Gemini.
+
+Provider client pattern:
+
+```text
+OpenAI    -> openai.OpenAI()
+Anthropic -> anthropic.Anthropic()
+Gemini    -> google.genai.Client()
+```
+
+Model names come from `.env` through `OPENAI_MODEL`, `ANTHROPIC_MODEL`, and `GEMINI_MODEL`.
+
 Two paths inside the same script:
 
 * **Real-time**: one HTTP call per (paper, provider), retried up to 3× with exponential backoff. Used by `PHASE3_MODE` in `test` / `single` / `dev`.
@@ -105,7 +137,7 @@ That produces 6 summaries for the same paper: 3 from the processed JSONL text an
 | `BudgetGuard.total_spent > BUDGET_HARD_STOP, exiting.`        | You hit the cap in `.env`.                                           | Increase `BUDGET_HARD_STOP` or stop the run; partial progress is on disk.            |
 | Provider returns HTTP 429 repeatedly                          | Rate limit; the retry loop sleeps but the QPS may still be too high. | Raise `RATE_LIMIT_<PROVIDER>` in `.env`.                                             |
 | Provider fails with a schema/validation error                  | The model response did not satisfy `VeterinarySummary`, or the provider SDK does not support the requested structured-output feature. | Check SDK versions from `requirements.txt`, then retry in `single` mode.             |
-| `model_version` looks like `gpt-5.5` (no date suffix)         | Some providers return only the alias for niche models.               | Not a bug — Anthropic and OpenAI usually return the dated string for production models. |
+| `model_version` looks like `gpt-5.4` (no date suffix)         | Some providers return only the alias for niche models.               | Not a bug — Anthropic and OpenAI usually return the dated string for production models. |
 
 ## Worked example
 
@@ -117,8 +149,8 @@ python llm-sum/summarizer.py
 # → [phase3:safety] About to submit REAL real-time API calls (limit=1).
 # →   Type 'yes' to confirm: yes
 # → [phase3:summarize] paper 1: 10.1111/jvim.16872
-# →   openai: success    (in=4521, out=487, ver=gpt-5.5-0325-preview, $0.0223)
-# →   anthropic: success (in=4521, out=475, ver=claude-opus-4-6-20250901, $0.0214)
-# →   gemini: success    (in=4612, out=482, ver=gemini-3.1-pro, $0.0165)
+# →   openai: success    (in=4521, out=487, ver=gpt-5.4-0325-preview, $0.0223)
+# →   anthropic: success (in=4521, out=475, ver=claude-sonnet-4-6-20250901, $0.0214)
+# →   gemini: success    (in=4612, out=482, ver=gemini-3.5-flash, $0.0165)
 # → [phase3:summarize] done. counts={'success': 3, 'failed': 0, ...} budget_spent=$0.0602
 ```

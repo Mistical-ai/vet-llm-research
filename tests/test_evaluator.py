@@ -143,7 +143,7 @@ def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
             "reasoning": "ok",
         }),
         "input_tokens": 1500, "output_tokens": 200,
-        "model_version": "gpt-5.5-test",
+        "model_version": "gpt-5.4-test",
     }
     row = build_evaluation_row(
         doi="10.1111/jvim.16872",
@@ -204,7 +204,7 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
                     "openai": {
                         "status": "success",
                         "summary": f"summary for paper {i}",
-                        "model_version": "gpt-5.5-test",
+                        "model_version": "gpt-5.4-test",
                         "input_tokens": 100, "output_tokens": 50,
                     }
                 }

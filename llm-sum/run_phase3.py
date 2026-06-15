@@ -5,6 +5,9 @@ llm-sum/run_phase3.py — Phase 3 orchestrator CLI
 One CLI for every Phase 3 step:
     extract     Build / refresh the data/processed/*.jsonl cache from PDFs.
     summarize   Run the three summarisers; supports --estimate, --resume, --force.
+    summarize-all
+                Run paired raw-PDF and processed-text summaries, producing
+                three provider outputs for each source representation.
     evaluate    Run the blind judge over data/summaries.jsonl.
     status      Print counts: extracted / summarised / evaluated / budget.
     clean       Remove temporary data/batch/*.jsonl scratch files.
@@ -29,6 +32,8 @@ from phase3_mode import resolve_mode, VALID_MODES  # noqa: E402
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
+SUMMARIES_PDF_DIR = DATA_DIR / "summaries_pdf"
+SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +194,77 @@ def cmd_clean(_args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# summarize-all  (folder-based: data/raw/*.pdf + data/processed/*.jsonl)
+# ---------------------------------------------------------------------------
+
+def cmd_summarize_all(args: argparse.Namespace) -> int:
+    """
+    Summarise every PDF in data/raw/ AND every processed JSONL in data/processed/
+    with all three providers in a single command.
+
+    In ``single`` mode this processes one PDF and one processed-text file, which
+    yields the intended six summaries for the same first corpus article when the
+    raw and processed folders share stems.
+
+    Outputs:
+      data/summaries_pdf/<stem>.json  — one file per PDF
+      data/summaries_txt/<stem>.json  — one file per processed text
+    """
+    profile = resolve_mode(args.mode)
+    print(profile.banner())
+
+    if profile.use_batch:
+        print("[phase3:summarize-all] batch mode is not supported because direct PDF "
+              "summarisation is real-time only. Use --mode single or --mode dev.")
+        return 1
+
+    from summarizer import (
+        summarize_all_pdfs,
+        summarize_all_processed_texts,
+        load_prompt_with_optional_guide,
+        confirm_real_batch,
+    )
+
+    try:
+        prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(None)
+    except Exception as exc:
+        print(f"[phase3:summarize-all] prompt validation failed: {exc}")
+        return 1
+    if guide_summary:
+        print(f"[phase3:summarize-all] format guide ready: {resolved_guide_path}")
+
+    if not confirm_real_batch(profile, force=args.force):
+        return 1
+
+    providers = (
+        [p.strip() for p in args.providers.split(",") if p.strip()]
+        if args.providers else None
+    )
+    effective_limit = args.limit if args.limit is not None else profile.paper_limit
+
+    pdf_counts = summarize_all_pdfs(
+        output_dir=SUMMARIES_PDF_DIR,
+        providers=providers,
+        resume=args.resume,
+        prompt_template=prompt_template,
+        limit=effective_limit,
+    )
+
+    txt_counts = summarize_all_processed_texts(
+        output_dir=SUMMARIES_TXT_DIR,
+        providers=providers,
+        resume=args.resume,
+        prompt_template=prompt_template,
+        limit=effective_limit,
+    )
+
+    total = {k: pdf_counts.get(k, 0) + txt_counts.get(k, 0)
+             for k in set(pdf_counts) | set(txt_counts)}
+    print(f"\n[phase3:summarize-all] TOTAL counts={total}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI wiring
 # ---------------------------------------------------------------------------
 
@@ -233,6 +309,26 @@ def build_parser() -> argparse.ArgumentParser:
                        help=("Optional human-written format guide file. The guide controls "
                              "section style only; facts must still come from the target paper."))
     p_sum.set_defaults(func=cmd_summarize)
+
+    p_sum_all = sub.add_parser(
+        "summarize-all",
+        help="Summarize all PDFs (data/raw/) and processed texts (data/processed/) "
+             "with OpenAI, Anthropic, and Gemini. "
+             "Outputs: data/summaries_pdf/ and data/summaries_txt/.",
+    )
+    _add_mode_arg(p_sum_all)
+    p_sum_all.add_argument("--limit", type=int, default=None,
+                            help=("Override the mode limit. Without this, single "
+                                  "processes 1 PDF + 1 processed text; dev uses "
+                                  "PHASE3_DEV_LIMIT."))
+    p_sum_all.add_argument("--resume", action="store_true",
+                            help="Skip provider slots already at status=success.")
+    p_sum_all.add_argument("--force", action="store_true",
+                            help="Bypass interactive confirmation. USE WITH CAUTION.")
+    p_sum_all.add_argument("--providers", default=None,
+                            help="Comma-separated subset of providers "
+                                 "(default: openai,anthropic,gemini).")
+    p_sum_all.set_defaults(func=cmd_summarize_all)
 
     p_eval = sub.add_parser("evaluate", help="Run the blind judge.")
     _add_mode_arg(p_eval)

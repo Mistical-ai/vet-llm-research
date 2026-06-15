@@ -1,1 +1,17 @@
+*Overall good agreement of smartphone-based and standard base-apex electrocardiography in healthy sheep*
+
+Authors: King A, Rolph KE, Dzikiti L, Cavanaugh SM. J Am Vet Med Assoc. 2023.
+
+1. Objective
+The study assessed whether a smartphone-based ECG device (KardiaMobile, AliveCor Inc) produces tracings of similar quality to standard base-apex ECG in healthy sheep and whether the two methods agree on heart rate, waveform morphology, and interval measurements. The authors hypothesized that smartphone ECG would yield comparable quality and good parameter agreement with standard ECG.
+
+2. Key Methods
+Prospective observational study in 23 healthy feral rams (Barbados Blackbelly, Pelibüey, and St. Croix; approximately 1 year old; median weight 28 kg) from a university teaching flock. Standard base-apex ECG (CardEx 300) was recorded first, followed by a single-lead smartphone ECG (KardiaMobile on an iPhone 8) placed on the left thoracic wall at the apex beat. Hair was not clipped; 70% isopropyl alcohol was used for contact. A single board-certified internist reviewed all masked tracings. Quality was scored on a 0–3 scale (0 = best, 3 = worst) based on baseline undulation and tremor artifacts.
+
+3. Primary Results
+Standard ECGs were interpretable in 100% (23/23) of sheep, while smartphone ECGs were interpretable in 65% (15/23). Eight of 23 (35%) smartphone tracings were uninterpretable due to motion artifact, tachypnea, or very low waveform amplitude; all 8 had uninterpretable P waves. Quality scores showed no agreement between devices (κ coefficient, –0.0062).
+
+Good agreement was found for heart rate (mean difference 2.86 bpm; 95% CI, –3.44 to 9.16), P wave amplitude (0.02 mV; CI, –0.01 to 0.05), QRS duration (–10.5 ms; CI, –20.96 to –0.04), QT interval (–27.14 ms; CI, –59.36 to 5.08), T wave duration (–30.00 ms; CI, –66.73 to 6.73), and T wave amplitude (–0.07 mV; CI, –0.22 to 0.08).
+Clinically relevant differences were observed for PR interval (mean difference –44.38 ms; CI, –64.69 to –24.06) and QRS amplitude (mean difference 0.18 mV; CI, 0.06 to 0.29), making these parameters unreliable on smartphone tracings.
+
 

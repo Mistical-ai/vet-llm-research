@@ -10,7 +10,12 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
 - key_findings: short list of the most important findings, especially quantitative results.
 - clinical_significance: how a practising clinician should interpret or apply the findings.
 - limitations: short list of important caveats or limitations from the article.
-- summary_text: readable prose containing Objective, Key Methods, Primary Results, and Clinical Significance.
+- summary_text: readable prose under 400 words using these sections in order:
+  1. Objective
+  2. Key Methods
+  3. Primary Results
+  4. Clinical Significance
+  5. Limitations
 
 Rules:
 - summary_text must be under 400 words.
@@ -18,6 +23,7 @@ Rules:
 - If a text field's information is not present in the source, write "Not reported" rather than inferring.
 - For missing sample size, use null. Do not use 0 unless the article explicitly reports zero.
 - Keep wording clear for a clinical veterinary audience.
+- Include author names in summary_text only if they are present in the article text.
 
 Article text:
 {ARTICLE_TEXT}

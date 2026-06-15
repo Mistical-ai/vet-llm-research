@@ -34,24 +34,25 @@ from file_paths import doi_to_slug
 # ---------------------------------------------------------------------------
 
 def test_build_openai_request_shape() -> None:
-    row = build_openai_request("my_slug", "Judge this please.", "gpt-5.5")
+    row = build_openai_request("my_slug", "Judge this please.", "gpt-5.4")
     assert row["custom_id"] == "my_slug"
     assert row["method"] == "POST"
     assert row["url"] == "/v1/chat/completions"
     body = row["body"]
-    assert body["model"] == "gpt-5.5"
+    assert body["model"] == "gpt-5.4"
     assert body["messages"][0]["role"] == "user"
     assert body["messages"][0]["content"] == "Judge this please."
     assert body["temperature"] == 0.0
-    assert "max_tokens" in body
+    assert "max_completion_tokens" in body
+    assert "max_tokens" not in body
     assert "seed" in body
 
 
 def test_build_anthropic_request_shape() -> None:
-    row = build_anthropic_request("another_slug", "Anthropic judge.", "claude-opus-4-6")
+    row = build_anthropic_request("another_slug", "Anthropic judge.", "claude-sonnet-4-6")
     assert row["custom_id"] == "another_slug"
     params = row["params"]
-    assert params["model"] == "claude-opus-4-6"
+    assert params["model"] == "claude-sonnet-4-6"
     assert params["messages"][0]["content"] == "Anthropic judge."
     assert params["temperature"] == 0.0
     assert "max_tokens" in params
@@ -79,7 +80,7 @@ def test_parse_evaluation_custom_id_invalid() -> None:
 # ---------------------------------------------------------------------------
 
 def _openai_success_line(custom_id: str, content: str,
-                         model: str = "gpt-5.5-preview") -> str:
+                         model: str = "gpt-5.4-preview") -> str:
     return json.dumps({
         "custom_id": custom_id,
         "response": {
@@ -107,7 +108,7 @@ def test_parse_openai_result_line_success() -> None:
     assert parsed["summary"] == "summary text here"
     assert parsed["input_tokens"] == 1000
     assert parsed["output_tokens"] == 200
-    assert parsed["model_version"] == "gpt-5.5-preview"
+    assert parsed["model_version"] == "gpt-5.4-preview"
     assert parsed["custom_id"] == "slug_a"
 
 
@@ -128,7 +129,7 @@ def _anthropic_success_line(custom_id: str, content: str) -> str:
         "result": {
             "type": "succeeded",
             "message": {
-                "model": "claude-opus-4-6-20260101",
+                "model": "claude-sonnet-4-6-20260101",
                 "content": [{"type": "text", "text": content}],
                 "usage": {"input_tokens": 800, "output_tokens": 150},
             },
@@ -153,7 +154,7 @@ def test_parse_anthropic_result_line_success() -> None:
     assert parsed["summary"] == "anthropic summary"
     assert parsed["input_tokens"] == 800
     assert parsed["output_tokens"] == 150
-    assert parsed["model_version"] == "claude-opus-4-6-20260101"
+    assert parsed["model_version"] == "claude-sonnet-4-6-20260101"
 
 
 def test_parse_anthropic_result_line_error() -> None:
@@ -197,7 +198,7 @@ def test_merge_evaluation_results_produces_correct_schema(
             "anthropic": {
                 "status": "success",
                 "summary": "Candidate summary text.",
-                "model_version": "claude-opus-4-6-test",
+                "model_version": "claude-sonnet-4-6-test",
                 "input_tokens": 400, "output_tokens": 80,
             }
         }
@@ -207,7 +208,7 @@ def test_merge_evaluation_results_produces_correct_schema(
     judge_raw = _make_judge_json_response(quality=8)
     result_path = tmp_path / "openai_eval_results.jsonl"
     result_path.write_text(
-        _openai_success_line(f"{slug}__anthropic", judge_raw, model="gpt-5.5-eval"),
+        _openai_success_line(f"{slug}__anthropic", judge_raw, model="gpt-5.4-eval"),
         encoding="utf-8",
     )
 
@@ -258,4 +259,4 @@ def test_merge_evaluation_results_produces_correct_schema(
     assert row["parse_method"] == "json"
     assert row["requires_human_review"] is False
     assert "judge_model_version" in row
-    assert row["judge_model_version"] == "gpt-5.5-eval"
+    assert row["judge_model_version"] == "gpt-5.4-eval"

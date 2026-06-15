@@ -53,12 +53,12 @@ class ModelSpec:
 # Prices below come from the Phase 3 design doc (May 2026 pricing). When
 # providers update their pricing pages, edit these numbers and nothing else.
 # Model IDs default to the env var (so the user can pin a specific version
-# string like "gpt-5.5-0325-preview"), with a sensible default if unset.
+# string like "gpt-5.4-0325-preview"), with a sensible default if unset.
 
 MODELS: dict[ProviderKey, ModelSpec] = {
     "openai": ModelSpec(
         provider="openai",
-        model_id=os.getenv("OPENAI_MODEL", "gpt-5.5"),
+        model_id=os.getenv("OPENAI_MODEL", "gpt-5.4"),
         price_input_per_mtok=5.00,
         price_output_per_mtok=30.00,
         price_input_per_mtok_batched=2.50,
@@ -68,7 +68,7 @@ MODELS: dict[ProviderKey, ModelSpec] = {
     ),
     "anthropic": ModelSpec(
         provider="anthropic",
-        model_id=os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6"),
+        model_id=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
         price_input_per_mtok=5.00,
         price_output_per_mtok=25.00,
         price_input_per_mtok_batched=2.50,
@@ -78,7 +78,7 @@ MODELS: dict[ProviderKey, ModelSpec] = {
     ),
     "gemini": ModelSpec(
         provider="gemini",
-        model_id=os.getenv("GEMINI_MODEL", "gemini-3.1-pro"),
+        model_id=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
         price_input_per_mtok=4.00,
         price_output_per_mtok=18.00,
         # Gemini batch API not in scope for Phase 3 — same as real-time price.
