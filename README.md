@@ -55,7 +55,32 @@ The workflow script is smart: before trying to match each PDF, it looks up the p
 
 ### Phase 3 (LLM summarisation & evaluation)
 
-Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. Extraction is column-aware for two-column journals such as JVIM and VRU, writes raw extracted text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with publisher noise and references removed. To manually compare source formats for one matched DOI/title, run `python llm-sum/run_phase3.py summarize-all --mode single` or `--mode dev`; this sends the same article once as the raw PDF and once as the processed JSONL text, producing six readable summaries total. All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. See **[docs/phase3/README.md](docs/phase3/README.md)** for the mode cheat-sheet, raw-vs-processed comparison workflow, and a guide per script.
+Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. Extraction is column-aware for two-column journals such as JVIM and VRU, writes raw extracted text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with publisher noise and references removed.
+
+**Primary command right now — six summaries from one matched article (PDF + processed JSONL):**
+
+```powershell
+python llm-sum/run_phase3.py summarize-all --mode single
+```
+
+Use the hyphenated subcommand `summarize-all` (not `summarize all`). The script finds one article stem that exists in both `data/raw/*.pdf` and `data/processed/*.jsonl`, then runs OpenAI, Anthropic, and Gemini on each source:
+
+| Source | Input folder | Summaries |
+|--------|--------------|-----------|
+| Raw PDF | `data/raw/` | 3 |
+| Processed JSONL | `data/processed/` | 3 |
+| **Total** | | **6** |
+
+Outputs land in readable text files (not `summaries.jsonl`):
+
+```text
+data/summaries_pdf/<matched-article-stem>.txt
+data/summaries_txt/<matched-article-stem>.txt
+```
+
+Same six-summary default in dev mode: `python llm-sum/run_phase3.py summarize-all --mode dev`. Free dry run: add `--mode test`.
+
+All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. Full command reference: **[docs/phase3/run_phase3.md](docs/phase3/run_phase3.md)**. Beginner walkthrough: **[docs/phase3/README.md](docs/phase3/README.md)**.
 
 ---
 

@@ -2,6 +2,14 @@
 
 This is a hands-on walkthrough for turning your collected PDFs into LLM summaries and quality scores. It assumes **no prior knowledge** of the pipeline. Read it top to bottom the first time; after that, the [mode cheat-sheet](#the-one-control-you-need-to-understand-phase3_mode) and [recipes](#copy-paste-recipes) are all you'll need.
 
+> **Primary command right now** — six summaries from one matched article (3 from raw PDF + 3 from processed JSONL). Use the hyphenated subcommand **`summarize-all`**, not `summarize all`:
+>
+> ```powershell
+> python llm-sum/run_phase3.py summarize-all --mode single
+> ```
+>
+> Outputs: `data/summaries_pdf/<stem>.txt` and `data/summaries_txt/<stem>.txt`. Same default in dev: `--mode dev`. Free mock: `--mode test`. Full reference: [run_phase3.md](run_phase3.md).
+
 > **Golden rule:** the pipeline always starts in **test mode** (free, no API calls). You have to *deliberately* switch to a paid mode. So you can't accidentally spend money by following these steps — experiment freely.
 
 ---

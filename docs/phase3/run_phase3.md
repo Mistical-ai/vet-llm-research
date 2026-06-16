@@ -1,5 +1,29 @@
 # run_phase3.py
 
+## Primary command — six summaries (PDF + processed JSONL)
+
+**Use `summarize-all` (hyphenated), not `summarize all`.**
+
+```powershell
+python llm-sum/run_phase3.py summarize-all --mode single
+```
+
+Prerequisite: run `extract` first so `data/processed/` exists.
+
+| What happens | Detail |
+|--------------|--------|
+| Matching | Finds article stems present in both `data/raw/*.pdf` and `data/processed/*.jsonl` |
+| Default in `single` / `dev` | 1 matched pair → **6 summaries** (3 providers × 2 source types) |
+| PDF summaries | `data/summaries_pdf/<stem>.txt` — OpenAI, Anthropic, Gemini on the raw PDF |
+| JSONL summaries | `data/summaries_txt/<stem>.txt` — same 3 providers on processed text |
+| Dev mode | Same default: `python llm-sum/run_phase3.py summarize-all --mode dev` |
+| Free mock | `python llm-sum/run_phase3.py summarize-all --mode test` |
+| More articles | Add `--limit N` for N matched pairs (N × 6 summaries) |
+
+Type `yes` at the confirmation prompt for paid modes (`single`, `dev`).
+
+---
+
 ## What it does
 
 The Phase 3 orchestrator CLI. One entry point with six subcommands; every subcommand prints the active `PHASE3_MODE` banner before doing anything so you cannot run a paid call without seeing the mode first.
