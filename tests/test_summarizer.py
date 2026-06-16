@@ -172,6 +172,33 @@ def test_drift_openai_model_version_from_response(monkeypatch: pytest.MonkeyPatc
     assert "max_tokens" not in captured_kwargs
 
 
+def test_non_dry_mode_ignores_stale_module_dry_run_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A stale module-level DRY_RUN=True must not force mocks after the active
+    environment says this is a paid single-mode run.
+    """
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("PHASE3_MODE", "single")
+    monkeypatch.setattr(summarizer, "DRY_RUN", True)
+
+    def _fake_provider(_text: str, **_kwargs) -> dict:
+        parsed = summarizer.VeterinarySummary(**_valid_summary_dict())
+        return summarizer._successful_summary_result(
+            parsed=parsed,
+            input_tokens=10,
+            output_tokens=5,
+            model_version="real-provider-version",
+        )
+
+    monkeypatch.setitem(summarizer.PROVIDER_CALLERS, "openai", _fake_provider)
+
+    result = summarizer.generate_summary("openai", "Article body.")
+
+    assert result["status"] == "success"
+    assert result["model_version"] == "real-provider-version"
+    assert not result["model_version"].endswith("-DRYRUN")
+
+
 def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("PHASE3_MODE", "single")
@@ -762,7 +789,7 @@ def test_enrich_result_skips_human_readable_on_failure() -> None:
 def test_summarize_all_pdfs_test_mode_writes_output_files(
     tmp_path: Path,
 ) -> None:
-    """In test (DRY_RUN) mode every PDF gets 3 provider slots and a JSON output."""
+    """In test (DRY_RUN) mode every PDF gets 3 provider sections and a text output."""
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
     (raw_dir / "paper1.pdf").write_bytes(b"%PDF-1.4 fake pdf 1")
@@ -780,19 +807,18 @@ def test_summarize_all_pdfs_test_mode_writes_output_files(
     assert counts["success"] == 6
     assert counts["failed"] == 0
 
-    # One JSON file per PDF
-    assert (pdf_output / "paper1.json").exists()
-    assert (pdf_output / "paper2.json").exists()
+    # One readable text file per PDF
+    assert (pdf_output / "paper1.txt").exists()
+    assert (pdf_output / "paper2.txt").exists()
 
     for stem in ("paper1", "paper2"):
-        data = json.loads((pdf_output / f"{stem}.json").read_text(encoding="utf-8"))
-        assert data["source_type"] == "pdf"
-        assert data["source_filename"] == f"{stem}.pdf"
-        assert set(data["models"].keys()) == {"openai", "anthropic", "gemini"}
-        for prov_data in data["models"].values():
-            assert prov_data["status"] == "success"
-            assert "human_readable" in prov_data
-            assert "1. Objective" in prov_data["human_readable"]
+        text = (pdf_output / f"{stem}.txt").read_text(encoding="utf-8")
+        assert "Summary Source: Pdf" in text
+        assert f"Source File: {stem}.pdf" in text
+        assert "OPENAI SUMMARY" in text
+        assert "ANTHROPIC SUMMARY" in text
+        assert "GEMINI SUMMARY" in text
+        assert "1. Objective" in text
 
 
 def test_summarize_all_pdfs_each_pdf_has_all_three_providers(
@@ -810,30 +836,35 @@ def test_summarize_all_pdfs_each_pdf_has_all_three_providers(
         providers=["openai", "anthropic", "gemini"],
     )
 
-    data = json.loads((pdf_output / "study.json").read_text(encoding="utf-8"))
-    assert "openai" in data["models"]
-    assert "anthropic" in data["models"]
-    assert "gemini" in data["models"]
+    text = (pdf_output / "study.txt").read_text(encoding="utf-8")
+    assert "OPENAI SUMMARY" in text
+    assert "ANTHROPIC SUMMARY" in text
+    assert "GEMINI SUMMARY" in text
 
 
 def test_summarize_all_pdfs_resume_skips_successful_slots(
     tmp_path: Path,
 ) -> None:
-    """Resume skips provider slots that already have status=success."""
+    """Resume still skips successful slots from legacy JSON folder outputs."""
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
     (raw_dir / "paper.pdf").write_bytes(b"%PDF-1.4")
     pdf_output = tmp_path / "summaries_pdf"
 
-    # First run — all providers succeed.
-    counts_first = summarizer.summarize_all_pdfs(
-        output_dir=pdf_output,
-        raw_dir=raw_dir,
-        providers=["openai", "anthropic", "gemini"],
-    )
-    assert counts_first["success"] == 3
+    pdf_output.mkdir()
+    legacy_entry = {
+        "source_type": "pdf",
+        "source_filename": "paper.pdf",
+        "doi": None,
+        "slug": "paper",
+        "generated_at": "2026-06-14T00:00:00+00:00",
+        "models": {
+            provider: {"status": "success"}
+            for provider in ("openai", "anthropic", "gemini")
+        },
+    }
+    (pdf_output / "paper.json").write_text(json.dumps(legacy_entry), encoding="utf-8")
 
-    # Second run with resume — all slots already successful, so all are skipped.
     counts_resume = summarizer.summarize_all_pdfs(
         output_dir=pdf_output,
         raw_dir=raw_dir,
@@ -859,8 +890,8 @@ def test_summarize_all_pdfs_limit_respected(tmp_path: Path) -> None:
         limit=2,
     )
     assert counts["success"] == 2
-    json_files = list(pdf_output.glob("*.json"))
-    assert len(json_files) == 2
+    txt_files = list(pdf_output.glob("*.txt"))
+    assert len(txt_files) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -870,7 +901,7 @@ def test_summarize_all_pdfs_limit_respected(tmp_path: Path) -> None:
 def test_summarize_all_processed_texts_test_mode_writes_output_files(
     tmp_path: Path,
 ) -> None:
-    """In test mode every processed JSONL gets 3 provider slots by source stem."""
+    """In test mode every processed JSONL gets 3 provider sections by source stem."""
     from file_paths import doi_to_slug
 
     processed_dir = tmp_path / "processed"
@@ -897,19 +928,18 @@ def test_summarize_all_processed_texts_test_mode_writes_output_files(
     assert counts["success"] == 6
     assert counts["failed"] == 0
 
-    json_files = list(txt_output.glob("*.json"))
-    assert len(json_files) == 2
+    txt_files = list(txt_output.glob("*.txt"))
+    assert len(txt_files) == 2
 
     for doi, slug, source_stem in source_records:
-        data = json.loads((txt_output / f"{source_stem}.json").read_text(encoding="utf-8"))
-        assert data["source_type"] == "processed_text"
-        assert data["source_filename"] == f"{source_stem}.jsonl"
-        assert data["doi"] == doi
-        assert data["slug"] == slug
-        assert set(data["models"].keys()) == {"openai", "anthropic", "gemini"}
-        for prov_data in data["models"].values():
-            assert prov_data["status"] == "success"
-            assert "human_readable" in prov_data
+        text = (txt_output / f"{source_stem}.txt").read_text(encoding="utf-8")
+        assert "Summary Source: Processed Text" in text
+        assert f"Source File: {source_stem}.jsonl" in text
+        assert f"DOI: {doi}" in text
+        assert f"Slug: {slug}" in text
+        assert "OPENAI SUMMARY" in text
+        assert "ANTHROPIC SUMMARY" in text
+        assert "GEMINI SUMMARY" in text
 
 
 def test_summarize_all_processed_texts_writes_to_summaries_txt_dir(
@@ -934,8 +964,8 @@ def test_summarize_all_processed_texts_writes_to_summaries_txt_dir(
         processed_dir=processed_dir,
         providers=["openai"],
     )
-    assert (txt_output / f"{source_stem}.json").exists()
-    assert not (txt_output / f"{slug}.json").exists()
+    assert (txt_output / f"{source_stem}.txt").exists()
+    assert not (txt_output / f"{slug}.txt").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -981,16 +1011,16 @@ def test_failed_provider_does_not_stop_other_providers_or_files(
     assert counts["success"] == 5
     assert counts["failed"] == 1
 
-    # paper1: anthropic slot is failed, others success
-    data1 = json.loads((pdf_output / "paper1.json").read_text(encoding="utf-8"))
-    assert data1["models"]["openai"]["status"] == "success"
-    assert data1["models"]["anthropic"]["status"] == "failed"
-    assert data1["models"]["gemini"]["status"] == "success"
+    # paper1: anthropic section is failed, others success
+    text1 = (pdf_output / "paper1.txt").read_text(encoding="utf-8")
+    assert "OPENAI SUMMARY" in text1
+    assert "ANTHROPIC SUMMARY" in text1
+    assert "Status: failed" in text1
+    assert "GEMINI SUMMARY" in text1
 
-    # paper2: all success
-    data2 = json.loads((pdf_output / "paper2.json").read_text(encoding="utf-8"))
-    for prov in ("openai", "anthropic", "gemini"):
-        assert data2["models"][prov]["status"] == "success"
+    # paper2: all providers produced readable success sections
+    text2 = (pdf_output / "paper2.txt").read_text(encoding="utf-8")
+    assert text2.count("Status: success") == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1033,7 @@ def test_run_phase3_summarize_all_single_mode_limits_both_sources(
     """single mode means 1 PDF + 1 processed text, for 6 summaries total."""
     import run_phase3
 
-    captured: dict[str, int | None] = {}
+    captured: dict[str, object] = {}
 
     def _fake_load_prompt(_path=None):
         return "Prompt {ARTICLE_TEXT}", None, Path("guide.txt")
@@ -1017,16 +1047,92 @@ def test_run_phase3_summarize_all_single_mode_limits_both_sources(
 
     def _fake_texts(**kwargs):
         captured["txt_limit"] = kwargs["limit"]
+        captured["txt_stems"] = kwargs["stems"]
         return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
 
     monkeypatch.setattr(summarizer, "load_prompt_with_optional_guide", _fake_load_prompt)
     monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
     monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
     monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+    monkeypatch.setattr(run_phase3, "_paired_summary_stems", lambda _limit: {"same_article"})
 
     ret = run_phase3.main(["summarize-all", "--mode", "single"])
     assert ret == 0
-    assert captured == {"pdf_limit": 1, "txt_limit": 1}
+    assert captured["pdf_limit"] == 1
+    assert captured["txt_limit"] == 1
+    assert captured["txt_stems"] == {"same_article"}
+
+
+def test_run_phase3_summarize_all_test_mode_defaults_to_one_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mock summarize-all should not create one file per corpus article by default."""
+    import run_phase3
+
+    captured: dict[str, object] = {}
+
+    def _fake_load_prompt(_path=None):
+        return "Prompt {ARTICLE_TEXT}", None, Path("guide.txt")
+
+    def _fake_pdfs(**kwargs):
+        captured["pdf_limit"] = kwargs["limit"]
+        captured["pdf_stems"] = kwargs["stems"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _fake_texts(**kwargs):
+        captured["txt_limit"] = kwargs["limit"]
+        captured["txt_stems"] = kwargs["stems"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    monkeypatch.setattr(summarizer, "load_prompt_with_optional_guide", _fake_load_prompt)
+    monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
+    monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+    monkeypatch.setattr(run_phase3, "_paired_summary_stems", lambda _limit: {"same_article"})
+
+    ret = run_phase3.main(["summarize-all", "--mode", "test"])
+    assert ret == 0
+    assert captured["pdf_limit"] == 1
+    assert captured["txt_limit"] == 1
+    assert captured["pdf_stems"] == {"same_article"}
+    assert captured["txt_stems"] == {"same_article"}
+
+
+def test_run_phase3_summarize_all_dev_mode_defaults_to_one_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """summarize-all dev mode is also a one-article PDF-vs-processed smoke test."""
+    import run_phase3
+
+    captured: dict[str, object] = {}
+
+    def _fake_load_prompt(_path=None):
+        return "Prompt {ARTICLE_TEXT}", None, Path("guide.txt")
+
+    def _fake_confirm(_profile, force=False):
+        return True
+
+    def _fake_pdfs(**kwargs):
+        captured["pdf_limit"] = kwargs["limit"]
+        captured["pdf_stems"] = kwargs["stems"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _fake_texts(**kwargs):
+        captured["txt_limit"] = kwargs["limit"]
+        captured["txt_stems"] = kwargs["stems"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    monkeypatch.setattr(summarizer, "load_prompt_with_optional_guide", _fake_load_prompt)
+    monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
+    monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
+    monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+    monkeypatch.setattr(run_phase3, "_paired_summary_stems", lambda _limit: {"same_article"})
+
+    ret = run_phase3.main(["summarize-all", "--mode", "dev"])
+    assert ret == 0
+    assert captured["pdf_limit"] == 1
+    assert captured["txt_limit"] == 1
+    assert captured["pdf_stems"] == {"same_article"}
+    assert captured["txt_stems"] == {"same_article"}
 
 
 def test_run_phase3_summarize_all_rejects_batch_mode(
@@ -1057,7 +1163,7 @@ def test_run_phase3_summarize_all_rejects_batch_mode(
 # Folder I/O helpers
 # ---------------------------------------------------------------------------
 
-def test_write_and_load_folder_output_round_trip(tmp_path: Path) -> None:
+def test_write_folder_output_creates_readable_text(tmp_path: Path) -> None:
     entry = {
         "source_type": "pdf",
         "source_filename": "test.pdf",
@@ -1066,7 +1172,24 @@ def test_write_and_load_folder_output_round_trip(tmp_path: Path) -> None:
         "generated_at": "2026-06-14T00:00:00+00:00",
         "models": {"openai": {"status": "success", "summary": "A mock summary."}},
     }
-    summarizer._write_folder_output(tmp_path, "test", entry)
+    out_path = summarizer._write_folder_output(tmp_path, "test", entry)
+    text = out_path.read_text(encoding="utf-8")
+    assert out_path == tmp_path / "test.txt"
+    assert "Summary Source: Pdf" in text
+    assert "OPENAI SUMMARY" in text
+    assert "A mock summary." in text
+
+
+def test_load_folder_output_reads_legacy_json(tmp_path: Path) -> None:
+    entry = {
+        "source_type": "pdf",
+        "source_filename": "test.pdf",
+        "doi": None,
+        "slug": "test",
+        "generated_at": "2026-06-14T00:00:00+00:00",
+        "models": {"openai": {"status": "success", "summary": "A mock summary."}},
+    }
+    (tmp_path / "test.json").write_text(json.dumps(entry), encoding="utf-8")
     loaded = summarizer._load_folder_output(tmp_path, "test")
     assert loaded == entry
 

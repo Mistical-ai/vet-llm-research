@@ -82,7 +82,7 @@ Everything in Phase 3 is governed by a single switch in your `.env` file called 
 |----------|-----------------|----------------------------------|----------------------|------------------------------------------------------|
 | `test`   | **No** (fakes)  | All                              | No                   | Learning the pipeline, running tests — **the safe default** |
 | `single` | Yes, ~$0.16     | **1**                            | Yes (type `yes`)     | Checking your prompt works before spending real money |
-| `dev`    | Yes, budget-capped | `PHASE3_DEV_LIMIT` (default 5) | Yes                  | A small real run to sanity-check end-to-end          |
+| `dev`    | Yes, budget-capped | `PHASE3_DEV_LIMIT` (default 5); `summarize-all` defaults to 1 matched article | Yes | A small real run to sanity-check end-to-end |
 | `batch`  | Yes, 50% cheaper| All (~250)                       | Yes                  | The real, full run                                   |
 
 How to set it — open `.env` and edit one line:
@@ -95,6 +95,24 @@ Or override it for a single command without touching `.env`:
 
 ```powershell
 python llm-sum/run_phase3.py summarize --mode single
+```
+
+For the raw-PDF vs processed-JSONL comparison on the same DOI/title, use
+`summarize-all` instead. In both `single` and `dev`, this defaults to one
+matched article stem that exists in both `data/raw/*.pdf` and
+`data/processed/*.jsonl`, producing six summaries total:
+
+```powershell
+python llm-sum/run_phase3.py summarize-all --mode single
+# or
+python llm-sum/run_phase3.py summarize-all --mode dev
+```
+
+Outputs are written as readable text files:
+
+```text
+data/summaries_pdf/<matched-article-stem>.txt
+data/summaries_txt/<matched-article-stem>.txt
 ```
 
 **Why a single knob instead of several settings?** An earlier version had two separate switches that interacted in confusing ways — it was easy to *think* you were safe when you weren't. Collapsing everything into one named mode means there's exactly one thing to check, and its name tells you what will happen. `test` mode is also the default, so if you forget to set anything, nothing gets charged.
@@ -257,6 +275,26 @@ python llm-sum/run_phase3.py summarize      # type 'yes' → 1 paper × 3 models
 python llm-sum/run_phase3.py evaluate
 ```
 Read the resulting summary by hand. If it looks good, scale up. If not, fix the prompt and repeat — you've spent 16 cents, not $40.
+
+### Recipe A2 — "Compare the same article as PDF vs processed JSONL"
+
+Use this when you want exactly six summaries from the same article: three
+providers see the raw PDF, and the same three providers see the matching
+processed JSONL text.
+
+```powershell
+python llm-sum/run_phase3.py summarize-all --mode single
+# or, for the same one-pair smoke test under dev mode:
+python llm-sum/run_phase3.py summarize-all --mode dev
+```
+
+The script matches by shared article stem, which includes the title-derived
+filename and DOI slug. It writes:
+
+```text
+data/summaries_pdf/<matched-article-stem>.txt
+data/summaries_txt/<matched-article-stem>.txt
+```
 
 ### Recipe B — "Small real run on 5 papers"
 

@@ -55,7 +55,7 @@ The workflow script is smart: before trying to match each PDF, it looks up the p
 
 ### Phase 3 (LLM summarisation & evaluation)
 
-Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. Extraction is column-aware for two-column journals such as JVIM and VRU, writes raw extracted text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with publisher noise and references removed. All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. See **[docs/phase3/README.md](docs/phase3/README.md)** for the mode cheat-sheet, raw-vs-processed comparison workflow, and a guide per script.
+Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. Extraction is column-aware for two-column journals such as JVIM and VRU, writes raw extracted text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with publisher noise and references removed. To manually compare source formats for one matched DOI/title, run `python llm-sum/run_phase3.py summarize-all --mode single` or `--mode dev`; this sends the same article once as the raw PDF and once as the processed JSONL text, producing six readable summaries total. All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. See **[docs/phase3/README.md](docs/phase3/README.md)** for the mode cheat-sheet, raw-vs-processed comparison workflow, and a guide per script.
 
 ---
 

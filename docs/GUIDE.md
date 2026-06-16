@@ -71,6 +71,18 @@ PHASE3_MODE=batch    full run, batch APIs where supported
 
 Every paid mode asks for confirmation before calling APIs. This prevents accidental spending.
 
+For the manual source-format comparison, use:
+
+```powershell
+python llm-sum/run_phase3.py summarize-all --mode single
+# or
+python llm-sum/run_phase3.py summarize-all --mode dev
+```
+
+Both modes default to one matched article stem that exists as a raw PDF and as
+a processed JSONL file. That gives six summaries total: 3 providers see the PDF
+and the same 3 providers see the matching processed JSONL text.
+
 ### 2.3 Reproducibility
 
 The pipeline tries to keep model comparisons fair:
@@ -627,7 +639,19 @@ No real API calls. Mock summaries only.
 PHASE3_MODE=single
 ```
 
-One paper only. Good for real paid smoke tests.
+One paper only. Good for real paid smoke tests. For `summarize-all`, this means
+one matched raw PDF plus one matching processed JSONL text, producing six
+summaries total.
+
+### Dev Mode
+
+```text
+PHASE3_MODE=dev
+```
+
+Normally uses `PHASE3_DEV_LIMIT` papers. For `summarize-all`, it also defaults
+to one matched raw PDF plus one matching processed JSONL text unless you pass
+`--limit N`.
 
 ### Confirmation Prompt
 

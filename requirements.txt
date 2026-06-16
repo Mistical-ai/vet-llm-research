@@ -1,17 +1,32 @@
+# Loads secret settings, like API keys, from a local .env file so they do not need to be typed into the code.
 python-dotenv
+# Checks that data has the right shape and type before the program uses it, which helps catch mistakes early.
 pydantic
+# Works with table-like data, similar to spreadsheets, for cleaning, sorting, and analysing research results.
 pandas
+# Lets Python ask websites and online APIs for information, such as paper metadata.
 requests
+# Handles lower-level web connection details that requests relies on when talking to websites.
 urllib3
+# Reads text from PDF files, including research papers that may have complicated page layouts.
 pdfplumber
+# Automatically retries a task when it fails for a temporary reason, like a slow website or rate limit.
 tenacity
+# Shows progress bars so long-running scripts make it clear how much work is finished.
 tqdm
+# Runs automated tests to check that the code still works after changes.
 pytest
+# Reads and searches HTML pages, which is useful when extracting information from web pages.
 beautifulsoup4
+# Finds and downloads open-access full-text research articles when a legal free version is available.
 fulltext-article-downloader
 
 # Phase 3: LLM Summarisation & Evaluation
+# Connects to OpenAI models, such as GPT, so the pipeline can request summaries or evaluations.
 openai>=1.50.0
+# Connects to Anthropic models, such as Claude, so the pipeline can compare multiple LLM providers.
 anthropic>=0.40.0
+# Connects to Google Gemini models so they can be included in the same summarisation study.
 google-genai>=1.0.0
+# Counts text tokens for OpenAI-style models, helping estimate how much text fits into a model request.
 tiktoken>=0.7.0

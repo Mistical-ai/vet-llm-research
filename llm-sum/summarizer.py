@@ -10,7 +10,7 @@ provider (OpenAI, Anthropic, Gemini) is called with:
 
 Every successful call returns the SAME dict shape so downstream code never
 branches on provider. Manifest-driven runs persist to ``data/summaries.jsonl``;
-folder-driven ``summarize-all`` runs persist one JSON file per source article
+folder-driven ``summarize-all`` runs persist one text file per source article
 under ``data/summaries_pdf/`` and ``data/summaries_txt/`` so the raw-PDF and
 processed-text comparisons stay separate.
 
@@ -50,6 +50,7 @@ from _bootstrap import *  # noqa: F401,F403
 import argparse
 import base64
 import copy
+import importlib
 import json
 import os
 import sys
@@ -74,7 +75,10 @@ SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
 
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 SEED = int(os.getenv("SEED", "42"))
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "500"))
+# The structured VeterinarySummary schema needs enough room for valid JSON plus
+# readable prose. 500 tokens caused provider-side truncation and unparsable
+# OpenAI responses, so the default leaves headroom for complete summaries.
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
 PROMPT_FILE = Path(os.getenv("PROMPT_FILE", "llm-sum/prompts/summarization_v1.txt"))
 GUIDE_SUMMARY_FILE = Path(
     os.getenv("GUIDE_SUMMARY_FILE", "llm-sum/prompts/guide_summary_template.txt")
@@ -308,8 +312,9 @@ def _is_dry_run() -> bool:
     return resolve_mode().dry_run
 
 
-# Backwards-compatible module attribute. Tests that monkeypatch
-# `summarizer.DRY_RUN` still work; runtime code goes through `_is_dry_run()`.
+# Backwards-compatible module attribute for older tests/importers. Runtime code
+# must call `_is_dry_run()` directly so a stale shell value cannot keep a paid
+# single-mode run on mocks after `.env` or CLI mode has changed.
 DRY_RUN = _is_dry_run()
 
 
@@ -648,10 +653,29 @@ def _extract_anthropic_tool_input(content_blocks) -> dict:
     raise ValueError("Anthropic response did not include the VeterinarySummary tool call.")
 
 
+def _load_google_genai():
+    """
+    Import the modern Gemini SDK and return its client module plus types module.
+
+    A plain ``from google import genai`` can fail when another package has
+    already created the ``google`` namespace without the GenAI submodule. Using
+    importlib targets ``google.genai`` directly and lets us give the user a
+    concrete setup fix when the SDK is missing from the active virtualenv.
+    """
+    try:
+        genai = importlib.import_module("google.genai")
+        types = importlib.import_module("google.genai.types")
+    except ImportError as exc:
+        raise ImportError(
+            "Gemini provider requires the google-genai package in the active "
+            "virtual environment. Run: python -m pip install -r requirements.txt"
+        ) from exc
+    return genai, types
+
+
 def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
     """Real-time Gemini call (no batch API)."""
-    from google import genai  # type: ignore[import-not-found]
-    from google.genai import types  # type: ignore[import-not-found]
+    genai, types = _load_google_genai()
 
     spec = get_model_spec("gemini")
     user_message = build_user_message(article_text, prompt_template)
@@ -825,8 +849,7 @@ def _call_gemini_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     the uploaded file and the same instructions used everywhere else. The output
     is still validated against VeterinarySummary before it is written to disk.
     """
-    from google import genai  # type: ignore[import-not-found]
-    from google.genai import types  # type: ignore[import-not-found]
+    genai, types = _load_google_genai()
 
     spec = get_model_spec("gemini")
     user_message = build_pdf_user_message(prompt_template)
@@ -889,9 +912,7 @@ def generate_summary(
     if model_name not in PROVIDER_CALLERS:
         raise KeyError(f"Unknown provider '{model_name}'")
 
-    # Tests may monkeypatch `summarizer.DRY_RUN` directly; production code
-    # may toggle the env between runs. Honour either.
-    if DRY_RUN or _is_dry_run():
+    if _is_dry_run():
         return _mock_summary(model_name, text)
 
     caller = PROVIDER_CALLERS[model_name]
@@ -941,7 +962,7 @@ def generate_summary_from_pdf(
     if model_name not in PROVIDER_PDF_CALLERS:
         raise KeyError(f"Unknown provider '{model_name}'")
 
-    if DRY_RUN or _is_dry_run():
+    if _is_dry_run():
         return _mock_pdf_summary(model_name, pdf_path)
 
     caller = PROVIDER_PDF_CALLERS[model_name]
@@ -1301,19 +1322,70 @@ def _enrich_result_with_human_readable(result: dict) -> dict:
     return result
 
 
-def _write_folder_output(output_dir: Path, stem: str, entry: dict) -> None:
-    """Atomically write one paper's multi-model summary to output_dir/stem.json."""
+def _format_folder_entry_as_text(entry: dict) -> str:
+    """
+    Turn one multi-provider summary entry into a plain-English report.
+
+    The folder workflow is for manual inspection, so it writes one readable text
+    file per source article instead of exposing the research JSON payload first.
+    The structured fields still guide this report so the sections are consistent
+    across providers and easy to compare by eye.
+    """
+    source_type = str(entry.get("source_type") or "unknown").replace("_", " ").title()
+    lines = [
+        f"Summary Source: {source_type}",
+        f"Source File: {entry.get('source_filename') or 'Not recorded'}",
+        f"DOI: {entry.get('doi') or 'Not recorded'}",
+        f"Slug: {entry.get('slug') or 'Not recorded'}",
+        f"Generated At: {entry.get('generated_at') or 'Not recorded'}",
+        "",
+        "This file contains one summary from each configured model provider.",
+        "Compare the provider sections below against the same article source.",
+    ]
+
+    models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
+    for provider in all_providers():
+        result = models.get(provider) if isinstance(models.get(provider), dict) else _empty_model_slot()
+        lines.extend([
+            "",
+            "=" * 78,
+            f"{provider.upper()} SUMMARY",
+            "=" * 78,
+            f"Status: {result.get('status') or 'unknown'}",
+            f"Model Version: {result.get('model_version') or 'Not recorded'}",
+            f"Timestamp: {result.get('timestamp') or 'Not recorded'}",
+        ])
+
+        if result.get("status") != "success":
+            lines.extend([
+                "",
+                f"No readable summary was produced. Error: {result.get('error') or 'Not recorded'}",
+            ])
+            continue
+
+        readable = result.get("human_readable") or result.get("summary") or "No summary text returned."
+        lines.extend([
+            f"Input Tokens: {result.get('input_tokens') or 'Not recorded'}",
+            f"Output Tokens: {result.get('output_tokens') or 'Not recorded'}",
+            "",
+            str(readable).strip(),
+        ])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_folder_output(output_dir: Path, stem: str, entry: dict) -> Path:
+    """Atomically write one paper's multi-model summary to output_dir/stem.txt."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{stem}.json"
-    tmp_path = out_path.with_suffix(".json.tmp")
-    tmp_path.write_text(
-        json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    out_path = output_dir / f"{stem}.txt"
+    tmp_path = out_path.with_suffix(".txt.tmp")
+    tmp_path.write_text(_format_folder_entry_as_text(entry), encoding="utf-8")
     tmp_path.replace(out_path)
+    return out_path
 
 
 def _load_folder_output(output_dir: Path, stem: str) -> dict | None:
-    """Load an existing folder output JSON for resume support, or return None."""
+    """Load legacy JSON folder output for resume support, or return None."""
     path = output_dir / f"{stem}.json"
     if not path.exists():
         return None
@@ -1383,14 +1455,15 @@ def summarize_all_pdfs(
     prompt_template: str | None = None,
     limit: int | None = None,
     raw_dir: Path | None = None,
+    stems: set[str] | None = None,
 ) -> dict[str, int]:
     """
     Summarise every PDF in data/raw/ using all three providers.
 
-    For each PDF the result is written to data/summaries_pdf/<stem>.json
-    containing status, structured_summary, and a human_readable section
-    for each provider. Failed provider slots are recorded in the output
-    but do not stop other providers or other PDFs from running.
+    For each PDF the result is written to data/summaries_pdf/<stem>.txt
+    with one plain-English section per provider. Failed provider slots are
+    recorded in the output but do not stop other providers or other PDFs from
+    running.
     """
     out_dir = output_dir if output_dir is not None else SUMMARIES_PDF_DIR
     pdf_dir = raw_dir if raw_dir is not None else RAW_DIR
@@ -1406,6 +1479,8 @@ def summarize_all_pdfs(
 
     processed = 0
     for pdf_path in pdfs:
+        if stems is not None and pdf_path.stem not in stems:
+            continue
         if limit is not None and processed >= limit:
             break
 
@@ -1468,7 +1543,8 @@ def summarize_all_pdfs(
                 counts["failed"] += 1
                 print(f"  {provider}: FAILED — {result.get('error')}")
 
-        _write_folder_output(out_dir, stem, entry)
+        written_path = _write_folder_output(out_dir, stem, entry)
+        print(f"  wrote: {written_path}")
 
     print(f"\n[phase3:summarize-all] PDFs done. counts={counts}  "
           f"budget_spent=${guard.total_spent:.4f}")
@@ -1483,14 +1559,15 @@ def summarize_all_processed_texts(
     prompt_template: str | None = None,
     limit: int | None = None,
     processed_dir: Path | None = None,
+    stems: set[str] | None = None,
 ) -> dict[str, int]:
     """
     Summarise every processed JSONL file in data/processed/ using all three providers.
 
-    For each file the result is written to data/summaries_txt/<source-stem>.json
-    containing status, structured_summary, and a human_readable section
-    for each provider. Failed provider slots are recorded in the output
-    but do not stop other providers or other files from running.
+    For each file the result is written to data/summaries_txt/<source-stem>.txt
+    with one plain-English section per provider. Failed provider slots are
+    recorded in the output but do not stop other providers or other files from
+    running.
     """
     out_dir = output_dir if output_dir is not None else SUMMARIES_TXT_DIR
     pdir = processed_dir if processed_dir is not None else PROCESSED_DIR
@@ -1506,6 +1583,8 @@ def summarize_all_processed_texts(
 
     processed_count = 0
     for record in records:
+        if stems is not None and str(record["stem"]) not in stems:
+            continue
         if limit is not None and processed_count >= limit:
             break
 
@@ -1568,7 +1647,8 @@ def summarize_all_processed_texts(
                 counts["failed"] += 1
                 print(f"  {provider}: FAILED — {result.get('error')}")
 
-        _write_folder_output(out_dir, stem, entry)
+        written_path = _write_folder_output(out_dir, stem, entry)
+        print(f"  wrote: {written_path}")
 
     print(f"\n[phase3:summarize-all] Texts done. counts={counts}  "
           f"budget_spent=${guard.total_spent:.4f}")

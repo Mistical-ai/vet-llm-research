@@ -7,7 +7,7 @@ One CLI for every Phase 3 step:
     summarize   Run the three summarisers; supports --estimate, --resume, --force.
     summarize-all
                 Run paired raw-PDF and processed-text summaries, producing
-                three provider outputs for each source representation.
+                readable text files with three provider outputs per source.
     evaluate    Run the blind judge over data/summaries.jsonl.
     status      Print counts: extracted / summarised / evaluated / budget.
     clean       Remove temporary data/batch/*.jsonl scratch files.
@@ -32,6 +32,8 @@ from phase3_mode import resolve_mode, VALID_MODES  # noqa: E402
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
+RAW_DIR = DATA_DIR / "raw"
+PROCESSED_DIR = DATA_DIR / "processed"
 SUMMARIES_PDF_DIR = DATA_DIR / "summaries_pdf"
 SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
 
@@ -197,18 +199,37 @@ def cmd_clean(_args: argparse.Namespace) -> int:
 # summarize-all  (folder-based: data/raw/*.pdf + data/processed/*.jsonl)
 # ---------------------------------------------------------------------------
 
+def _paired_summary_stems(limit: int | None) -> set[str] | None:
+    """
+    Return article stems that exist in both raw PDFs and processed text caches.
+
+    Matching by stem keeps the manual comparison honest: the PDF-side and
+    processed-text-side summaries come from the same descriptive filename, which
+    includes the DOI slug generated during extraction.
+    """
+    if not RAW_DIR.exists() or not PROCESSED_DIR.exists():
+        return set()
+
+    pdf_stems = {path.stem for path in RAW_DIR.glob("*.pdf")}
+    processed_stems = {path.stem for path in PROCESSED_DIR.glob("*.jsonl")}
+    paired = sorted(pdf_stems & processed_stems)
+    if limit is not None:
+        paired = paired[:limit]
+    return set(paired)
+
+
 def cmd_summarize_all(args: argparse.Namespace) -> int:
     """
     Summarise every PDF in data/raw/ AND every processed JSONL in data/processed/
     with all three providers in a single command.
 
-    In ``single`` mode this processes one PDF and one processed-text file, which
-    yields the intended six summaries for the same first corpus article when the
-    raw and processed folders share stems.
+    In ``single`` and ``dev`` mode this processes one matched article stem that
+    exists in both folders, yielding six summaries for the same DOI/title: one
+    PDF source and one processed-text source, each across three providers.
 
     Outputs:
-      data/summaries_pdf/<stem>.json  — one file per PDF
-      data/summaries_txt/<stem>.json  — one file per processed text
+      data/summaries_pdf/<stem>.txt  — one readable file per PDF
+      data/summaries_txt/<stem>.txt  — one readable file per processed text
     """
     profile = resolve_mode(args.mode)
     print(profile.banner())
@@ -240,7 +261,24 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
         [p.strip() for p in args.providers.split(",") if p.strip()]
         if args.providers else None
     )
-    effective_limit = args.limit if args.limit is not None else profile.paper_limit
+    # summarize-all is the manual PDF-vs-processed comparison workflow. Keep
+    # its default narrow in test/single/dev: 1 matched article x 2 source types
+    # x 3 providers = 6 summaries. Users can still pass --limit N explicitly
+    # when they want more matched article pairs.
+    effective_limit = (
+        args.limit
+        if args.limit is not None
+        else (1 if profile.name in {"test", "single", "dev"} else profile.paper_limit)
+    )
+    if args.limit is None and profile.name in {"test", "single", "dev"}:
+        print(f"[phase3:summarize-all] {profile.name} mode defaults to --limit 1; "
+              "pass --limit N to create more matched comparison files.")
+    paired_stems = _paired_summary_stems(effective_limit)
+    if not paired_stems:
+        print("[phase3:summarize-all] No matching article stems found between "
+              "data/raw/*.pdf and data/processed/*.jsonl.")
+        return 1
+    print(f"[phase3:summarize-all] paired articles selected: {len(paired_stems)}")
 
     pdf_counts = summarize_all_pdfs(
         output_dir=SUMMARIES_PDF_DIR,
@@ -248,6 +286,7 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
         resume=args.resume,
         prompt_template=prompt_template,
         limit=effective_limit,
+        stems=paired_stems,
     )
 
     txt_counts = summarize_all_processed_texts(
@@ -256,6 +295,7 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
         resume=args.resume,
         prompt_template=prompt_template,
         limit=effective_limit,
+        stems=paired_stems,
     )
 
     total = {k: pdf_counts.get(k, 0) + txt_counts.get(k, 0)
@@ -312,15 +352,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sum_all = sub.add_parser(
         "summarize-all",
-        help="Summarize all PDFs (data/raw/) and processed texts (data/processed/) "
+        help="Summarize paired PDFs (data/raw/) and processed texts (data/processed/) "
              "with OpenAI, Anthropic, and Gemini. "
-             "Outputs: data/summaries_pdf/ and data/summaries_txt/.",
+             "Outputs readable .txt files in data/summaries_pdf/ and data/summaries_txt/.",
     )
     _add_mode_arg(p_sum_all)
     p_sum_all.add_argument("--limit", type=int, default=None,
-                            help=("Override the mode limit. Without this, single "
-                                  "processes 1 PDF + 1 processed text; dev uses "
-                                  "PHASE3_DEV_LIMIT."))
+                            help=("Override the paired article limit. Without this, "
+                                  "test/single/dev process 1 matched PDF + 1 "
+                                  "matched processed text."))
     p_sum_all.add_argument("--resume", action="store_true",
                             help="Skip provider slots already at status=success.")
     p_sum_all.add_argument("--force", action="store_true",

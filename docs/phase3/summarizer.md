@@ -70,6 +70,8 @@ Two paths inside the same script:
 | Path                          | Schema                                                                                  |
 |-------------------------------|-----------------------------------------------------------------------------------------|
 | `data/summaries.jsonl`        | One row per paper. Each `models.<provider>` slot: `status`, `summary`, `structured_summary`, `input_tokens`, `output_tokens`, `model_version`, `timestamp`. |
+| `data/summaries_pdf/*.txt`    | Readable `summarize-all` reports for raw PDFs; one file per matched article source. |
+| `data/summaries_txt/*.txt`    | Readable `summarize-all` reports for processed JSONL text; one file per matched article source. |
 | `data/batch_jobs.jsonl`       | One row per submitted batch job (only in `batch` mode).                                 |
 | `data/error_log.jsonl`        | Any retry-exhausted failure.                                                            |
 
@@ -84,6 +86,8 @@ python llm-sum/summarizer.py --resume                     # skip already-success
 python llm-sum/summarizer.py --providers openai,anthropic # subset of providers
 python llm-sum/summarizer.py --mode single --input-source raw_text
 python llm-sum/summarizer.py --mode single --input-source pdf
+python llm-sum/run_phase3.py summarize-all --mode single  # same article, 6 summaries
+python llm-sum/run_phase3.py summarize-all --mode dev     # same one-pair default
 python llm-sum/summarizer.py --mode single --guide-summary llm-sum/prompts/guide_summary_template.txt
 ```
 
@@ -106,19 +110,19 @@ Use this when you want all LLM summaries to follow your preferred structure whil
 | Mode     | What happens                                                                    |
 |----------|---------------------------------------------------------------------------------|
 | `test`   | All API calls return deterministic `_mock_summary(...)` dicts. Output schema is identical to live runs so downstream code never branches. No spend. |
-| `single` | 1 paper, real-time, 3 providers → 3 API calls. Prompts for `yes` before the first call. |
-| `dev`    | `PHASE3_DEV_LIMIT` papers, real-time. Same confirm prompt. Budget-guarded.       |
+| `single` | 1 paper, real-time, 3 providers → 3 API calls. For `summarize-all`, 1 matched PDF/JSONL pair → 6 summaries. Prompts for `yes` before the first call. |
+| `dev`    | `PHASE3_DEV_LIMIT` papers for normal `summarize`; for `summarize-all`, the default is also 1 matched PDF/JSONL pair → 6 summaries unless `--limit N` is passed. Same confirm prompt. Budget-guarded. |
 | `batch`  | Full corpus. Builds and submits OpenAI + Anthropic batch JSONL; Gemini still goes through real-time in the same run. Confirm prompt required. |
 
-PDF-vs-JSONL comparison workflow for one paper:
+PDF-vs-JSONL comparison workflow for one matched DOI/title:
 
 ```powershell
-python llm-sum/run_phase3.py summarize --mode single --estimate --input-source processed
-python llm-sum/run_phase3.py summarize --mode single --input-source processed
-python llm-sum/run_phase3.py summarize --mode single --input-source pdf
+python llm-sum/run_phase3.py summarize-all --mode single
+# or
+python llm-sum/run_phase3.py summarize-all --mode dev
 ```
 
-That produces 6 summaries for the same paper: 3 from the processed JSONL text and 3 from the original PDF. The direct-PDF run cannot be cost-estimated offline because token accounting happens inside each provider's PDF ingestion system; the live `single` run records real input/output token counts and cost after each provider returns.
+That produces 6 summaries for the same paper: 3 from the processed JSONL text and 3 from the original PDF. The script matches by the shared article stem in `data/raw` and `data/processed`, which includes the title-derived filename and DOI slug. The direct-PDF calls cannot be cost-estimated offline because token accounting happens inside each provider's PDF ingestion system; the live run records real input/output token counts and cost after each provider returns.
 
 ## Scientific controls (don't change between runs you want to compare)
 
