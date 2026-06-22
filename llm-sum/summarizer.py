@@ -54,6 +54,7 @@ import importlib
 import json
 import os
 import sys
+import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,13 @@ SEED = int(os.getenv("SEED", "42"))
 # OpenAI responses, so the default leaves headroom for complete summaries.
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
 PROMPT_FILE = Path(os.getenv("PROMPT_FILE", "llm-sum/prompts/summarization_v1.txt"))
+PROMPT_MODE = os.getenv("PROMPT_MODE", "shared")
+VALID_PROMPT_MODES = ("shared", "provider_specific")
+PROVIDER_PROMPT_FILES = {
+    "openai": Path(os.getenv("OPENAI_PROMPT_FILE", "llm-sum/prompts/summarization_openai_v1.txt")),
+    "anthropic": Path(os.getenv("ANTHROPIC_PROMPT_FILE", "llm-sum/prompts/summarization_anthropic_v1.txt")),
+    "gemini": Path(os.getenv("GEMINI_PROMPT_FILE", "llm-sum/prompts/summarization_gemini_v1.txt")),
+}
 GUIDE_SUMMARY_FILE = Path(
     os.getenv("GUIDE_SUMMARY_FILE", "llm-sum/prompts/guide_summary_template.txt")
 )
@@ -89,6 +97,12 @@ GUIDE_SUMMARY_FILE = Path(
 # 40 000 chars ≈ 10 000 tokens ≈ a full 15-page research article.
 MAX_INPUT_CHARS: int = int(os.getenv("MAX_INPUT_CHARS", "0"))
 VALID_INPUT_SOURCES = ("processed", "raw_text", "pdf")
+
+# OpenAI rate-limit retry config (separate from the general outer retry in
+# generate_summary — these control the inner 429-specific backoff layer).
+OPENAI_MAX_RETRIES: int = int(os.getenv("OPENAI_MAX_RETRIES", "6"))
+OPENAI_RETRY_BASE_DELAY: float = float(os.getenv("OPENAI_RETRY_BASE_DELAY", "1.0"))
+OPENAI_RETRY_MAX_DELAY: float = float(os.getenv("OPENAI_RETRY_MAX_DELAY", "60.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +356,40 @@ def _resolve_repo_path(path: Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+def _prompt_mode() -> str:
+    """
+    Return the active prompt mode from the current environment.
+
+    This is read at call time, not import time, so tests and one-off shell runs
+    can change PROMPT_MODE without needing a fresh Python process. Invalid modes
+    fail during prompt validation before any paid API confirmation.
+    """
+    mode = os.getenv("PROMPT_MODE", PROMPT_MODE).strip().lower()
+    if mode not in VALID_PROMPT_MODES:
+        raise ValueError(
+            f"PROMPT_MODE must be one of {', '.join(VALID_PROMPT_MODES)}; got {mode!r}."
+        )
+    return mode
+
+
+def _provider_prompt_file(provider: str) -> Path:
+    """
+    Resolve the configured prompt path for one provider.
+
+    The provider-specific env vars are read lazily for the same reason as
+    PROMPT_MODE: a test or short run can change one variable without reloading
+    this module.
+    """
+    env_names = {
+        "openai": "OPENAI_PROMPT_FILE",
+        "anthropic": "ANTHROPIC_PROMPT_FILE",
+        "gemini": "GEMINI_PROMPT_FILE",
+    }
+    if provider not in env_names:
+        raise KeyError(f"Unknown provider '{provider}'")
+    return Path(os.getenv(env_names[provider], str(PROVIDER_PROMPT_FILES[provider])))
+
+
 def load_optional_guide_summary(guide_file: Path | None = GUIDE_SUMMARY_FILE) -> str | None:
     """
     Load the user's human-written format guide, if one exists.
@@ -419,6 +467,60 @@ def load_prompt_with_optional_guide(
     return prompt_template, guide_summary, resolved_guide_path
 
 
+def load_provider_prompt_templates_with_optional_guide(
+    providers: list[str] | None = None,
+    guide_summary_path: Path | None = GUIDE_SUMMARY_FILE,
+) -> tuple[dict[str, str], str | None, Path, dict[str, Path]]:
+    """
+    Load the prompt template each provider should receive for this run.
+
+    ``PROMPT_MODE=shared`` intentionally maps every provider to the same prompt
+    to preserve the fair-comparison baseline. ``provider_specific`` loads one
+    file per provider for prompt-engineering experiments while keeping the same
+    validation and optional guide-summary wrapper.
+    """
+    provider_list = providers or list(all_providers())
+    resolved_guide_path = _resolve_repo_path(guide_summary_path or GUIDE_SUMMARY_FILE)
+    guide_summary = load_optional_guide_summary(guide_summary_path or GUIDE_SUMMARY_FILE)
+    mode = _prompt_mode()
+
+    if mode == "shared":
+        shared_template = apply_guide_summary_to_prompt(load_prompt(), guide_summary)
+        shared_path = _resolve_repo_path(PROMPT_FILE)
+        return (
+            {provider: shared_template for provider in provider_list},
+            guide_summary,
+            resolved_guide_path,
+            {provider: shared_path for provider in provider_list},
+        )
+
+    prompt_templates: dict[str, str] = {}
+    prompt_paths: dict[str, Path] = {}
+    for provider in provider_list:
+        prompt_path = _provider_prompt_file(provider)
+        prompt_templates[provider] = apply_guide_summary_to_prompt(
+            load_prompt(prompt_path),
+            guide_summary,
+        )
+        prompt_paths[provider] = _resolve_repo_path(prompt_path)
+    return prompt_templates, guide_summary, resolved_guide_path, prompt_paths
+
+
+def prompt_template_for_provider(
+    prompt_template: str | dict[str, str] | None,
+    provider: str,
+) -> str | None:
+    """
+    Pick the correct template for provider-aware callers.
+
+    Older tests and helper calls still pass a single string, so this adapter lets
+    new provider-specific routing coexist with the original shared-template API.
+    """
+    if isinstance(prompt_template, dict):
+        return prompt_template[provider]
+    return prompt_template
+
+
 def build_user_message(article_text: str, template: str | None = None) -> str:
     """
     Substitute the article text into the prompt template, applying
@@ -482,10 +584,38 @@ def _remove_json_schema_keys(value: Any, blocked: set[str]) -> Any:
     return value
 
 
+def _gemini_coerce_nullable(schema: Any) -> Any:
+    """Convert Pydantic anyOf-null pattern to Gemini's nullable flag.
+
+    Gemini structured output does not support anyOf. For Optional[X] Pydantic
+    generates {"anyOf": [{"type": "X"}, {"type": "null"}]}; Gemini requires
+    {"type": "X", "nullable": true}.
+    """
+    if isinstance(schema, dict):
+        any_of = schema.get("anyOf")
+        if isinstance(any_of, list):
+            non_null = [s for s in any_of if s.get("type") != "null" and s != {"type": "null"}]
+            has_null = len(non_null) < len(any_of)
+            if has_null and len(non_null) == 1:
+                result = {**non_null[0], "nullable": True}
+                for k, v in schema.items():
+                    if k != "anyOf" and k not in result:
+                        result[k] = v
+                return _gemini_coerce_nullable(result)
+        return {k: _gemini_coerce_nullable(v) for k, v in schema.items()}
+    if isinstance(schema, list):
+        return [_gemini_coerce_nullable(item) for item in schema]
+    return schema
+
+
 def gemini_response_schema() -> dict[str, Any]:
     """Return a Gemini-compatible copy of the VeterinarySummary JSON schema."""
     schema = copy.deepcopy(VeterinarySummary.model_json_schema())
-    return _remove_json_schema_keys(schema, {"default", "additionalProperties"})
+    # Strip keys Gemini rejects: title/anyOf/$ keys cause structured-output failures.
+    stripped = _remove_json_schema_keys(
+        schema, {"default", "additionalProperties", "title", "$schema", "$defs"}
+    )
+    return _gemini_coerce_nullable(stripped)
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +678,93 @@ def _openai_is_temperature_error(exc: Exception) -> bool:
     )
 
 
+def _is_non_retriable_openai_error(exc: Exception) -> bool:
+    """Return True for OpenAI errors that must not be retried (400/401/403).
+
+    Safe to call for any provider — isinstance returns False for non-OpenAI
+    exceptions. Uses getattr so test mocks that omit APIStatusError don't crash.
+    """
+    try:
+        import openai as _openai  # noqa: import-outside-toplevel
+        _APIStatusError = getattr(_openai, "APIStatusError", None)
+        if _APIStatusError is not None and isinstance(exc, _APIStatusError):
+            return exc.status_code in (400, 401, 403)
+    except ImportError:
+        pass
+    return False
+
+
+def _is_gemini_overload(exc: Exception) -> bool:
+    """True when the google-genai SDK received a 503 UNAVAILABLE response."""
+    msg = str(exc)
+    return "503" in msg or "UNAVAILABLE" in msg
+
+
+def _openai_call_with_backoff(api_call_fn):
+    """Execute api_call_fn() with jittered exponential backoff on HTTP 429.
+
+    api_call_fn must be a zero-argument callable (lambda/closure) that returns
+    an OpenAI response object. Only RateLimitError (429) is retried; all other
+    exceptions propagate immediately so callers can apply their own logic.
+
+    The openai import is lazy so unit tests that patch sys.modules["openai"]
+    with a SimpleNamespace continue to work — getattr guards ensure missing
+    error classes on the mock don't cause AttributeError.
+    """
+    import openai  # noqa: import-outside-toplevel
+
+    _RateLimitError = getattr(openai, "RateLimitError", None)
+    _APIStatusError = getattr(openai, "APIStatusError", None)
+
+    last_exc: Exception | None = None
+    for attempt in range(OPENAI_MAX_RETRIES):
+        try:
+            return api_call_fn()
+        except Exception as exc:
+            # Non-429 HTTP errors (bad request, invalid key): re-raise at once.
+            if _APIStatusError is not None and isinstance(exc, _APIStatusError):
+                if not (_RateLimitError is not None and isinstance(exc, _RateLimitError)):
+                    raise
+            elif _RateLimitError is None or not isinstance(exc, _RateLimitError):
+                # Not an openai error at all (or mock without the class).
+                raise
+
+            last_exc = exc
+
+            # Try to honour the provider's own reset timestamp from headers.
+            delay: float | None = None
+            raw_response = getattr(exc, "response", None)
+            if raw_response is not None:
+                headers = getattr(raw_response, "headers", {}) or {}
+                candidates = []
+                for key in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+                    val = headers.get(key)
+                    if val:
+                        try:
+                            candidates.append(float(val) - time.time())
+                        except (ValueError, TypeError):
+                            pass
+                if candidates:
+                    header_wait = min(c for c in candidates if c > 0) if any(c > 0 for c in candidates) else None
+                    if header_wait is not None:
+                        delay = min(header_wait + random.uniform(0, 1), OPENAI_RETRY_MAX_DELAY)
+
+            if delay is None:
+                delay = min(
+                    OPENAI_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1),
+                    OPENAI_RETRY_MAX_DELAY,
+                )
+
+            if attempt < OPENAI_MAX_RETRIES - 1:
+                print(
+                    f"[phase3:summarize] OpenAI rate limit (429) on attempt {attempt + 1}; "
+                    f"retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+
+    raise last_exc  # type: ignore[misc]
+
+
 def _call_openai(article_text: str, *, prompt_template: str | None) -> dict:
     """
     Real-time OpenAI call. Imports the SDK lazily so unit tests that mock
@@ -570,14 +787,18 @@ def _call_openai(article_text: str, *, prompt_template: str | None) -> dict:
         **_openai_completion_token_arg(),
     }
     try:
-        response = client.beta.chat.completions.parse(
-            **base_kwargs, temperature=TEMPERATURE, seed=SEED
+        response = _openai_call_with_backoff(
+            lambda: client.beta.chat.completions.parse(
+                **base_kwargs, temperature=TEMPERATURE, seed=SEED
+            )
         )
     except Exception as exc:
         if not _openai_is_temperature_error(exc):
             raise
         print(f"[phase3:summarize] {spec.model_id} rejected temperature — retrying without it.")
-        response = client.beta.chat.completions.parse(**base_kwargs)
+        response = _openai_call_with_backoff(
+            lambda: client.beta.chat.completions.parse(**base_kwargs)
+        )
 
     parsed = response.choices[0].message.parsed
     if parsed is None:
@@ -696,6 +917,12 @@ def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
     )
 
     usage = response.usage_metadata
+    if not response.text:
+        finish = getattr(
+            (getattr(response, "candidates", None) or [None])[0],
+            "finish_reason", "unknown",
+        )
+        raise ValueError(f"Gemini returned empty response.text (finish_reason={finish})")
     parsed = coerce_veterinary_summary(json.loads(response.text))
     return _successful_summary_result(
         parsed=parsed,
@@ -771,12 +998,16 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
         "text_format": VeterinarySummary,
     }
     try:
-        response = client.responses.parse(**base_kwargs, temperature=TEMPERATURE)
+        response = _openai_call_with_backoff(
+            lambda: client.responses.parse(**base_kwargs, temperature=TEMPERATURE)
+        )
     except Exception as exc:
         if not _openai_is_temperature_error(exc):
             raise
         print(f"[phase3:summarize] {spec.model_id} rejected temperature for PDF — retrying without it.")
-        response = client.responses.parse(**base_kwargs)
+        response = _openai_call_with_backoff(
+            lambda: client.responses.parse(**base_kwargs)
+        )
 
     parsed = _extract_openai_parsed_summary(response)
     usage = response.usage
@@ -868,6 +1099,12 @@ def _call_gemini_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     )
 
     usage = response.usage_metadata
+    if not response.text:
+        finish = getattr(
+            (getattr(response, "candidates", None) or [None])[0],
+            "finish_reason", "unknown",
+        )
+        raise ValueError(f"Gemini returned empty response.text (finish_reason={finish})")
     parsed = coerce_veterinary_summary(json.loads(response.text))
     return _successful_summary_result(
         parsed=parsed,
@@ -899,7 +1136,7 @@ def generate_summary(
     text: str,
     *,
     prompt_template: str | None = None,
-    max_retries: int = 3,
+    max_retries: int = 5,
 ) -> dict:
     """
     Route a summarisation request to the correct provider and return a
@@ -922,10 +1159,15 @@ def generate_summary(
             return caller(text, prompt_template=prompt_template)
         except Exception as exc:
             last_error = exc
+            if _is_non_retriable_openai_error(exc):
+                break
             if attempt < max_retries - 1:
-                wait = 2 ** attempt
+                if _is_gemini_overload(exc):
+                    wait = min(15 * (2 ** attempt) + random.uniform(0, 2), 120.0)
+                else:
+                    wait = min(2 ** attempt + random.uniform(0, 1), 30.0)
                 print(f"[phase3:summarize] {model_name} attempt {attempt+1} failed: {exc}; "
-                      f"retrying in {wait}s")
+                      f"retrying in {wait:.1f}s")
                 time.sleep(wait)
 
     log_error(
@@ -949,7 +1191,7 @@ def generate_summary_from_pdf(
     pdf_path: Path,
     *,
     prompt_template: str | None = None,
-    max_retries: int = 3,
+    max_retries: int = 5,
 ) -> dict:
     """
     Route one directly attached PDF to a provider and return the normal result.
@@ -972,10 +1214,15 @@ def generate_summary_from_pdf(
             return caller(pdf_path, prompt_template=prompt_template)
         except Exception as exc:
             last_error = exc
+            if _is_non_retriable_openai_error(exc):
+                break
             if attempt < max_retries - 1:
-                wait = 2 ** attempt
+                if _is_gemini_overload(exc):
+                    wait = min(15 * (2 ** attempt) + random.uniform(0, 2), 120.0)
+                else:
+                    wait = min(2 ** attempt + random.uniform(0, 1), 30.0)
                 print(f"[phase3:summarize] {model_name} PDF attempt {attempt+1} failed: {exc}; "
-                      f"retrying in {wait}s")
+                      f"retrying in {wait:.1f}s")
                 time.sleep(wait)
 
     log_error(
@@ -1173,8 +1420,8 @@ def run_realtime(
     Sequentially summarise each paper across each provider in real time.
     """
     providers = providers or list(all_providers())
-    prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(
-        guide_summary_path
+    prompt_templates, guide_summary, resolved_guide_path, _prompt_paths = (
+        load_provider_prompt_templates_with_optional_guide(providers, guide_summary_path)
     )
     if guide_summary:
         print(f"[phase3:summarize] using format guide: {resolved_guide_path}")
@@ -1238,13 +1485,18 @@ def run_realtime(
                 continue
 
             sleep_for_model(provider)
+            provider_prompt = prompt_template_for_provider(prompt_templates, provider)
             if input_source == "pdf":
                 # pdf_path is known to be present because missing PDFs were
                 # skipped above. This branch is the only place live direct-PDF
                 # calls happen, which keeps batch/dev runs safely text-only.
-                result = generate_summary_from_pdf(provider, pdf_path, prompt_template=prompt_template)
+                result = generate_summary_from_pdf(
+                    provider, pdf_path, prompt_template=provider_prompt
+                )
             else:
-                result = generate_summary(provider, article_text, prompt_template=prompt_template)
+                result = generate_summary(
+                    provider, article_text, prompt_template=provider_prompt
+                )
 
             entry["models"][provider] = result
 
@@ -1272,6 +1524,14 @@ def run_realtime(
 # ---------------------------------------------------------------------------
 # Folder-based summarisation (summarize-all workflow)
 # ---------------------------------------------------------------------------
+
+class SummaryRunStats(dict[str, int]):
+    """Counts dict plus the actual USD spent by that summarize-all source run."""
+
+    def __init__(self, counts: dict[str, int], *, budget_spent: float) -> None:
+        super().__init__(counts)
+        self.budget_spent = budget_spent
+
 
 def _format_human_readable(structured: dict) -> str:
     """
@@ -1374,10 +1634,17 @@ def _format_folder_entry_as_text(entry: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _write_folder_output(output_dir: Path, stem: str, entry: dict) -> Path:
-    """Atomically write one paper's multi-model summary to output_dir/stem.txt."""
+def _write_folder_output(
+    output_dir: Path,
+    stem: str,
+    entry: dict,
+    *,
+    output_suffix: str | None = None,
+) -> Path:
+    """Atomically write one paper's multi-model summary to the output folder."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{stem}.txt"
+    output_stem = f"{stem}__{output_suffix}" if output_suffix else stem
+    out_path = output_dir / f"{output_stem}.txt"
     tmp_path = out_path.with_suffix(".txt.tmp")
     tmp_path.write_text(_format_folder_entry_as_text(entry), encoding="utf-8")
     tmp_path.replace(out_path)
@@ -1452,11 +1719,12 @@ def summarize_all_pdfs(
     output_dir: Path | None = None,
     providers: list[str] | None = None,
     resume: bool = False,
-    prompt_template: str | None = None,
+    prompt_template: str | dict[str, str] | None = None,
     limit: int | None = None,
     raw_dir: Path | None = None,
     stems: set[str] | None = None,
-) -> dict[str, int]:
+    output_suffix: str | None = None,
+) -> SummaryRunStats:
     """
     Summarise every PDF in data/raw/ using all three providers.
 
@@ -1475,7 +1743,7 @@ def summarize_all_pdfs(
     pdfs = sorted(pdf_dir.glob("*.pdf"))
     if not pdfs:
         print(f"[phase3:summarize-all] No PDFs found in {pdf_dir}")
-        return counts
+        return SummaryRunStats(counts, budget_spent=guard.total_spent)
 
     processed = 0
     for pdf_path in pdfs:
@@ -1508,9 +1776,10 @@ def summarize_all_pdfs(
                 continue
 
             sleep_for_model(provider)
+            provider_prompt = prompt_template_for_provider(prompt_template, provider)
             try:
                 result = generate_summary_from_pdf(
-                    provider, pdf_path, prompt_template=prompt_template
+                    provider, pdf_path, prompt_template=provider_prompt
                 )
             except Exception as exc:
                 result = {
@@ -1543,12 +1812,14 @@ def summarize_all_pdfs(
                 counts["failed"] += 1
                 print(f"  {provider}: FAILED — {result.get('error')}")
 
-        written_path = _write_folder_output(out_dir, stem, entry)
+        written_path = _write_folder_output(
+            out_dir, stem, entry, output_suffix=output_suffix
+        )
         print(f"  wrote: {written_path}")
 
     print(f"\n[phase3:summarize-all] PDFs done. counts={counts}  "
           f"budget_spent=${guard.total_spent:.4f}")
-    return counts
+    return SummaryRunStats(counts, budget_spent=guard.total_spent)
 
 
 def summarize_all_processed_texts(
@@ -1556,11 +1827,12 @@ def summarize_all_processed_texts(
     output_dir: Path | None = None,
     providers: list[str] | None = None,
     resume: bool = False,
-    prompt_template: str | None = None,
+    prompt_template: str | dict[str, str] | None = None,
     limit: int | None = None,
     processed_dir: Path | None = None,
     stems: set[str] | None = None,
-) -> dict[str, int]:
+    output_suffix: str | None = None,
+) -> SummaryRunStats:
     """
     Summarise every processed JSONL file in data/processed/ using all three providers.
 
@@ -1579,7 +1851,7 @@ def summarize_all_processed_texts(
     records = _iter_processed_text_files(pdir)
     if not records:
         print(f"[phase3:summarize-all] No processed JSONL files found in {pdir}")
-        return counts
+        return SummaryRunStats(counts, budget_spent=guard.total_spent)
 
     processed_count = 0
     for record in records:
@@ -1612,9 +1884,10 @@ def summarize_all_processed_texts(
                 continue
 
             sleep_for_model(provider)
+            provider_prompt = prompt_template_for_provider(prompt_template, provider)
             try:
                 result = generate_summary(
-                    provider, str(record["text"]), prompt_template=prompt_template
+                    provider, str(record["text"]), prompt_template=provider_prompt
                 )
             except Exception as exc:
                 result = {
@@ -1647,12 +1920,14 @@ def summarize_all_processed_texts(
                 counts["failed"] += 1
                 print(f"  {provider}: FAILED — {result.get('error')}")
 
-        written_path = _write_folder_output(out_dir, stem, entry)
+        written_path = _write_folder_output(
+            out_dir, stem, entry, output_suffix=output_suffix
+        )
         print(f"  wrote: {written_path}")
 
     print(f"\n[phase3:summarize-all] Texts done. counts={counts}  "
           f"budget_spent=${guard.total_spent:.4f}")
-    return counts
+    return SummaryRunStats(counts, budget_spent=guard.total_spent)
 
 
 # ---------------------------------------------------------------------------
@@ -1699,8 +1974,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[phase3:summarize] input_source={args.input_source}")
 
     try:
-        _prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(
-            args.guide_summary
+        _prompt_templates, guide_summary, resolved_guide_path, _prompt_paths = (
+            load_provider_prompt_templates_with_optional_guide(providers, args.guide_summary)
         )
     except Exception as exc:
         print(f"[phase3:summarize] prompt validation failed: {exc}")

@@ -22,8 +22,11 @@ from _bootstrap import *  # noqa: F401,F403
 
 import argparse
 import json
+import os
+import random
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from models_config import all_providers  # noqa: E402
@@ -36,6 +39,30 @@ RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 SUMMARIES_PDF_DIR = DATA_DIR / "summaries_pdf"
 SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean env var with conservative, explicit true/false parsing."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    print(f"[phase3] WARNING: invalid {name}={raw!r}; using {default}.")
+    return default
+
+
+def _summarize_all_random_match() -> bool:
+    """Whether summarize-all samples matched article pairs randomly."""
+    return _env_bool("SUMMARIZE_ALL_RANDOM_MATCH", True)
+
+
+def _summarize_all_unique_output() -> bool:
+    """Whether summarize-all writes timestamped files instead of stem.txt."""
+    return _env_bool("SUMMARIZE_ALL_UNIQUE_OUTPUT", True)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +226,11 @@ def cmd_clean(_args: argparse.Namespace) -> int:
 # summarize-all  (folder-based: data/raw/*.pdf + data/processed/*.jsonl)
 # ---------------------------------------------------------------------------
 
-def _paired_summary_stems(limit: int | None) -> set[str] | None:
+def _paired_summary_stems(
+    limit: int | None,
+    *,
+    random_match: bool | None = None,
+) -> set[str] | None:
     """
     Return article stems that exist in both raw PDFs and processed text caches.
 
@@ -213,9 +244,17 @@ def _paired_summary_stems(limit: int | None) -> set[str] | None:
     pdf_stems = {path.stem for path in RAW_DIR.glob("*.pdf")}
     processed_stems = {path.stem for path in PROCESSED_DIR.glob("*.jsonl")}
     paired = sorted(pdf_stems & processed_stems)
-    if limit is not None:
-        paired = paired[:limit]
+    should_randomize = _summarize_all_random_match() if random_match is None else random_match
+    if limit is not None and limit < len(paired):
+        if not should_randomize:
+            return set(paired[:limit])
+        paired = random.sample(paired, limit)
     return set(paired)
+
+
+def _summary_run_suffix() -> str:
+    """Return a unique suffix shared by paired PDF/text summarize-all outputs."""
+    return datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S%fZ")
 
 
 def cmd_summarize_all(args: argparse.Namespace) -> int:
@@ -242,12 +281,18 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     from summarizer import (
         summarize_all_pdfs,
         summarize_all_processed_texts,
-        load_prompt_with_optional_guide,
+        load_provider_prompt_templates_with_optional_guide,
         confirm_real_batch,
     )
 
+    providers = (
+        [p.strip() for p in args.providers.split(",") if p.strip()]
+        if args.providers else None
+    )
     try:
-        prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(None)
+        prompt_templates, guide_summary, resolved_guide_path, _prompt_paths = (
+            load_provider_prompt_templates_with_optional_guide(providers, None)
+        )
     except Exception as exc:
         print(f"[phase3:summarize-all] prompt validation failed: {exc}")
         return 1
@@ -257,10 +302,6 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     if not confirm_real_batch(profile, force=args.force):
         return 1
 
-    providers = (
-        [p.strip() for p in args.providers.split(",") if p.strip()]
-        if args.providers else None
-    )
     # summarize-all is the manual PDF-vs-processed comparison workflow. Keep
     # its default narrow in test/single/dev: 1 matched article x 2 source types
     # x 3 providers = 6 summaries. Users can still pass --limit N explicitly
@@ -273,34 +314,51 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     if args.limit is None and profile.name in {"test", "single", "dev"}:
         print(f"[phase3:summarize-all] {profile.name} mode defaults to --limit 1; "
               "pass --limit N to create more matched comparison files.")
-    paired_stems = _paired_summary_stems(effective_limit)
+    random_match = _summarize_all_random_match()
+    unique_output = _summarize_all_unique_output()
+    paired_stems = _paired_summary_stems(effective_limit, random_match=random_match)
     if not paired_stems:
         print("[phase3:summarize-all] No matching article stems found between "
               "data/raw/*.pdf and data/processed/*.jsonl.")
         return 1
     print(f"[phase3:summarize-all] paired articles selected: {len(paired_stems)}")
+    print(f"[phase3:summarize-all] random match: {str(random_match).lower()}")
+    output_suffix = _summary_run_suffix() if unique_output else None
+    if output_suffix:
+        print(f"[phase3:summarize-all] output run suffix: {output_suffix}")
+    else:
+        print("[phase3:summarize-all] unique output disabled; writing <stem>.txt files.")
 
     pdf_counts = summarize_all_pdfs(
         output_dir=SUMMARIES_PDF_DIR,
         providers=providers,
         resume=args.resume,
-        prompt_template=prompt_template,
+        prompt_template=prompt_templates,
         limit=effective_limit,
         stems=paired_stems,
+        output_suffix=output_suffix,
     )
 
     txt_counts = summarize_all_processed_texts(
         output_dir=SUMMARIES_TXT_DIR,
         providers=providers,
         resume=args.resume,
-        prompt_template=prompt_template,
+        prompt_template=prompt_templates,
         limit=effective_limit,
         stems=paired_stems,
+        output_suffix=output_suffix,
     )
 
     total = {k: pdf_counts.get(k, 0) + txt_counts.get(k, 0)
              for k in set(pdf_counts) | set(txt_counts)}
+    pdf_cost = float(getattr(pdf_counts, "budget_spent", 0.0))
+    txt_cost = float(getattr(txt_counts, "budget_spent", 0.0))
+    combined_cost = pdf_cost + txt_cost
     print(f"\n[phase3:summarize-all] TOTAL counts={total}")
+    print("[phase3:summarize-all] COSTS")
+    print(f"  PDF/raw summaries:          ${pdf_cost:.4f}")
+    print(f"  Processed JSONL summaries:  ${txt_cost:.4f}")
+    print(f"  Combined total:             ${combined_cost:.4f}")
     return 0
 
 

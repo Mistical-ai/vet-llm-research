@@ -35,6 +35,7 @@ def _force_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     that doesn't explicitly override it.
     """
     monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setenv("PROMPT_MODE", "shared")
     monkeypatch.setattr(summarizer, "DRY_RUN", True)
 
 
@@ -118,6 +119,101 @@ def test_default_prompt_file_loads_and_keeps_article_placeholder() -> None:
     assert "{ARTICLE_TEXT}" in template
     prompt_template, _guide_summary, _guide_path = summarizer.load_prompt_with_optional_guide(None)
     assert "{ARTICLE_TEXT}" in prompt_template
+
+
+def test_shared_prompt_mode_returns_same_template_for_each_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROMPT_MODE", "shared")
+
+    templates, _guide_summary, _guide_path, prompt_paths = (
+        summarizer.load_provider_prompt_templates_with_optional_guide(
+            ["openai", "anthropic", "gemini"], None
+        )
+    )
+
+    assert templates["openai"] == templates["anthropic"] == templates["gemini"]
+    assert prompt_paths["openai"] == prompt_paths["anthropic"] == prompt_paths["gemini"]
+    assert "{ARTICLE_TEXT}" in templates["openai"]
+
+
+def test_provider_specific_prompt_mode_loads_distinct_templates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openai_prompt = tmp_path / "openai.txt"
+    anthropic_prompt = tmp_path / "anthropic.txt"
+    gemini_prompt = tmp_path / "gemini.txt"
+    openai_prompt.write_text("OpenAI prompt {ARTICLE_TEXT}", encoding="utf-8")
+    anthropic_prompt.write_text("Anthropic prompt {ARTICLE_TEXT}", encoding="utf-8")
+    gemini_prompt.write_text("Gemini prompt {ARTICLE_TEXT}", encoding="utf-8")
+
+    monkeypatch.setenv("PROMPT_MODE", "provider_specific")
+    monkeypatch.setenv("OPENAI_PROMPT_FILE", str(openai_prompt))
+    monkeypatch.setenv("ANTHROPIC_PROMPT_FILE", str(anthropic_prompt))
+    monkeypatch.setenv("GEMINI_PROMPT_FILE", str(gemini_prompt))
+
+    templates, _guide_summary, _guide_path, prompt_paths = (
+        summarizer.load_provider_prompt_templates_with_optional_guide(
+            ["openai", "anthropic", "gemini"], None
+        )
+    )
+
+    assert templates["openai"].startswith("OpenAI prompt")
+    assert templates["anthropic"].startswith("Anthropic prompt")
+    assert templates["gemini"].startswith("Gemini prompt")
+    assert prompt_paths["openai"] == openai_prompt
+
+
+def test_provider_specific_prompt_validation_requires_article_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_prompt = tmp_path / "bad_openai.txt"
+    bad_prompt.write_text("No article placeholder here.", encoding="utf-8")
+
+    monkeypatch.setenv("PROMPT_MODE", "provider_specific")
+    monkeypatch.setenv("OPENAI_PROMPT_FILE", str(bad_prompt))
+
+    with pytest.raises(ValueError, match="ARTICLE_TEXT"):
+        summarizer.load_provider_prompt_templates_with_optional_guide(["openai"], None)
+
+
+def test_summarize_all_processed_texts_routes_provider_specific_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    (processed_dir / "paper.jsonl").write_text(
+        json.dumps({"doi": "10.9999/prompt", "slug": "paper", "text": "Clinical body."})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    captured_prompts: dict[str, str | None] = {}
+
+    def _fake_generate(provider: str, text: str, **kwargs) -> dict:
+        captured_prompts[provider] = kwargs["prompt_template"]
+        return summarizer._mock_summary(provider, text)
+
+    monkeypatch.setattr(summarizer, "generate_summary", _fake_generate)
+    monkeypatch.setattr(summarizer, "sleep_for_model", lambda _provider: None)
+
+    summarizer.summarize_all_processed_texts(
+        output_dir=tmp_path / "summaries_txt",
+        processed_dir=processed_dir,
+        providers=["openai", "gemini"],
+        prompt_template={
+            "openai": "OpenAI only {ARTICLE_TEXT}",
+            "gemini": "Gemini only {ARTICLE_TEXT}",
+        },
+    )
+
+    assert captured_prompts == {
+        "openai": "OpenAI only {ARTICLE_TEXT}",
+        "gemini": "Gemini only {ARTICLE_TEXT}",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +348,9 @@ def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch
     assert isinstance(response_schema, dict)
     assert response_schema["properties"]["headline"]["type"] == "string"
     assert "default" not in json.dumps(response_schema)
+    assert "anyOf" not in json.dumps(response_schema)
+    assert "title" not in json.dumps(response_schema)
+    assert response_schema["properties"]["sample_size"].get("nullable") is True
 
 
 def test_anthropic_tool_call_returns_validated_summary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -806,6 +905,7 @@ def test_summarize_all_pdfs_test_mode_writes_output_files(
     # 2 PDFs × 3 providers = 6 successes
     assert counts["success"] == 6
     assert counts["failed"] == 0
+    assert counts.budget_spent > 0
 
     # One readable text file per PDF
     assert (pdf_output / "paper1.txt").exists()
@@ -894,6 +994,48 @@ def test_summarize_all_pdfs_limit_respected(tmp_path: Path) -> None:
     assert len(txt_files) == 2
 
 
+def test_summarize_all_outputs_can_use_shared_suffix(tmp_path: Path) -> None:
+    """A summarize-all CLI run can create paired unique files in both output folders."""
+    processed_dir = tmp_path / "processed"
+    raw_dir = tmp_path / "raw"
+    processed_dir.mkdir()
+    raw_dir.mkdir()
+
+    stem = "journal__study_title__10_9999_suffix"
+    suffix = "run_20260617T131100000000Z"
+    (raw_dir / f"{stem}.pdf").write_bytes(b"%PDF-1.4")
+    (processed_dir / f"{stem}.jsonl").write_text(
+        json.dumps({
+            "doi": "10.9999/suffix",
+            "slug": "10_9999_suffix",
+            "text": "Clinical trial body. " * 30,
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    pdf_output = tmp_path / "summaries_pdf"
+    txt_output = tmp_path / "summaries_txt"
+    summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai"],
+        stems={stem},
+        output_suffix=suffix,
+    )
+    summarizer.summarize_all_processed_texts(
+        output_dir=txt_output,
+        processed_dir=processed_dir,
+        providers=["openai"],
+        stems={stem},
+        output_suffix=suffix,
+    )
+
+    assert (pdf_output / f"{stem}__{suffix}.txt").exists()
+    assert (txt_output / f"{stem}__{suffix}.txt").exists()
+    assert not (pdf_output / f"{stem}.txt").exists()
+    assert not (txt_output / f"{stem}.txt").exists()
+
+
 # ---------------------------------------------------------------------------
 # Folder-based summarize_all_processed_texts (test mode — no API calls)
 # ---------------------------------------------------------------------------
@@ -927,6 +1069,7 @@ def test_summarize_all_processed_texts_test_mode_writes_output_files(
 
     assert counts["success"] == 6
     assert counts["failed"] == 0
+    assert counts.budget_spent > 0
 
     txt_files = list(txt_output.glob("*.txt"))
     assert len(txt_files) == 2
@@ -1027,40 +1170,175 @@ def test_failed_provider_does_not_stop_other_providers_or_files(
 # summarize-all CLI command (test mode)
 # ---------------------------------------------------------------------------
 
+def test_run_phase3_paired_summary_stems_randomly_samples(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default one-pair runs should not always select the first sorted article."""
+    import run_phase3
+
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir()
+    processed_dir.mkdir()
+    for stem in ("alpha", "beta", "gamma"):
+        (raw_dir / f"{stem}.pdf").write_bytes(b"%PDF-1.4")
+        (processed_dir / f"{stem}.jsonl").write_text(
+            json.dumps({"text": "body"}) + "\n", encoding="utf-8"
+        )
+
+    captured: dict[str, object] = {}
+
+    def _fake_sample(population, k):
+        captured["population"] = population
+        captured["k"] = k
+        return ["gamma"]
+
+    monkeypatch.setattr(run_phase3, "RAW_DIR", raw_dir)
+    monkeypatch.setattr(run_phase3, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(run_phase3.random, "sample", _fake_sample)
+    monkeypatch.setenv("SUMMARIZE_ALL_RANDOM_MATCH", "true")
+
+    assert run_phase3._paired_summary_stems(1) == {"gamma"}
+    assert captured["population"] == ["alpha", "beta", "gamma"]
+    assert captured["k"] == 1
+
+
+def test_run_phase3_paired_summary_stems_can_be_deterministic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Env/config can keep choosing the first sorted matched article."""
+    import run_phase3
+
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir()
+    processed_dir.mkdir()
+    for stem in ("alpha", "beta", "gamma"):
+        (raw_dir / f"{stem}.pdf").write_bytes(b"%PDF-1.4")
+        (processed_dir / f"{stem}.jsonl").write_text(
+            json.dumps({"text": "body"}) + "\n", encoding="utf-8"
+        )
+
+    def _unexpected_sample(_population, _k):
+        raise AssertionError("random.sample should not be called")
+
+    monkeypatch.setattr(run_phase3, "RAW_DIR", raw_dir)
+    monkeypatch.setattr(run_phase3, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(run_phase3.random, "sample", _unexpected_sample)
+    monkeypatch.setenv("SUMMARIZE_ALL_RANDOM_MATCH", "false")
+
+    assert run_phase3._paired_summary_stems(1) == {"alpha"}
+    assert run_phase3._paired_summary_stems(2) == {"alpha", "beta"}
+
+
 def test_run_phase3_summarize_all_single_mode_limits_both_sources(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """single mode means 1 PDF + 1 processed text, for 6 summaries total."""
     import run_phase3
 
     captured: dict[str, object] = {}
 
-    def _fake_load_prompt(_path=None):
-        return "Prompt {ARTICLE_TEXT}", None, Path("guide.txt")
+    def _fake_load_prompts(_providers=None, _path=None):
+        return {"openai": "Prompt {ARTICLE_TEXT}"}, None, Path("guide.txt"), {}
 
     def _fake_confirm(_profile, force=False):
         return True
 
     def _fake_pdfs(**kwargs):
         captured["pdf_limit"] = kwargs["limit"]
-        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+        captured["pdf_suffix"] = kwargs["output_suffix"]
+        return summarizer.SummaryRunStats(
+            {"success": 3, "failed": 0, "skipped": 0, "no_source": 0},
+            budget_spent=1.25,
+        )
 
     def _fake_texts(**kwargs):
         captured["txt_limit"] = kwargs["limit"]
         captured["txt_stems"] = kwargs["stems"]
-        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+        captured["txt_suffix"] = kwargs["output_suffix"]
+        return summarizer.SummaryRunStats(
+            {"success": 3, "failed": 0, "skipped": 0, "no_source": 0},
+            budget_spent=0.75,
+        )
 
-    monkeypatch.setattr(summarizer, "load_prompt_with_optional_guide", _fake_load_prompt)
+    monkeypatch.setattr(
+        summarizer,
+        "load_provider_prompt_templates_with_optional_guide",
+        _fake_load_prompts,
+    )
     monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
     monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
     monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
-    monkeypatch.setattr(run_phase3, "_paired_summary_stems", lambda _limit: {"same_article"})
+    monkeypatch.setattr(
+        run_phase3,
+        "_paired_summary_stems",
+        lambda _limit, **_kwargs: {"same_article"},
+    )
+    monkeypatch.setattr(run_phase3, "_summary_run_suffix", lambda: "run_test")
 
     ret = run_phase3.main(["summarize-all", "--mode", "single"])
     assert ret == 0
     assert captured["pdf_limit"] == 1
     assert captured["txt_limit"] == 1
     assert captured["txt_stems"] == {"same_article"}
+    assert captured["pdf_suffix"] == "run_test"
+    assert captured["txt_suffix"] == "run_test"
+    out = capsys.readouterr().out
+    assert "output run suffix: run_test" in out
+    assert "[phase3:summarize-all] COSTS" in out
+    assert "PDF/raw summaries:          $1.2500" in out
+    assert "Processed JSONL summaries:  $0.7500" in out
+    assert "Combined total:             $2.0000" in out
+
+
+def test_run_phase3_summarize_all_can_disable_unique_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SUMMARIZE_ALL_UNIQUE_OUTPUT=false writes legacy stem.txt filenames."""
+    import run_phase3
+
+    captured: dict[str, object] = {}
+
+    def _fake_load_prompts(_providers=None, _path=None):
+        return {"openai": "Prompt {ARTICLE_TEXT}"}, None, Path("guide.txt"), {}
+
+    def _fake_pdfs(**kwargs):
+        captured["pdf_suffix"] = kwargs["output_suffix"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _fake_texts(**kwargs):
+        captured["txt_suffix"] = kwargs["output_suffix"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _unexpected_suffix():
+        raise AssertionError("unique suffix should not be generated")
+
+    monkeypatch.setenv("SUMMARIZE_ALL_UNIQUE_OUTPUT", "false")
+    monkeypatch.setattr(
+        summarizer,
+        "load_provider_prompt_templates_with_optional_guide",
+        _fake_load_prompts,
+    )
+    monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
+    monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+    monkeypatch.setattr(
+        run_phase3,
+        "_paired_summary_stems",
+        lambda _limit, **_kwargs: {"same_article"},
+    )
+    monkeypatch.setattr(run_phase3, "_summary_run_suffix", _unexpected_suffix)
+
+    ret = run_phase3.main(["summarize-all", "--mode", "test"])
+    assert ret == 0
+    assert captured["pdf_suffix"] is None
+    assert captured["txt_suffix"] is None
+    out = capsys.readouterr().out
+    assert "unique output disabled; writing <stem>.txt files" in out
 
 
 def test_run_phase3_summarize_all_test_mode_defaults_to_one_pair(
@@ -1071,8 +1349,8 @@ def test_run_phase3_summarize_all_test_mode_defaults_to_one_pair(
 
     captured: dict[str, object] = {}
 
-    def _fake_load_prompt(_path=None):
-        return "Prompt {ARTICLE_TEXT}", None, Path("guide.txt")
+    def _fake_load_prompts(_providers=None, _path=None):
+        return {"openai": "Prompt {ARTICLE_TEXT}"}, None, Path("guide.txt"), {}
 
     def _fake_pdfs(**kwargs):
         captured["pdf_limit"] = kwargs["limit"]
@@ -1084,10 +1362,18 @@ def test_run_phase3_summarize_all_test_mode_defaults_to_one_pair(
         captured["txt_stems"] = kwargs["stems"]
         return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
 
-    monkeypatch.setattr(summarizer, "load_prompt_with_optional_guide", _fake_load_prompt)
+    monkeypatch.setattr(
+        summarizer,
+        "load_provider_prompt_templates_with_optional_guide",
+        _fake_load_prompts,
+    )
     monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
     monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
-    monkeypatch.setattr(run_phase3, "_paired_summary_stems", lambda _limit: {"same_article"})
+    monkeypatch.setattr(
+        run_phase3,
+        "_paired_summary_stems",
+        lambda _limit, **_kwargs: {"same_article"},
+    )
 
     ret = run_phase3.main(["summarize-all", "--mode", "test"])
     assert ret == 0
@@ -1105,8 +1391,8 @@ def test_run_phase3_summarize_all_dev_mode_defaults_to_one_pair(
 
     captured: dict[str, object] = {}
 
-    def _fake_load_prompt(_path=None):
-        return "Prompt {ARTICLE_TEXT}", None, Path("guide.txt")
+    def _fake_load_prompts(_providers=None, _path=None):
+        return {"openai": "Prompt {ARTICLE_TEXT}"}, None, Path("guide.txt"), {}
 
     def _fake_confirm(_profile, force=False):
         return True
@@ -1121,11 +1407,19 @@ def test_run_phase3_summarize_all_dev_mode_defaults_to_one_pair(
         captured["txt_stems"] = kwargs["stems"]
         return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
 
-    monkeypatch.setattr(summarizer, "load_prompt_with_optional_guide", _fake_load_prompt)
+    monkeypatch.setattr(
+        summarizer,
+        "load_provider_prompt_templates_with_optional_guide",
+        _fake_load_prompts,
+    )
     monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
     monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
     monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
-    monkeypatch.setattr(run_phase3, "_paired_summary_stems", lambda _limit: {"same_article"})
+    monkeypatch.setattr(
+        run_phase3,
+        "_paired_summary_stems",
+        lambda _limit, **_kwargs: {"same_article"},
+    )
 
     ret = run_phase3.main(["summarize-all", "--mode", "dev"])
     assert ret == 0

@@ -222,7 +222,7 @@ def run_batch_summarisation(
     # have run first.
     from summarizer import (  # noqa: E402
         load_existing_summaries,
-        load_prompt_with_optional_guide,
+        load_provider_prompt_templates_with_optional_guide,
         build_user_message,
         GUIDE_SUMMARY_FILE,
         _new_summary_entry,
@@ -230,8 +230,10 @@ def run_batch_summarisation(
     )
 
     providers = providers or ["openai", "anthropic"]
-    prompt_template, guide_summary, resolved_guide_path = load_prompt_with_optional_guide(
-        guide_summary_path or GUIDE_SUMMARY_FILE
+    prompt_templates, guide_summary, resolved_guide_path, _prompt_paths = (
+        load_provider_prompt_templates_with_optional_guide(
+            providers, guide_summary_path or GUIDE_SUMMARY_FILE
+        )
     )
     if guide_summary:
         print(f"[phase3:batch] using format guide: {resolved_guide_path}")
@@ -256,13 +258,14 @@ def run_batch_summarisation(
         entry = summaries_by_doi.get(doi) or _new_summary_entry(record)
         summaries_by_doi[doi] = entry
 
-        user_message = build_user_message(article_text, prompt_template)
-
         for provider in providers:
             slot = entry["models"].get(provider, {})
             if resume and slot.get("status") == "success":
                 continue
             spec = get_model_spec(provider)
+            # Build inside the provider loop so PROMPT_MODE=provider_specific
+            # changes only the intended provider's request body.
+            user_message = build_user_message(article_text, prompt_templates[provider])
             if provider == "openai":
                 rows_per_provider["openai"].append(
                     build_openai_request(custom_id=slug, user_message=user_message,

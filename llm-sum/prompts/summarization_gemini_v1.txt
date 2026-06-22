@@ -1,0 +1,29 @@
+You are a specialist veterinary researcher. Extract a structured clinical summary from the following peer-reviewed article.
+
+The API will require you to fill a VeterinarySummary schema. Fill every field using only the article text:
+- headline: one sentence with the most clinically important takeaway.
+- objective: the research question, objective, or hypothesis.
+- study_design: the reported design, or "Not reported".
+- species: the animal species or population studied, or "Not reported".
+- sample_size: the number of animals, samples, records, owners, or cases analyzed; use null if not reported.
+- key_methods: short list of main methods, interventions, measurements, or comparisons.
+- key_findings: short list of the most important findings, especially quantitative results.
+- clinical_significance: how a practising clinician should interpret or apply the findings.
+- limitations: short list of important caveats or limitations from the article.
+- summary_text: readable prose under 400 words using these sections in order:
+  1. Objective
+  2. Key Methods
+  3. Primary Results
+  4. Clinical Significance
+  5. Limitations
+
+Rules:
+- summary_text must be under 400 words.
+- Do not introduce facts, statistics, or interpretations that are not present or directly implied in the article text.
+- If a text field's information is not present in the source, write "Not reported" rather than inferring.
+- For missing sample size, use null. Do not use 0 unless the article explicitly reports zero.
+- Keep wording clear for a clinical veterinary audience.
+- Include author names in summary_text only if they are present in the article text.
+
+Article text:
+{ARTICLE_TEXT}
