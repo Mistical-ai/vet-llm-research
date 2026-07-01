@@ -23,6 +23,7 @@ import pytest
 import summarizer
 from models_config import compute_cost, get_model_spec
 from utils import BudgetGuard
+import utils
 
 
 @pytest.fixture(autouse=True)
@@ -226,6 +227,7 @@ def _fake_openai_response(specific_version: str = "gpt-5.4-0325-preview") -> Sim
         choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))],
         usage=SimpleNamespace(prompt_tokens=1234, completion_tokens=456),
         model=specific_version,
+        system_fingerprint="fp-openai-test",
     )
 
 
@@ -262,6 +264,7 @@ def test_drift_openai_model_version_from_response(monkeypatch: pytest.MonkeyPatc
     assert result["model_version"] != "gpt-5"
     assert result["input_tokens"] == 1234
     assert result["output_tokens"] == 456
+    assert result["system_fingerprint"] == "fp-openai-test"
     assert result["summary"] == result["structured_summary"]["summary_text"]
     assert captured_kwargs["response_format"] is summarizer.VeterinarySummary
     assert captured_kwargs["max_completion_tokens"] == summarizer.MAX_OUTPUT_TOKENS
@@ -430,6 +433,24 @@ def test_penny_budget_matches_models_config_pricing() -> None:
     guard = BudgetGuard(hard_stop=10.0)
     guard.add_cost(got)
     assert abs(guard.total_spent - expected) < 1e-9
+
+
+def test_paid_run_preflight_rejects_zero_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(utils, "BUDGET_HARD_STOP", 0.0)
+    with pytest.raises(SystemExit):
+        utils.require_positive_budget_for_real_run(
+            dry_run=False,
+            context="test paid run",
+        )
+
+
+def test_paid_run_preflight_allows_dry_run_with_zero_budget(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(utils, "BUDGET_HARD_STOP", 0.0)
+    utils.require_positive_budget_for_real_run(
+        dry_run=True,
+        context="test dry run",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +629,7 @@ def test_openai_pdf_call_uploads_file_and_parses_schema(
                 output_parsed=summarizer.VeterinarySummary(**_valid_summary_dict()),
                 usage=SimpleNamespace(input_tokens=3210, output_tokens=210),
                 model="gpt-5.4-pdf-test",
+                system_fingerprint="fp-pdf-test",
             )
 
     class _FakeClient:
@@ -626,6 +648,7 @@ def test_openai_pdf_call_uploads_file_and_parses_schema(
     assert result["input_tokens"] == 3210
     assert result["output_tokens"] == 210
     assert result["model_version"] == "gpt-5.4-pdf-test"
+    assert result["system_fingerprint"] == "fp-pdf-test"
     assert captured["file_purpose"] == "user_data"
     assert captured["file_name"] == "paper.pdf"
     content = captured["response_kwargs"]["input"][0]["content"]
@@ -633,6 +656,7 @@ def test_openai_pdf_call_uploads_file_and_parses_schema(
     assert content[1]["type"] == "input_text"
     assert "attached as a PDF" in content[1]["text"]
     assert captured["response_kwargs"]["text_format"] is summarizer.VeterinarySummary
+    assert captured["response_kwargs"]["seed"] == summarizer.SEED
 
 
 def test_anthropic_pdf_call_sends_document_block(

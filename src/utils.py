@@ -145,6 +145,25 @@ class BudgetGuard:
         )
 
 
+def require_positive_budget_for_real_run(*, dry_run: bool, context: str) -> None:
+    """
+    Fail before a paid run when the hard stop is still the safe $0 default.
+
+    BudgetGuard still enforces the invariant before/after each cost addition.
+    This preflight exists for usability: a non-test Phase 3 run with a zero-dollar
+    budget should explain the configuration problem before the first API call,
+    not after a provider response comes back.
+    """
+    if dry_run or BUDGET_HARD_STOP > 0:
+        return
+    print(
+        f"\n[BudgetGuard] Cannot start {context} with BUDGET_HARD_STOP=$0.00.\n"
+        "  Set BUDGET_HARD_STOP in your environment to the maximum dollars you "
+        "are willing to spend, or run with PHASE3_MODE=test for mocks only.\n"
+    )
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # sleep_for_model
 # ---------------------------------------------------------------------------

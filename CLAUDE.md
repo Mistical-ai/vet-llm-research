@@ -15,5 +15,5 @@
 - Running unit tests under `tests/` is allowed because mocks replace every external API call. Verify mocking is in place before running.
 - **Phase 3 mode rule:** Claude may run Phase 3 scripts only with `PHASE3_MODE=test` (mocks only, no network). Modes `single`, `dev`, and `batch` make live API calls and must be executed manually by the user in PowerShell. The interactive confirm prompt is the last guardrail before a live run. The previous `DEVELOPMENT_MODE` constant has been removed; the same safety intent now lives in `llm-sum/phase3_mode.py` and the safest mode (`test`) is the default.
 - All paid API calls must flow through `BudgetGuard.add_cost()` from `src/utils.py`. Token counts must come from the provider response, never from estimation.
-- Append-only output: never overwrite `data/summaries.jsonl` or `data/evaluations.jsonl`. New writes append one JSON line at a time.
+- Output safety: `data/evaluations.jsonl` is append-only. `data/summaries.jsonl` is a JSONL snapshot that may be atomically rewritten when provider slots are merged for resume support; never hand-edit either file or replace them with a non-JSONL format.
 - The judge prompt must never contain a summariser model identifier. The blind protocol is non-negotiable for study validity.

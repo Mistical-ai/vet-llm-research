@@ -92,6 +92,8 @@ def download_anthropic_results(job_id: str, dest: Path) -> Path:
 def _load_summaries() -> dict[str, dict]:
     if not SUMMARIES_PATH.exists():
         return {}
+    from summarizer import _entry_key  # noqa: E402
+
     out: dict[str, dict] = {}
     with open(SUMMARIES_PATH, encoding="utf-8") as f:
         for line in f:
@@ -104,12 +106,16 @@ def _load_summaries() -> dict[str, dict]:
                 continue
             doi = str(entry.get("doi", "")).strip()
             if doi:
-                out[doi] = entry
+                out[_entry_key(entry)] = entry
     return out
 
 
-def _build_slug_to_doi(summaries: dict[str, dict]) -> dict[str, str]:
-    return {entry.get("custom_id", ""): doi for doi, entry in summaries.items()}
+def _build_custom_id_to_key(summaries: dict[str, dict]) -> dict[str, str]:
+    return {
+        str(entry.get("custom_id") or ""): key
+        for key, entry in summaries.items()
+        if entry.get("custom_id")
+    }
 
 
 def _write_summaries(summaries: dict[str, dict]) -> None:
@@ -131,7 +137,7 @@ def merge_summarisation_results(result_path: Path, provider: str) -> int:
     )
 
     summaries = _load_summaries()
-    slug_to_doi = _build_slug_to_doi(summaries)
+    custom_id_to_key = _build_custom_id_to_key(summaries)
 
     merged = 0
     with open(result_path, encoding="utf-8") as f:
@@ -141,12 +147,12 @@ def merge_summarisation_results(result_path: Path, provider: str) -> int:
                 continue
             parsed = parser(line)
             custom_id = parsed.pop("custom_id", "")
-            doi = slug_to_doi.get(custom_id)
-            if not doi:
+            summary_key = custom_id_to_key.get(custom_id)
+            if not summary_key:
                 log_error(custom_id, "batch_merge",
                           f"custom_id has no matching DOI in summaries.jsonl")
                 continue
-            entry = summaries[doi]
+            entry = summaries[summary_key]
             entry.setdefault("models", {})[provider] = parsed
             merged += 1
 
@@ -173,7 +179,7 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str) -> in
         parse_openai_result_line if provider == "openai" else parse_anthropic_result_line
     )
     summaries = _load_summaries()
-    slug_to_doi = _build_slug_to_doi(summaries)
+    custom_id_to_key = _build_custom_id_to_key(summaries)
 
     merged = 0
     with open(result_path, encoding="utf-8") as in_f:
@@ -181,7 +187,7 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str) -> in
             line = line.strip()
             if not line:
                 continue
-            parsed = parser(line)
+            parsed = parser(line, expect_summary_schema=False)
             cid = parsed.pop("custom_id", "")
             pair = parse_evaluation_custom_id(cid)
             if pair is None:
@@ -189,8 +195,8 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str) -> in
                           "evaluation custom_id did not match slug__summariser pattern")
                 continue
             slug, summariser = pair
-            doi = slug_to_doi.get(slug)
-            if not doi:
+            summary_key = custom_id_to_key.get(slug)
+            if not summary_key:
                 log_error(cid, "batch_merge",
                           "evaluation slug has no matching DOI in summaries.jsonl")
                 continue
@@ -210,13 +216,16 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str) -> in
                 "model_version": parsed.get("model_version", ""),
             }
 
-            entry = summaries[doi]
+            entry = summaries[summary_key]
+            doi = str(entry.get("doi", "")).strip()
+            input_source = str(entry.get("input_source") or "processed")
             candidate_summary = (entry.get("models") or {}).get(summariser, {}).get("summary", "")
 
             row = build_evaluation_row(
                 doi=doi,
                 summariser=summariser,
                 judge=judge,
+                input_source=input_source,
                 reference_text="",   # not stored in the output row — safe to omit
                 candidate_summary=candidate_summary,
                 judge_response=judge_response,

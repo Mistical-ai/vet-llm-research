@@ -50,7 +50,7 @@ There is no `--mode` flag because the script ignores the active mode by design.
 | `No batch jobs found at data/batch_jobs.jsonl`     | No batches have been submitted yet.                                  | Run `python llm-sum/run_phase3.py summarize` with `PHASE3_MODE=batch` first.              |
 | Status stays `in_progress` for >24h                | Provider batch backlog (rare).                                       | Check the provider's status page; rerun the polling script periodically.                  |
 | `failed` status with `error: rate_limited`         | Submission was too large for the batch endpoint at that moment.      | Resubmit by re-running `summarize`; resume picks up only the unsuccessful slots.          |
-| Duplicate rows in `summaries.jsonl`                | Cannot happen — merge is keyed on `(doi, provider)` and replaces slots in place. | Report a bug. |
+| Duplicate rows in `summaries.jsonl`                | Merge keys use the batch `custom_id`, which encodes DOI plus input source, then replace the matching provider slot in place. | Report a bug if the same `(doi, input_source, provider)` appears twice. |
 
 ## Worked example
 

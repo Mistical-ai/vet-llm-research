@@ -64,7 +64,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from models_config import all_providers, compute_cost, get_model_spec  # noqa: E402
 from file_paths import doi_to_slug, resolve_existing_pdf_path  # noqa: E402
-from utils import BudgetGuard, log_error, sleep_for_model  # noqa: E402
+from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
 from extract import truncate_to_limit  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 
@@ -299,6 +299,7 @@ def _successful_summary_result(
     input_tokens: int,
     output_tokens: int,
     model_version: str,
+    system_fingerprint: str | None = None,
 ) -> dict:
     """Wrap a validated summary with provider metadata used downstream."""
     result = veterinary_summary_to_result(parsed)
@@ -307,6 +308,7 @@ def _successful_summary_result(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "model_version": model_version,
+        "system_fingerprint": system_fingerprint,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     return result
@@ -814,6 +816,7 @@ def _call_openai(article_text: str, *, prompt_template: str | None) -> dict:
         # "gpt-5.4-0325-preview" — not the alias "gpt-5.4" we requested.
         # Logging this lets us detect silent model updates across runs.
         model_version=str(response.model),
+        system_fingerprint=getattr(response, "system_fingerprint", None),
     )
 
 
@@ -999,14 +1002,14 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     }
     try:
         response = _openai_call_with_backoff(
-            lambda: client.responses.parse(**base_kwargs, temperature=TEMPERATURE)
+            lambda: client.responses.parse(**base_kwargs, temperature=TEMPERATURE, seed=SEED)
         )
     except Exception as exc:
         if not _openai_is_temperature_error(exc):
             raise
         print(f"[phase3:summarize] {spec.model_id} rejected temperature for PDF — retrying without it.")
         response = _openai_call_with_backoff(
-            lambda: client.responses.parse(**base_kwargs)
+            lambda: client.responses.parse(**base_kwargs, seed=SEED)
         )
 
     parsed = _extract_openai_parsed_summary(response)
@@ -1016,6 +1019,7 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
         input_tokens=_response_usage_int(usage, "input_tokens", "prompt_tokens"),
         output_tokens=_response_usage_int(usage, "output_tokens", "completion_tokens"),
         model_version=str(getattr(response, "model", spec.model_id)),
+        system_fingerprint=getattr(response, "system_fingerprint", None),
     )
 
 
@@ -1985,6 +1989,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not confirm_real_batch(profile, force=args.force):
         return 1
+    require_positive_budget_for_real_run(
+        dry_run=profile.dry_run,
+        context="Phase 3 summarization",
+    )
 
     if profile.use_batch:
         # Lazy import so unit tests don't need the batch dependencies loaded.

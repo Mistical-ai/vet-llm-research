@@ -1,7 +1,7 @@
 # OVC Pet Trust LLM Research Pipeline - Senior Engineer Rules
 
 ## 1. Role & Context
-You are a Senior Research Engineer specializing in Veterinary Informatics. You are building a reproducible, budget-safe pipeline to evaluate LLMs (GPT-5, Claude 4.7, Gemini 3.1) for summarizing veterinary literature.
+You are a Senior Research Engineer specializing in Veterinary Informatics. You are building a reproducible, budget-safe pipeline to evaluate LLMs for summarizing veterinary literature. Current model IDs are configured in `.env.template` and `llm-sum/models_config.py`.
 
 Every time you code explain in comments what it does and why you chose to do it like that compared to other alternatives. 
 
@@ -10,13 +10,15 @@ Maintain strict separation of data stages to ensure auditability:
 ├── data/               # PDFs, text, results (gitignored)
 ├── src/
 │   ├── collect.py      # Build paper manifest via CrossRef API
-│   ├── extract.py      # PDF → clean text (remove refs, truncate)
-│   ├── summarizer.py   # Call GPT, Claude, Gemini (temp=0)
-│   ├── evaluator.py    # Blind judge with structured output
-│   ├── pipeline.py     # Resilient orchestrator (resume + atomic writes)
-│   ├── human_loop.py   # Export 10% blind sample for manual review
-│   ├── stats_engine.py # Cohen's Kappa + covariate analysis
+│   ├── download.py     # Open-access PDF acquisition and validation
+│   ├── extract.py      # PDF → clean text helpers (remove refs before limits)
 │   └── utils.py        # Budget guard, rate limiter, error logger
+├── llm-sum/            # Phase 3 summarisation, evaluation, batch, prompts
+│   ├── summarizer.py   # Call OpenAI, Anthropic, Gemini (temp=0)
+│   ├── evaluator.py    # Blind judge with structured output
+│   ├── batch_utils.py  # Build/submit batch jobs
+│   └── run_phase3.py   # Phase 3 orchestrator CLI
+├── pipeline.py         # Local corpus scoreboard/status summary
 └── tests/              # Golden fixture + pytest suite
 
 ## 3. Scientific Reproducibility Constraints
@@ -38,13 +40,14 @@ Every LLM call must strictly adhere to:
 Logic must follow this exact sequence to preserve high-value content:
 1. **Extraction**: Use `pdfplumber` to handle multi-column layouts.
 2. **Sifting**: Identify and remove the "References" section immediately using case-insensitive regex.
-3. **Truncation**: Only *after* reference removal, if characters > 12,000, truncate at the nearest sentence boundary.
-4. **Rationale**: References are non-informative "junk" tokens; removing them first preserves the critical "Results" and "Discussion" sections.
+3. **Caching**: Store full cleaned text in `data/processed/` so limits can be changed without re-extracting PDFs.
+4. **LLM-call limit**: Apply `MAX_INPUT_CHARS` only when building the summariser prompt; if limiting is enabled, truncate at the nearest sentence boundary.
+5. **Rationale**: References are non-informative "junk" tokens; removing them first preserves the critical "Results" and "Discussion" sections.
 
 ### B. Budget & Safety (src/utils.py)
 - **BudgetGuard**: Implement a stateful class that checks `total_spent` before every call. If `total_spent > BUDGET_HARD_STOP`, trigger `sys.exit().
 - **Dry-Run**: If `DRY_RUN=true`, all API logic must return mock success strings and $0.00 cost.
-- **Rate Limiting**: Use a dictionary-based sleep system (`RATE_LIMIT_MODEL`) to prevent 429 errors.
+- **Rate Limiting**: Use the dictionary-based `RATE_LIMITS` sleep system to prevent 429 errors.
 
 ### C. The Manifest & Covariates (src/collect.py)
 Every paper in the manifest must include the **Research Covariate Schema** for stratified analysis:
@@ -54,9 +57,9 @@ Every paper in the manifest must include the **Research Covariate Schema** for s
 - Use a low-cost LLM mock to infer these if missing from abstract. actually For Phase 2, because no API keys are available, the mock LLM shall return a placeholder and set needs_manual_review: true
 
 ## 6. Coding Standards & Documentation
-- **JSONL Everywhere**: Use JSON Lines for manifests and logs. It is append-safe and prevents total file corruption during pipeline crashes.
+- **JSONL Everywhere**: Use JSON Lines for manifests, logs, summaries, and evaluations. Manifests/logs/evaluations are append-safe; `summaries.jsonl` is a JSONL snapshot that may be atomically rewritten to merge provider slots for resume support.
 - **Architectural Decision Records (ADRs)**: Every module must have a header explaining "The Why":
     - *Why pdfplumber?* High-accuracy for veterinary multi-column text.
     - *Why JSONL?* Corruption resilience.
     - *Why 12k char limit?* Reliable proxy for 4k tokens without extra API calls.
-- **Atomic Writes**: Always append to files immediately after processing a paper so progress is never lost.
+- **Atomic Writes**: Append per-result where possible. When merging resumable summary slots, write a temporary JSONL snapshot and atomically replace the old `summaries.jsonl` so progress is not lost to partial writes.

@@ -41,7 +41,9 @@ MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 SEED = int(os.getenv("SEED", "42"))
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "500"))
+# Keep batch and real-time runs on one output cap. A lower batch-only default
+# caused structured summaries to truncate before they could be parsed.
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
 
 
 def _timestamp_slug() -> str:
@@ -54,6 +56,8 @@ def _timestamp_slug() -> str:
 
 def build_openai_request(custom_id: str, user_message: str, model_id: str) -> dict:
     """One row of OpenAI's batch JSONL format."""
+    from summarizer import VeterinarySummary  # noqa: E402
+
     return {
         "custom_id": custom_id,
         "method": "POST",
@@ -64,6 +68,14 @@ def build_openai_request(custom_id: str, user_message: str, model_id: str) -> di
             "temperature": TEMPERATURE,
             "max_completion_tokens": MAX_OUTPUT_TOKENS,
             "seed": SEED,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "VeterinarySummary",
+                    "schema": VeterinarySummary.model_json_schema(),
+                    "strict": True,
+                },
+            },
         },
     }
 
@@ -74,6 +86,8 @@ def build_anthropic_request(custom_id: str, user_message: str, model_id: str) ->
     OpenAI's: the request body is nested under "params" and the URL is
     implicit.
     """
+    from summarizer import VeterinarySummary  # noqa: E402
+
     return {
         "custom_id": custom_id,
         "params": {
@@ -81,6 +95,15 @@ def build_anthropic_request(custom_id: str, user_message: str, model_id: str) ->
             "max_tokens": MAX_OUTPUT_TOKENS,
             "temperature": TEMPERATURE,
             "messages": [{"role": "user", "content": user_message}],
+            "tools": [{
+                "name": "VeterinarySummary",
+                "description": (
+                    "Return the veterinary article summary using exactly the "
+                    "VeterinarySummary schema."
+                ),
+                "input_schema": VeterinarySummary.model_json_schema(),
+            }],
+            "tool_choice": {"type": "tool", "name": "VeterinarySummary"},
         },
     }
 
@@ -202,7 +225,58 @@ def _read_cached_text(record_or_doi) -> str | None:
     both work.
     """
     from prepare_texts import read_cached_text as _shared_read
-    return _shared_read(record_or_doi)
+    input_source = "processed"
+    if not isinstance(record_or_doi, str):
+        input_source = str(record_or_doi.get("input_source") or "processed")
+    return _shared_read(record_or_doi, input_source=input_source)
+
+
+def _failed_batch_result(custom_id: str, error: str) -> dict:
+    """Return the standard failed model-slot shape for one batch response row."""
+    return {
+        "custom_id": custom_id,
+        "status": "failed",
+        "error": error,
+        "summary": None,
+        "structured_summary": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "model_version": None,
+        "system_fingerprint": None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _successful_batch_summary(
+    *,
+    custom_id: str,
+    payload: Any,
+    input_tokens: int,
+    output_tokens: int,
+    model_version: str,
+    system_fingerprint: str | None = None,
+) -> dict:
+    """
+    Validate a batch summary through the same Pydantic repair path as real-time.
+
+    Batch APIs return raw JSONL later, outside the provider SDK's parsed object
+    helpers. Validating here prevents unstructured prose from silently entering
+    ``summaries.jsonl`` and breaking the blind judge pipeline.
+    """
+    from summarizer import coerce_veterinary_summary, veterinary_summary_to_result  # noqa: E402
+
+    parsed = coerce_veterinary_summary(payload)
+    result = veterinary_summary_to_result(parsed)
+    result.update({
+        "custom_id": custom_id,
+        "status": "success",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "model_version": model_version,
+        "system_fingerprint": system_fingerprint,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return result
 
 
 def run_batch_summarisation(
@@ -227,6 +301,8 @@ def run_batch_summarisation(
         GUIDE_SUMMARY_FILE,
         _new_summary_entry,
         _write_all_summaries,
+        _custom_id_for_source,
+        _summary_key,
     )
 
     providers = providers or ["openai", "anthropic"]
@@ -247,19 +323,21 @@ def run_batch_summarisation(
         doi = str(record.get("doi", "")).strip()
         if not doi:
             continue
-        slug = doi_to_slug(doi)
+        input_source = "processed"
+        custom_id = _custom_id_for_source(doi, input_source)
+        summary_key = _summary_key(doi, input_source)
         article_text = _read_cached_text(record)
         if article_text is None:
             log_error(doi, "summarize",
-                      f"No cached text for {slug} (descriptive + legacy lookups failed)")
+                      f"No cached text for {custom_id} (descriptive + legacy lookups failed)")
             continue
 
-        slug_to_doi[slug] = doi
-        entry = summaries_by_doi.get(doi) or _new_summary_entry(record)
-        summaries_by_doi[doi] = entry
+        slug_to_doi[custom_id] = doi
+        entry = summaries_by_doi.get(summary_key) or _new_summary_entry(record, input_source)
+        summaries_by_doi[summary_key] = entry
 
         for provider in providers:
-            slot = entry["models"].get(provider, {})
+            slot = entry["models"].setdefault(provider, {})
             if resume and slot.get("status") == "success":
                 continue
             spec = get_model_spec(provider)
@@ -268,12 +346,12 @@ def run_batch_summarisation(
             user_message = build_user_message(article_text, prompt_templates[provider])
             if provider == "openai":
                 rows_per_provider["openai"].append(
-                    build_openai_request(custom_id=slug, user_message=user_message,
+                    build_openai_request(custom_id=custom_id, user_message=user_message,
                                          model_id=spec.model_id)
                 )
             elif provider == "anthropic":
                 rows_per_provider["anthropic"].append(
-                    build_anthropic_request(custom_id=slug, user_message=user_message,
+                    build_anthropic_request(custom_id=custom_id, user_message=user_message,
                                             model_id=spec.model_id)
                 )
             else:
@@ -356,6 +434,7 @@ def run_batch_evaluation(
         doi = str(entry.get("doi", "")).strip()
         if not doi:
             continue
+        input_source = str(entry.get("input_source") or "processed")
         slug = entry.get("custom_id") or doi_to_slug(doi)
         # The summary entry carries journal+title so the descriptive lookup works.
         reference_text = _read_cached_text(entry)
@@ -375,7 +454,7 @@ def run_batch_evaluation(
             custom_id = f"{slug}__{summariser}"
 
             for judge in judges:
-                if resume and already_evaluated(doi, summariser, judge):
+                if resume and already_evaluated(doi, summariser, judge, input_source):
                     continue
                 spec = get_model_spec(judge)
                 if judge == "openai":
@@ -423,7 +502,7 @@ def run_batch_evaluation(
 # Result parsers (used by check_batch_status.py)
 # ---------------------------------------------------------------------------
 
-def parse_openai_result_line(line: str) -> dict:
+def parse_openai_result_line(line: str, *, expect_summary_schema: bool = True) -> dict:
     """
     Parse one line of an OpenAI batch result file into our standard
     summarizer result shape.
@@ -435,31 +514,48 @@ def parse_openai_result_line(line: str) -> dict:
     error = raw.get("error")
 
     if error:
-        return {
-            "custom_id": custom_id,
-            "status": "failed",
-            "error": str(error),
-            "summary": None,
-            "input_tokens": None,
-            "output_tokens": None,
-            "model_version": None,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        return _failed_batch_result(custom_id, str(error))
 
     choices = body.get("choices") or [{}]
     usage = body.get("usage") or {}
-    return {
-        "custom_id": custom_id,
-        "status": "success",
-        "summary": choices[0].get("message", {}).get("content", ""),
-        "input_tokens": int(usage.get("prompt_tokens", 0)),
-        "output_tokens": int(usage.get("completion_tokens", 0)),
-        "model_version": str(body.get("model", "")),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    content = choices[0].get("message", {}).get("content", "")
+    if not expect_summary_schema:
+        return {
+            "custom_id": custom_id,
+            "status": "success",
+            "summary": content,
+            "input_tokens": int(usage.get("prompt_tokens", 0)),
+            "output_tokens": int(usage.get("completion_tokens", 0)),
+            "model_version": str(body.get("model", "")),
+            "system_fingerprint": body.get("system_fingerprint"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+        return _successful_batch_summary(
+            custom_id=custom_id,
+            payload=payload,
+            input_tokens=int(usage.get("prompt_tokens", 0)),
+            output_tokens=int(usage.get("completion_tokens", 0)),
+            model_version=str(body.get("model", "")),
+            system_fingerprint=body.get("system_fingerprint"),
+        )
+    except Exception as exc:
+        return _failed_batch_result(custom_id, f"Invalid structured summary: {exc}")
 
 
-def parse_anthropic_result_line(line: str) -> dict:
+def _extract_anthropic_summary_payload(content_blocks: list[dict]) -> Any:
+    """Return the forced VeterinarySummary tool payload from an Anthropic batch row."""
+    for block in content_blocks:
+        if block.get("type") == "tool_use" and block.get("name") == "VeterinarySummary":
+            return block.get("input")
+    text = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text")
+    if text:
+        return json.loads(text)
+    raise ValueError("Anthropic batch row did not include a VeterinarySummary tool payload.")
+
+
+def parse_anthropic_result_line(line: str, *, expect_summary_schema: bool = True) -> dict:
     """Parse one line of an Anthropic Message Batches result."""
     raw = json.loads(line)
     custom_id = raw.get("custom_id", "")
@@ -467,30 +563,36 @@ def parse_anthropic_result_line(line: str) -> dict:
     rtype = result.get("type")
 
     if rtype != "succeeded":
-        return {
-            "custom_id": custom_id,
-            "status": "failed",
-            "error": str(result.get("error") or rtype),
-            "summary": None,
-            "input_tokens": None,
-            "output_tokens": None,
-            "model_version": None,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        return _failed_batch_result(custom_id, str(result.get("error") or rtype))
 
     message = result.get("message") or {}
     content_blocks = message.get("content") or []
-    summary_text = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text")
     usage = message.get("usage") or {}
-    return {
-        "custom_id": custom_id,
-        "status": "success",
-        "summary": summary_text,
-        "input_tokens": int(usage.get("input_tokens", 0)),
-        "output_tokens": int(usage.get("output_tokens", 0)),
-        "model_version": str(message.get("model", "")),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    if not expect_summary_schema:
+        summary_text = "".join(
+            b.get("text", "") for b in content_blocks if b.get("type") == "text"
+        )
+        return {
+            "custom_id": custom_id,
+            "status": "success",
+            "summary": summary_text,
+            "input_tokens": int(usage.get("input_tokens", 0)),
+            "output_tokens": int(usage.get("output_tokens", 0)),
+            "model_version": str(message.get("model", "")),
+            "system_fingerprint": None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    try:
+        payload = _extract_anthropic_summary_payload(content_blocks)
+        return _successful_batch_summary(
+            custom_id=custom_id,
+            payload=payload,
+            input_tokens=int(usage.get("input_tokens", 0)),
+            output_tokens=int(usage.get("output_tokens", 0)),
+            model_version=str(message.get("model", "")),
+        )
+    except Exception as exc:
+        return _failed_batch_result(custom_id, f"Invalid structured summary: {exc}")
 
 
 # Eval custom_id like "10_1111_jvim_16872__openai". Match suffix to find summariser.

@@ -35,7 +35,9 @@ from utils import BUDGET_HARD_STOP  # noqa: E402
 # 1 token ≈ 0.75 words, equivalently words × 1.33 ≈ tokens.
 WORDS_TO_TOKENS = 1.33
 
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "500"))
+# Match summarizer.py and batch_utils.py when .env is absent. A lower estimator
+# default would understate summarisation cost before a paid run.
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
 JUDGE_INPUT_OVERHEAD_TOKENS = 800     # judge prompt boilerplate + 3 summaries.
 JUDGE_OUTPUT_TOKENS = 300
 

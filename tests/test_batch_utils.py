@@ -27,11 +27,29 @@ from batch_utils import (
     write_batch_jsonl,
 )
 from file_paths import doi_to_slug
+import summarizer
 
 
 # ---------------------------------------------------------------------------
 # Request builders
 # ---------------------------------------------------------------------------
+
+def _valid_summary_payload(**overrides) -> dict:
+    """Return a complete VeterinarySummary-shaped payload for batch parser tests."""
+    payload = {
+        "headline": "Clinical signs improved in dogs after treatment.",
+        "objective": "Assess treatment response in client-owned dogs.",
+        "study_design": "Retrospective cohort.",
+        "species": "Dogs",
+        "sample_size": 42,
+        "key_methods": ["Reviewed medical records.", "Compared clinical outcomes."],
+        "key_findings": ["Clinical signs improved in most dogs."],
+        "clinical_significance": "The findings may help guide follow-up care.",
+        "limitations": ["Single-center study."],
+        "summary_text": "Objective: Assess treatment response in client-owned dogs.",
+    }
+    payload.update(overrides)
+    return payload
 
 def test_build_openai_request_shape() -> None:
     row = build_openai_request("my_slug", "Judge this please.", "gpt-5.4")
@@ -44,8 +62,10 @@ def test_build_openai_request_shape() -> None:
     assert body["messages"][0]["content"] == "Judge this please."
     assert body["temperature"] == 0.0
     assert "max_completion_tokens" in body
+    assert body["max_completion_tokens"] == summarizer.MAX_OUTPUT_TOKENS
     assert "max_tokens" not in body
-    assert "seed" in body
+    assert body["seed"] == 42
+    assert body["response_format"]["type"] == "json_schema"
 
 
 def test_build_anthropic_request_shape() -> None:
@@ -56,6 +76,8 @@ def test_build_anthropic_request_shape() -> None:
     assert params["messages"][0]["content"] == "Anthropic judge."
     assert params["temperature"] == 0.0
     assert "max_tokens" in params
+    assert params["max_tokens"] == summarizer.MAX_OUTPUT_TOKENS
+    assert params["tool_choice"]["name"] == "VeterinarySummary"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +90,13 @@ def test_parse_evaluation_custom_id_valid() -> None:
     pair = parse_evaluation_custom_id(cid)
     assert pair is not None
     assert pair == (slug, "openai")
+
+
+def test_parse_evaluation_custom_id_keeps_input_source_suffix() -> None:
+    slug = f"{doi_to_slug('10.1111/jvim.16872')}__raw_text"
+    cid = f"{slug}__anthropic"
+    pair = parse_evaluation_custom_id(cid)
+    assert pair == (slug, "anthropic")
 
 
 def test_parse_evaluation_custom_id_invalid() -> None:
@@ -102,10 +131,11 @@ def _openai_error_line(custom_id: str) -> str:
 
 
 def test_parse_openai_result_line_success() -> None:
-    line = _openai_success_line("slug_a", "summary text here")
+    line = _openai_success_line("slug_a", json.dumps(_valid_summary_payload()))
     parsed = parse_openai_result_line(line)
     assert parsed["status"] == "success"
-    assert parsed["summary"] == "summary text here"
+    assert parsed["summary"] == "Objective: Assess treatment response in client-owned dogs."
+    assert parsed["structured_summary"]["species"] == "Dogs"
     assert parsed["input_tokens"] == 1000
     assert parsed["output_tokens"] == 200
     assert parsed["model_version"] == "gpt-5.4-preview"
@@ -148,10 +178,27 @@ def _anthropic_error_line(custom_id: str) -> str:
 
 
 def test_parse_anthropic_result_line_success() -> None:
-    line = _anthropic_success_line("slug_c", "anthropic summary")
+    line = json.dumps({
+        "custom_id": "slug_c",
+        "result": {
+            "type": "succeeded",
+            "message": {
+                "model": "claude-sonnet-4-6-20260101",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "VeterinarySummary",
+                    "input": _valid_summary_payload(
+                        summary_text="Objective: Anthropic structured summary."
+                    ),
+                }],
+                "usage": {"input_tokens": 800, "output_tokens": 150},
+            },
+        },
+    })
     parsed = parse_anthropic_result_line(line)
     assert parsed["status"] == "success"
-    assert parsed["summary"] == "anthropic summary"
+    assert parsed["summary"] == "Objective: Anthropic structured summary."
+    assert parsed["structured_summary"]["species"] == "Dogs"
     assert parsed["input_tokens"] == 800
     assert parsed["output_tokens"] == 150
     assert parsed["model_version"] == "claude-sonnet-4-6-20260101"
@@ -162,6 +209,53 @@ def test_parse_anthropic_result_line_error() -> None:
     parsed = parse_anthropic_result_line(line)
     assert parsed["status"] == "failed"
     assert parsed["summary"] is None
+
+
+def test_merge_summarisation_results_uses_custom_id_not_bare_doi(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raw_text batch result must update only the raw_text row for a DOI."""
+    doi = "10.9999/batch.same.doi"
+    slug = doi_to_slug(doi)
+    summaries_path = tmp_path / "summaries.jsonl"
+    processed_entry = {
+        "doi": doi,
+        "custom_id": slug,
+        "input_source": "processed",
+        "models": {"openai": {"status": "pending"}},
+    }
+    raw_entry = {
+        "doi": doi,
+        "custom_id": f"{slug}__raw_text",
+        "input_source": "raw_text",
+        "models": {"openai": {"status": "pending"}},
+    }
+    summaries_path.write_text(
+        json.dumps(processed_entry) + "\n" + json.dumps(raw_entry) + "\n",
+        encoding="utf-8",
+    )
+    result_path = tmp_path / "openai_sum_results.jsonl"
+    result_path.write_text(
+        _openai_success_line(
+            f"{slug}__raw_text",
+            json.dumps(_valid_summary_payload(summary_text="Raw text summary.")),
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(check_batch_status, "SUMMARIES_PATH", summaries_path)
+    count = check_batch_status.merge_summarisation_results(
+        result_path, provider="openai"
+    )
+    assert count == 1
+
+    rows = [
+        json.loads(line)
+        for line in summaries_path.read_text(encoding="utf-8").splitlines()
+    ]
+    by_source = {row["input_source"]: row for row in rows}
+    assert by_source["processed"]["models"]["openai"]["status"] == "pending"
+    assert by_source["raw_text"]["models"]["openai"]["status"] == "success"
+    assert by_source["raw_text"]["models"]["openai"]["summary"] == "Raw text summary."
 
 
 # ---------------------------------------------------------------------------

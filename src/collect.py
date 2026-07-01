@@ -226,6 +226,26 @@ def _mock_covariate_llm(doi: str) -> dict:
     }
 
 
+def _fill_missing_covariates_with_mock(covariates: dict, doi: str) -> dict:
+    """
+    Preserve deterministic keyword hits while marking incomplete rows for review.
+
+    The Phase 2 mock is only a transparent placeholder for fields we could not
+    infer. Replacing the whole dict would discard useful species/topic/design
+    evidence and make later stratified analysis harder to audit.
+    """
+    placeholder = _mock_covariate_llm(doi)
+    merged = dict(covariates)
+    if not merged.get("species"):
+        merged["species"] = placeholder["species"]
+    if merged.get("study_design") == "Unknown":
+        merged["study_design"] = placeholder["study_design"]
+    if merged.get("clinical_topic") == "Unknown":
+        merged["clinical_topic"] = placeholder["clinical_topic"]
+    merged["needs_manual_review"] = True
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # CrossRef API helpers
 # ---------------------------------------------------------------------------
@@ -485,7 +505,7 @@ def _parse_crossref_item(item: dict, journal_name: str, issn: str) -> dict | Non
     covariates = _infer_covariates(combined_text)
 
     if covariates["needs_manual_review"]:
-        covariates = _mock_covariate_llm(doi)
+        covariates = _fill_missing_covariates_with_mock(covariates, doi)
 
     return {
         "doi":            doi,

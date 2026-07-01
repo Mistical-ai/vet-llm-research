@@ -132,6 +132,159 @@ def cmd_summarize(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# evaluate helpers (journal-stratified sampling)
+# ---------------------------------------------------------------------------
+
+def _iter_summaries_simple(summaries_path: Path):
+    """Minimal summary iterator used by journal-stratified helpers."""
+    if not summaries_path.exists():
+        return
+    with open(summaries_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def _load_summaries_by_journal(
+    summaries_path: Path, manifest_path: Path
+) -> dict[str, list[dict]]:
+    """Group summary entries by journal name (lowercased).
+
+    summaries.jsonl entries may not carry a journal field. We build a
+    doi→journal map from manifest.jsonl (populated during Phase 2 enrichment)
+    and fall back to 'unknown' for DOIs that can't be mapped.
+    """
+    doi_to_journal: dict[str, str] = {}
+    if manifest_path.exists():
+        with open(manifest_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    doi = str(row.get("doi", "")).strip()
+                    journal = str(row.get("journal", "")).strip().lower()
+                    if doi and journal:
+                        doi_to_journal[doi] = journal
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+
+    by_journal: dict[str, list[dict]] = {}
+    for entry in _iter_summaries_simple(summaries_path):
+        doi = str(entry.get("doi", "")).strip()
+        journal = (
+            str(entry.get("journal", "")).strip().lower()
+            or doi_to_journal.get(doi, "unknown")
+        )
+        by_journal.setdefault(journal, []).append(entry)
+    return by_journal
+
+
+def _sample_by_journal(
+    by_journal: dict[str, list[dict]], per_journal: int, seed: int = 42
+) -> tuple[set[str], dict[str, list[str]]]:
+    """Randomly sample per_journal entries from each known journal.
+
+    Returns (doi_filter_set, {journal: [doi, ...]}) — the doi set is passed
+    to run_evaluation(doi_filter=...) so only selected articles are scored.
+    'unknown' entries are excluded from sampling (see caller for logging).
+    """
+    rng = random.Random(seed)
+    doi_filter: set[str] = set()
+    journal_map: dict[str, list[str]] = {}
+    for journal, entries in sorted(by_journal.items()):
+        if journal == "unknown":
+            continue
+        sample = rng.sample(entries, min(per_journal, len(entries)))
+        dois = [str(e.get("doi", "")).strip() for e in sample if e.get("doi")]
+        if dois:
+            journal_map[journal] = dois
+            doi_filter.update(dois)
+    return doi_filter, journal_map
+
+
+def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]]) -> None:
+    """Print the post-evaluation identity reveal table.
+
+    Called AFTER run_evaluation() completes — never before — so model
+    identities are not visible during scoring (blind protocol).
+    """
+    if not EVALUATIONS_PATH.exists():
+        return
+
+    # Build lookup: doi → list of evaluation rows
+    rows_by_doi: dict[str, list[dict]] = {}
+    with open(EVALUATIONS_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            doi = str(row.get("doi", "")).strip()
+            if doi in doi_filter:
+                rows_by_doi.setdefault(doi, []).append(row)
+
+    doi_to_journal: dict[str, str] = {}
+    for journal, dois in journal_map.items():
+        for doi in dois:
+            doi_to_journal[doi] = journal
+
+    print("\n" + "=" * 68)
+    print("  EVALUATION COMPLETE  ·  IDENTITY REVEAL")
+    print("  (Summaries were scored blind; identities shown only now)")
+    print("=" * 68)
+    print(f"  {'Journal':<16} {'Summarizer':<14} {'Judge':<10} "
+          f"{'Score':>5}  {'Halluc':>6}  {'Review?':>7}")
+    print("  " + "-" * 64)
+
+    total_cost = 0.0
+    judge_model_seen: set[str] = set()
+    for doi in sorted(doi_filter):
+        journal = doi_to_journal.get(doi, "unknown")
+        for row in rows_by_doi.get(doi, []):
+            score_disp = (
+                f"{row.get('composite_score', row.get('quality_score', '?'))}"
+            )
+            halluc = row.get("hallucination_count", "?")
+            review = "Yes" if row.get("requires_human_review") else "No"
+            summarizer = str(row.get("summarizer", "?"))
+            judge = str(row.get("judge", "?"))
+            judge_version = str(row.get("judge_model_version", ""))
+            if judge_version:
+                judge_model_seen.add(judge_version)
+            # Approximate cost from token counts (display only)
+            try:
+                from models_config import compute_cost
+                cost = compute_cost(
+                    judge,
+                    int(row.get("input_tokens") or 0),
+                    int(row.get("output_tokens") or 0),
+                    batched=False,
+                )
+                total_cost += cost
+            except Exception:
+                pass
+            print(f"  {journal:<16} {summarizer:<14} {judge:<10} "
+                  f"{score_disp:>5}  {str(halluc):>6}  {review:>7}")
+
+    print("=" * 68)
+    if judge_model_seen:
+        print(f"  Judge model version(s): {', '.join(sorted(judge_model_seen))}")
+    if total_cost > 0:
+        print(f"  Total cost this run: ${total_cost:.4f}")
+    print("=" * 68 + "\n")
+
+
+# ---------------------------------------------------------------------------
 # evaluate
 # ---------------------------------------------------------------------------
 
@@ -139,17 +292,83 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     profile = resolve_mode(args.mode)
     print(profile.banner())
 
-    from evaluator import main as evaluate_main
-    delegate = ["--mode", profile.name]
-    if args.limit is not None:
-        delegate += ["--limit", str(args.limit)]
-    if args.force:
-        delegate.append("--force")
-    if args.no_resume:
-        delegate.append("--no-resume")
-    if args.judges:
-        delegate += ["--judges", args.judges]
-    return evaluate_main(delegate)
+    judges = (
+        [j.strip() for j in args.judges.split(",") if j.strip()]
+        if args.judges else None
+    )
+
+    # test mode: simple delegation, no journal stratification (mock, $0)
+    if profile.name == "test" or profile.dry_run:
+        from evaluator import main as evaluate_main
+        delegate = ["--mode", profile.name]
+        if args.limit is not None:
+            delegate += ["--limit", str(args.limit)]
+        if args.force:
+            delegate.append("--force")
+        if args.no_resume:
+            delegate.append("--no-resume")
+        if args.judges:
+            delegate += ["--judges", args.judges]
+        return evaluate_main(delegate)
+
+    # single / dev / batch modes: journal-stratified sampling
+    from evaluator import run_evaluation, confirm_real_judge
+
+    by_journal = _load_summaries_by_journal(SUMMARIES_PATH, MANIFEST_PATH)
+
+    # Warn about and log unmapped DOIs
+    unknown_entries = by_journal.pop("unknown", [])
+    if unknown_entries:
+        unknown_dois = [str(e.get("doi", "?")) for e in unknown_entries]
+        msg_lines = [
+            f"[phase3:evaluate] WARNING: {len(unknown_dois)} summaries could not be "
+            "mapped to a journal and will be excluded from stratified sampling.",
+            "  DOIs without a journal mapping in manifest.jsonl:",
+        ] + [f"    {d}" for d in unknown_dois] + [
+            "  Add the journal field to manifest.jsonl to include these articles.",
+        ]
+        for line in msg_lines:
+            print(line)
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = LOGS_DIR / "eval_journal_mapping.log"
+        ts = datetime.now(timezone.utc).isoformat()
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(f"\n[{ts}]\n" + "\n".join(msg_lines) + "\n")
+
+    if not by_journal:
+        print("[phase3:evaluate] No journal-mapped summaries found. "
+              "Run 'extract' and 'summarize' first, or check manifest.jsonl.")
+        return 1
+
+    per_journal = (
+        args.limit
+        if args.limit is not None
+        else (1 if profile.name == "single" else (profile.paper_limit or 1))
+    )
+    seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
+    doi_filter, journal_map = _sample_by_journal(by_journal, per_journal, seed=seed)
+
+    # Pre-evaluation summary (anonymized — journal names only, no DOIs, no model names)
+    print("\n[phase3:evaluate] Journal-stratified sampling plan:")
+    print(f"  {'Journal':<20}  Articles selected")
+    print("  " + "-" * 38)
+    for journal in sorted(journal_map):
+        print(f"  {journal:<20}  {len(journal_map[journal])}")
+    print(f"  {'TOTAL':<20}  {len(doi_filter)}")
+    print(f"  (seed={seed}, per_journal={per_journal})\n")
+
+    if not confirm_real_judge(profile, force=args.force):
+        return 1
+
+    run_evaluation(
+        judges=judges,
+        resume=not args.no_resume,
+        paper_limit=None,
+        doi_filter=doi_filter,
+    )
+
+    _print_reveal_table(doi_filter, journal_map)
+    return 0
 
 
 # ---------------------------------------------------------------------------

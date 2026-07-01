@@ -255,6 +255,8 @@ python llm-sum/run_phase3.py evaluate
 
 For each summary, a judge model scores quality (1–10), counts hallucinations, and flags low-confidence cases for human review — **without being told which model wrote the summary**.
 
+**Full plain-English guide:** [How the Judge Works & the Vet-Score v2.0 Rubric](judge_and_rubric.md) — step-by-step flow, the four scoring dimensions, hallucination types, and how the 1–10 score is calculated.
+
 *Expect:* one line per (paper, summariser, judge) with a score and how it was parsed (`json` / `regex` / `sentinel`).
 
 *Why "blind":* an LLM asked to grade a summary it knows it wrote will inflate the score. Hiding the author is what makes the model comparison scientifically trustworthy — it's non-negotiable for the manuscript.
@@ -344,7 +346,7 @@ Each script has its own detailed guide (same layout every time: what it does / w
 | `prepare_texts.py` | PDFs → cleaned-text cache | [prepare_texts.md](prepare_texts.md) |
 | `verify_extraction.py` | Audit extraction quality (PASS/WARN/FAIL) | [verify_extraction.md](verify_extraction.md) |
 | `summarizer.py` | Run the 3 summarisers (real-time or batch) | [summarizer.md](summarizer.md) |
-| `evaluator.py` | Blind judge scoring | [evaluator.md](evaluator.md) |
+| `evaluator.py` | Blind judge scoring | [evaluator.md](evaluator.md) · [judge & rubric (simple)](judge_and_rubric.md) |
 | `check_batch_status.py` | Collect finished batch jobs | [check_batch_status.md](check_batch_status.md) |
 | `cost_estimator.py` | Forecast cost offline (no API) | [cost_estimator.md](cost_estimator.md) |
 | `run_phase3.py` | Orchestrator wrapping all steps | [run_phase3.md](run_phase3.md) |
@@ -367,7 +369,7 @@ data/
 └── error_log.jsonl                 ← any step : anything that failed
 ```
 
-`summaries.jsonl` and `evaluations.jsonl` are **append-only** — never edit them by hand. New results are added one line at a time, so if a run crashes halfway you keep everything completed so far and simply resume. That crash-safety is exactly why the project uses JSON-Lines files instead of one big document: a power cut costs you the current paper, not all 250.
+`summaries.jsonl` is an atomic merged snapshot: each row is JSONL, and successful provider slots are merged back into the matching `(doi, input_source)` row for resume support. `evaluations.jsonl` is append-only, with one new JSON line per completed judge result. Do not edit either file by hand; if a run crashes halfway, completed work remains on disk and the next run can resume.
 
 ---
 

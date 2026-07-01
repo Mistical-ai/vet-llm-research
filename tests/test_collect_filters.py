@@ -44,3 +44,20 @@ def test_collection_windows_match_configured_years() -> None:
     else:
         assert len(windows) == 1
         assert windows[0][0] == "all"
+
+
+def test_partial_covariates_are_preserved_when_manual_review_needed() -> None:
+    covariates = collect._infer_covariates(
+        "Canine lymphoma biomarker study without enough design language."
+    )
+    assert covariates["species"] == ["Canine"]
+    assert covariates["clinical_topic"] == "Oncology"
+    assert covariates["study_design"] == "Unknown"
+    assert covariates["needs_manual_review"] is True
+
+    merged = collect._fill_missing_covariates_with_mock(covariates, "10.9999/covariate")
+
+    assert merged["species"] == ["Canine"]
+    assert merged["clinical_topic"] == "Oncology"
+    assert merged["study_design"] == "Unknown"
+    assert merged["needs_manual_review"] is True
