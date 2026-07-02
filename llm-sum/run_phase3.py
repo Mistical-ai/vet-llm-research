@@ -36,9 +36,12 @@ SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 RAW_DIR = DATA_DIR / "raw"
-PROCESSED_DIR = DATA_DIR / "processed"
 SUMMARIES_PDF_DIR = DATA_DIR / "summaries_pdf"
 SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
+DEV_TESTS_DIR = DATA_DIR / "dev_tests"
+DEV_TESTS_SUMMARIES_PDF_DIR = DEV_TESTS_DIR / "summaries_pdf"
+DEV_TESTS_SUMMARIES_TXT_DIR = DEV_TESTS_DIR / "summaries_txt"
+SUMMARIZE_ALL_OUTPUT_SETS = ("auto", "regular", "dev-tests")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -63,6 +66,52 @@ def _summarize_all_random_match() -> bool:
 def _summarize_all_unique_output() -> bool:
     """Whether summarize-all writes timestamped files instead of stem.txt."""
     return _env_bool("SUMMARIZE_ALL_UNIQUE_OUTPUT", True)
+
+
+def _summarize_all_output_set() -> str:
+    """
+    Read the default summarize-all output set from the environment.
+
+    Keeping this in ``.env`` makes repeated dev runs reproducible without
+    needing to remember an extra CLI flag. Underscores are accepted because env
+    values are often copied from variable-style names.
+    """
+    raw = os.getenv("SUMMARIZE_ALL_OUTPUT_SET", "auto").strip().lower()
+    normalized = raw.replace("_", "-")
+    if normalized in SUMMARIZE_ALL_OUTPUT_SETS:
+        return normalized
+    print(
+        f"[phase3] WARNING: invalid SUMMARIZE_ALL_OUTPUT_SET={raw!r}; "
+        "using 'auto'."
+    )
+    return "auto"
+
+
+def _summarize_all_output_dirs(
+    profile_name: str,
+    output_set: str = "auto",
+) -> tuple[Path, Path, str]:
+    """
+    Return the PDF/text output folders for a summarize-all run.
+
+    ``auto`` keeps normal single/test runs in the original folders, while dev
+    mode writes under ``data/dev_tests`` so paid prompt experiments do not mix
+    with regular comparison outputs. The explicit output set exists for the
+    cases where the user wants to override that default for one command.
+    """
+    if output_set not in SUMMARIZE_ALL_OUTPUT_SETS:
+        raise ValueError(
+            f"Unknown summarize-all output set {output_set!r}; "
+            f"valid values: {', '.join(SUMMARIZE_ALL_OUTPUT_SETS)}"
+        )
+
+    resolved_set = "dev-tests" if output_set == "auto" and profile_name == "dev" else output_set
+    if resolved_set == "auto":
+        resolved_set = "regular"
+
+    if resolved_set == "dev-tests":
+        return DEV_TESTS_SUMMARIES_PDF_DIR, DEV_TESTS_SUMMARIES_TXT_DIR, resolved_set
+    return SUMMARIES_PDF_DIR, SUMMARIES_TXT_DIR, resolved_set
 
 
 # ---------------------------------------------------------------------------
@@ -481,13 +530,15 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     Summarise every PDF in data/raw/ AND every processed JSONL in data/processed/
     with all three providers in a single command.
 
-    In ``single`` and ``dev`` mode this processes one matched article stem that
-    exists in both folders, yielding six summaries for the same DOI/title: one
-    PDF source and one processed-text source, each across three providers.
+    In ``single`` mode this processes one matched article stem that exists in
+    both folders, yielding six summaries for the same DOI/title. ``dev`` mode
+    uses ``PHASE3_DEV_LIMIT`` matched stems so prompt experiments cover the same
+    small multi-article sample as the manifest-driven dev workflow.
 
-    Outputs:
-      data/summaries_pdf/<stem>.txt  — one readable file per PDF
-      data/summaries_txt/<stem>.txt  — one readable file per processed text
+    Outputs default by mode:
+      single/test: data/summaries_pdf/<stem>.txt and data/summaries_txt/<stem>.txt
+      dev:         data/dev_tests/summaries_pdf/<stem>.txt and
+                   data/dev_tests/summaries_txt/<stem>.txt
     """
     profile = resolve_mode(args.mode)
     print(profile.banner())
@@ -521,18 +572,21 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     if not confirm_real_batch(profile, force=args.force):
         return 1
 
-    # summarize-all is the manual PDF-vs-processed comparison workflow. Keep
-    # its default narrow in test/single/dev: 1 matched article x 2 source types
-    # x 3 providers = 6 summaries. Users can still pass --limit N explicitly
-    # when they want more matched article pairs.
+    # summarize-all is the manual PDF-vs-processed comparison workflow. Test
+    # and single stay as one-pair smoke checks; dev deliberately follows the
+    # shared ModeProfile limit so PHASE3_DEV_LIMIT means the same thing across
+    # summarize, evaluate, and summarize-all.
     effective_limit = (
         args.limit
         if args.limit is not None
-        else (1 if profile.name in {"test", "single", "dev"} else profile.paper_limit)
+        else (1 if profile.name in {"test", "single"} else profile.paper_limit)
     )
-    if args.limit is None and profile.name in {"test", "single", "dev"}:
+    if args.limit is None and profile.name in {"test", "single"}:
         print(f"[phase3:summarize-all] {profile.name} mode defaults to --limit 1; "
               "pass --limit N to create more matched comparison files.")
+    elif args.limit is None and profile.name == "dev":
+        print("[phase3:summarize-all] dev mode defaults to "
+              f"PHASE3_DEV_LIMIT={effective_limit} matched article pairs.")
     random_match = _summarize_all_random_match()
     unique_output = _summarize_all_unique_output()
     paired_stems = _paired_summary_stems(effective_limit, random_match=random_match)
@@ -541,15 +595,28 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
               "data/raw/*.pdf and data/processed/*.jsonl.")
         return 1
     print(f"[phase3:summarize-all] paired articles selected: {len(paired_stems)}")
+    if effective_limit is not None and len(paired_stems) < effective_limit:
+        print("[phase3:summarize-all] WARNING: requested "
+              f"{effective_limit} matched pairs, but only found {len(paired_stems)}. "
+              "Only stems present in both data/raw/*.pdf and "
+              "data/processed/*.jsonl can be processed.")
     print(f"[phase3:summarize-all] random match: {str(random_match).lower()}")
     output_suffix = _summary_run_suffix() if unique_output else None
     if output_suffix:
         print(f"[phase3:summarize-all] output run suffix: {output_suffix}")
     else:
         print("[phase3:summarize-all] unique output disabled; writing <stem>.txt files.")
+    selected_output_set = args.output_set or _summarize_all_output_set()
+    pdf_output_dir, txt_output_dir, output_set = _summarize_all_output_dirs(
+        profile.name,
+        selected_output_set,
+    )
+    print(f"[phase3:summarize-all] output set: {output_set}")
+    print(f"[phase3:summarize-all] PDF outputs: {pdf_output_dir}")
+    print(f"[phase3:summarize-all] Text outputs: {txt_output_dir}")
 
     pdf_counts = summarize_all_pdfs(
-        output_dir=SUMMARIES_PDF_DIR,
+        output_dir=pdf_output_dir,
         providers=providers,
         resume=args.resume,
         prompt_template=prompt_templates,
@@ -559,7 +626,7 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     )
 
     txt_counts = summarize_all_processed_texts(
-        output_dir=SUMMARIES_TXT_DIR,
+        output_dir=txt_output_dir,
         providers=providers,
         resume=args.resume,
         prompt_template=prompt_templates,
@@ -631,7 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
         "summarize-all",
         help="Summarize paired PDFs (data/raw/) and processed texts (data/processed/) "
              "with OpenAI, Anthropic, and Gemini. "
-             "Outputs readable .txt files in data/summaries_pdf/ and data/summaries_txt/.",
+             "Outputs readable .txt files; dev mode defaults to data/dev_tests/.",
     )
     _add_mode_arg(p_sum_all)
     p_sum_all.add_argument("--limit", type=int, default=None,
@@ -645,6 +712,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum_all.add_argument("--providers", default=None,
                             help="Comma-separated subset of providers "
                                  "(default: openai,anthropic,gemini).")
+    p_sum_all.add_argument(
+        "--output-set",
+        choices=SUMMARIZE_ALL_OUTPUT_SETS,
+        default=None,
+        help=(
+            "Where summarize-all writes readable .txt outputs. "
+            "auto sends dev mode to data/dev_tests/ and other modes to the "
+            "original data/summaries_pdf + data/summaries_txt folders; "
+            "regular always uses the original folders; dev-tests always uses "
+            "data/dev_tests/. Overrides SUMMARIZE_ALL_OUTPUT_SET from .env."
+        ),
+    )
     p_sum_all.set_defaults(func=cmd_summarize_all)
 
     p_eval = sub.add_parser("evaluate", help="Run the blind judge.")

@@ -52,7 +52,7 @@ LLM_SUM_DIR = _HERE
 SRC_DIR = _SRC
 DATA_DIR = _REPO_ROOT / "data"
 RAW_TEXT_DIR = DATA_DIR / "raw_text"
-PROCESSED_DIR = DATA_DIR / "processed"
+PROCESSED_DIR = DATA_DIR / os.getenv("PROCESSED_DIR_NAME", "processed")
 BATCH_DIR = DATA_DIR / "batch"
 LOGS_DIR = DATA_DIR / "logs"
 

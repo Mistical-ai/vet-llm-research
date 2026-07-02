@@ -8,8 +8,16 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
 - sample_size: the number of animals, samples, records, owners, or cases analyzed; use null if not reported.
 - key_methods: short list of main methods, interventions, measurements, or comparisons.
 - key_findings: short list of the most important findings, especially quantitative results.
+  Include every specific number: episode durations, frequency percentages (e.g. "40% daily /
+  27% weekly"), response thresholds (e.g. "≥50% reduction"), follow-up durations with ranges.
+  Do not compress multiple statistics into a vague phrase like "significant reduction" when
+  the article states a specific threshold or value.
 - clinical_significance: how a practising clinician should interpret or apply the findings.
 - limitations: short list of important caveats or limitations from the article.
+  Specifically include the absence of confirmatory diagnostic tests (EEG,
+  electroencephalography, histopathology, imaging) if the article mentions them as limitations.
+  These methodological limitations are distinct from sample-size caveats and are often the most
+  scientifically important.
 - summary_text: readable prose under 400 words using these sections in order:
   1. Objective
   2. Key Methods

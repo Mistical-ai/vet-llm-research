@@ -40,13 +40,14 @@ Gemini 1.5 Pro, while being long enough to capture a full Results and
 Discussion section.  It avoids token-counting API calls (which cost money and
 add latency) because the character limit is a reliable proxy.
 
-WHY pdfplumber (not PyPDF2, not pdfminer)?
--------------------------------------------
-pdfplumber is built on pdfminer but adds:
-  - Better handling of multi-column layouts (common in JVIM and JAVMA).
-  - Cleaner whitespace normalisation.
-  - Active maintenance and a stable API.
-PyPDF2 is older and struggles with complex layouts.
+WHY pymupdf4llm (primary) + pdfplumber (fallback)?
+--------------------------------------------------
+pymupdf4llm wraps PyMuPDF (fitz) and converts PDFs to structured Markdown
+in one call.  It uses spatial block analysis to detect columns and linearise
+them in true reading order, converting section headings to ## headers and
+tables to pipe-delimited Markdown rows.  This eliminates the whitespace-column
+artifacts that pdfplumber produced for two-column journal layouts (JVIM, JAVMA).
+pdfplumber is retained as a fallback for files that pymupdf4llm cannot open.
 
 WHY REMOVE REFERENCES WITH REGEX (not a model)?
 -------------------------------------------------
@@ -122,7 +123,7 @@ MANIFEST_PATH = Path("data") / "manifest.jsonl"
 # Flags: re.IGNORECASE so "REFERENCES" and "references" both match.
 #        re.MULTILINE so ^ and $ match line boundaries (not just string ends).
 REFERENCES_PATTERN = re.compile(
-    r"\n\s*(?:references?|reference\s+list|cited\s+references?|bibliography|works\s+cited|literature\s+cited)\s*(?:\n|$)",
+    r"\n\s*(?:#{1,6}\s+)?(?:references?|reference\s+list|cited\s+references?|bibliography|works\s+cited|literature\s+cited)\s*(?:\n|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -270,23 +271,56 @@ def truncate_to_limit(text: str, limit: int = MAX_CHARS) -> str:
 
 def extract_text_from_pdf(pdf_path: Path) -> str | None:
     """
-    Extract raw text from a PDF file using pdfplumber.
+    Extract text from a PDF file, preferring pymupdf4llm (Markdown output)
+    with pdfplumber as a fallback for files that pymupdf cannot open.
+    """
+    text = _extract_with_pymupdf4llm(pdf_path)
+    if text:
+        return text
+    return _extract_with_pdfplumber(pdf_path)
+
+
+def _extract_with_pymupdf4llm(pdf_path: Path) -> str | None:
+    """
+    Convert a PDF to structured Markdown using pymupdf4llm.
+
+    pymupdf4llm uses spatial block analysis to linearise multi-column layouts
+    in true reading order and converts tables to pipe-delimited Markdown rows,
+    eliminating the whitespace-column artifacts produced by pdfplumber for
+    two-column journals (JVIM, JAVMA, JFMS).
+
+    Returns None (silently) when the package is not installed, so the caller
+    falls back to pdfplumber without user-visible noise.
+    """
+    try:
+        import pymupdf4llm
+    except ImportError:
+        return None
+    try:
+        md = pymupdf4llm.to_markdown(str(pdf_path))
+        if md and md.strip():
+            print(f"  [extract] pymupdf4llm: {len(md):,} chars from {pdf_path.name}.")
+            return md
+        return None
+    except Exception as exc:
+        print(f"  [extract] pymupdf4llm failed ({exc}); trying pdfplumber.")
+        return None
+
+
+def _extract_with_pdfplumber(pdf_path: Path) -> str | None:
+    """
+    Fallback extractor using pdfplumber page-by-page text extraction.
 
     WHY CONCATENATE PAGES WITH A NEWLINE?
         pdfplumber returns text per page.  Joining with '\n' preserves
         paragraph-level boundaries so that the regex in
         remove_references_section() can detect newline-preceded headings.
-
-    Returns None and logs an error if pdfplumber raises an exception,
-    allowing the pipeline to continue with the next paper.
     """
     try:
-        import pdfplumber  # Imported here so the module loads even if pdfplumber
-                           # is not installed (dry-run tests don't need it).
+        import pdfplumber
     except ImportError:
         print("[extract] pdfplumber is not installed. Run: pip install pdfplumber")
         return None
-
     try:
         with pdfplumber.open(pdf_path) as pdf:
             pages: list[str] = []
@@ -295,7 +329,7 @@ def extract_text_from_pdf(pdf_path: Path) -> str | None:
                 if page_text:
                     pages.append(page_text)
             raw_text = "\n".join(pages)
-            print(f"  [extract] Extracted {len(raw_text):,} raw chars from {pdf_path.name}.")
+            print(f"  [extract] pdfplumber fallback: {len(raw_text):,} chars from {pdf_path.name}.")
             return raw_text
     except Exception as exc:
         log_error(str(pdf_path.stem), "extract", f"pdfplumber failed: {exc}")

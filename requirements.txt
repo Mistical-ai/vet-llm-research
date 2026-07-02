@@ -10,6 +10,8 @@ requests
 urllib3
 # Reads text from PDF files, including research papers that may have complicated page layouts.
 pdfplumber
+# Converts PDFs to structured Markdown for LLM input; handles multi-column layouts and tables.
+pymupdf4llm>=0.0.17
 # Automatically retries a task when it fails for a temporary reason, like a slow website or rate limit.
 tenacity
 # Shows progress bars so long-running scripts make it clear how much work is finished.

@@ -656,7 +656,7 @@ def test_openai_pdf_call_uploads_file_and_parses_schema(
     assert content[1]["type"] == "input_text"
     assert "attached as a PDF" in content[1]["text"]
     assert captured["response_kwargs"]["text_format"] is summarizer.VeterinarySummary
-    assert captured["response_kwargs"]["seed"] == summarizer.SEED
+    assert "seed" not in captured["response_kwargs"]
 
 
 def test_anthropic_pdf_call_sends_document_block(
@@ -769,11 +769,68 @@ def test_gemini_pdf_call_uploads_pdf(
     assert result["input_tokens"] == 5432
     assert result["output_tokens"] == 234
     assert captured["upload"]["file"] == str(pdf_path)
+    assert (
+        captured["generation_config"]["max_output_tokens"]
+        == summarizer.GEMINI_MAX_OUTPUT_TOKENS
+    )
     response_schema = captured["generation_config"]["response_schema"]
     assert isinstance(response_schema, dict)
     assert "default" not in json.dumps(response_schema)
     assert captured["contents"][0].name == "uploaded-paper"
     assert "attached as a PDF" in captured["contents"][1]
+
+
+def test_gemini_pdf_call_uses_parsed_schema_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("PHASE3_MODE", "single")
+    monkeypatch.setattr(summarizer, "DRY_RUN", False)
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 direct pdf")
+
+    class _FakeFiles:
+        def upload(self, file):
+            return SimpleNamespace(name="uploaded-paper")
+
+    class _FakeModels:
+        def generate_content(self, model, contents, config):
+            return SimpleNamespace(
+                parsed=_valid_summary_dict(),
+                text='{"headline": "truncated',
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=5432,
+                    candidates_token_count=234,
+                ),
+            )
+
+    class _FakeGeminiClient:
+        def __init__(self, api_key=None):
+            self.files = _FakeFiles()
+            self.models = _FakeModels()
+
+    class _FakeTypes:
+        @staticmethod
+        def GenerateContentConfig(**kwargs):
+            return kwargs
+
+    fake_genai = SimpleNamespace(Client=_FakeGeminiClient, types=_FakeTypes)
+
+    with patch.dict("sys.modules", {
+        "google": SimpleNamespace(genai=fake_genai),
+        "google.genai": fake_genai,
+        "google.genai.types": _FakeTypes,
+    }):
+        result = summarizer.generate_summary_from_pdf(
+            "gemini",
+            pdf_path,
+            prompt_template="Summarize this: {ARTICLE_TEXT}",
+        )
+
+    assert result["status"] == "success"
+    assert result["structured_summary"]["headline"] == _valid_summary_dict()["headline"]
 
 
 # ---------------------------------------------------------------------------
@@ -1379,11 +1436,13 @@ def test_run_phase3_summarize_all_test_mode_defaults_to_one_pair(
     def _fake_pdfs(**kwargs):
         captured["pdf_limit"] = kwargs["limit"]
         captured["pdf_stems"] = kwargs["stems"]
+        captured["pdf_output_dir"] = kwargs["output_dir"]
         return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
 
     def _fake_texts(**kwargs):
         captured["txt_limit"] = kwargs["limit"]
         captured["txt_stems"] = kwargs["stems"]
+        captured["txt_output_dir"] = kwargs["output_dir"]
         return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
 
     monkeypatch.setattr(
@@ -1405,12 +1464,14 @@ def test_run_phase3_summarize_all_test_mode_defaults_to_one_pair(
     assert captured["txt_limit"] == 1
     assert captured["pdf_stems"] == {"same_article"}
     assert captured["txt_stems"] == {"same_article"}
+    assert captured["pdf_output_dir"] == run_phase3.DATA_DIR / "summaries_pdf"
+    assert captured["txt_output_dir"] == run_phase3.DATA_DIR / "summaries_txt"
 
 
-def test_run_phase3_summarize_all_dev_mode_defaults_to_one_pair(
+def test_run_phase3_summarize_all_dev_mode_can_use_regular_outputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """summarize-all dev mode is also a one-article PDF-vs-processed smoke test."""
+    """--output-set regular keeps a dev comparison in the original output folders."""
     import run_phase3
 
     captured: dict[str, object] = {}
@@ -1422,13 +1483,11 @@ def test_run_phase3_summarize_all_dev_mode_defaults_to_one_pair(
         return True
 
     def _fake_pdfs(**kwargs):
-        captured["pdf_limit"] = kwargs["limit"]
-        captured["pdf_stems"] = kwargs["stems"]
+        captured["pdf_output_dir"] = kwargs["output_dir"]
         return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
 
     def _fake_texts(**kwargs):
-        captured["txt_limit"] = kwargs["limit"]
-        captured["txt_stems"] = kwargs["stems"]
+        captured["txt_output_dir"] = kwargs["output_dir"]
         return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
 
     monkeypatch.setattr(
@@ -1445,12 +1504,160 @@ def test_run_phase3_summarize_all_dev_mode_defaults_to_one_pair(
         lambda _limit, **_kwargs: {"same_article"},
     )
 
+    ret = run_phase3.main([
+        "summarize-all",
+        "--mode",
+        "dev",
+        "--output-set",
+        "regular",
+    ])
+
+    assert ret == 0
+    assert captured["pdf_output_dir"] == run_phase3.DATA_DIR / "summaries_pdf"
+    assert captured["txt_output_dir"] == run_phase3.DATA_DIR / "summaries_txt"
+
+
+def test_run_phase3_summarize_all_env_can_use_regular_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SUMMARIZE_ALL_OUTPUT_SET in .env can send dev outputs to regular folders."""
+    import run_phase3
+
+    captured: dict[str, object] = {}
+
+    def _fake_load_prompts(_providers=None, _path=None):
+        return {"openai": "Prompt {ARTICLE_TEXT}"}, None, Path("guide.txt"), {}
+
+    def _fake_confirm(_profile, force=False):
+        return True
+
+    def _fake_pdfs(**kwargs):
+        captured["pdf_output_dir"] = kwargs["output_dir"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _fake_texts(**kwargs):
+        captured["txt_output_dir"] = kwargs["output_dir"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    monkeypatch.setenv("SUMMARIZE_ALL_OUTPUT_SET", "regular")
+    monkeypatch.setattr(
+        summarizer,
+        "load_provider_prompt_templates_with_optional_guide",
+        _fake_load_prompts,
+    )
+    monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
+    monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
+    monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+    monkeypatch.setattr(
+        run_phase3,
+        "_paired_summary_stems",
+        lambda _limit, **_kwargs: {"same_article"},
+    )
+
+    ret = run_phase3.main(["summarize-all", "--mode", "dev"])
+
+    assert ret == 0
+    assert captured["pdf_output_dir"] == run_phase3.DATA_DIR / "summaries_pdf"
+    assert captured["txt_output_dir"] == run_phase3.DATA_DIR / "summaries_txt"
+
+
+def test_run_phase3_summarize_all_dev_mode_uses_phase3_dev_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """summarize-all dev mode uses PHASE3_DEV_LIMIT matched article pairs."""
+    import run_phase3
+
+    captured: dict[str, object] = {}
+    matched_stems = {f"article_{i}" for i in range(5)}
+
+    def _fake_load_prompts(_providers=None, _path=None):
+        return {"openai": "Prompt {ARTICLE_TEXT}"}, None, Path("guide.txt"), {}
+
+    def _fake_confirm(_profile, force=False):
+        return True
+
+    def _fake_pdfs(**kwargs):
+        captured["pdf_limit"] = kwargs["limit"]
+        captured["pdf_stems"] = kwargs["stems"]
+        captured["pdf_output_dir"] = kwargs["output_dir"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _fake_texts(**kwargs):
+        captured["txt_limit"] = kwargs["limit"]
+        captured["txt_stems"] = kwargs["stems"]
+        captured["txt_output_dir"] = kwargs["output_dir"]
+        return {"success": 3, "failed": 0, "skipped": 0, "no_source": 0}
+
+    monkeypatch.setattr(
+        summarizer,
+        "load_provider_prompt_templates_with_optional_guide",
+        _fake_load_prompts,
+    )
+    monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
+    monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
+    monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+    monkeypatch.setenv("PHASE3_DEV_LIMIT", "5")
+
+    def _fake_paired_summary_stems(limit, **_kwargs):
+        captured["paired_limit"] = limit
+        return matched_stems
+
+    monkeypatch.setattr(run_phase3, "_paired_summary_stems", _fake_paired_summary_stems)
+
     ret = run_phase3.main(["summarize-all", "--mode", "dev"])
     assert ret == 0
-    assert captured["pdf_limit"] == 1
-    assert captured["txt_limit"] == 1
-    assert captured["pdf_stems"] == {"same_article"}
-    assert captured["txt_stems"] == {"same_article"}
+    assert captured["paired_limit"] == 5
+    assert captured["pdf_limit"] == 5
+    assert captured["txt_limit"] == 5
+    assert captured["pdf_stems"] == matched_stems
+    assert captured["txt_stems"] == matched_stems
+    assert captured["pdf_output_dir"] == run_phase3.DATA_DIR / "dev_tests" / "summaries_pdf"
+    assert captured["txt_output_dir"] == run_phase3.DATA_DIR / "dev_tests" / "summaries_txt"
+    out = capsys.readouterr().out
+    assert "dev mode defaults to PHASE3_DEV_LIMIT=5 matched article pairs" in out
+
+
+def test_run_phase3_summarize_all_warns_when_fewer_pairs_than_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI explains when the paired corpus has fewer matches than requested."""
+    import run_phase3
+
+    def _fake_load_prompts(_providers=None, _path=None):
+        return {"openai": "Prompt {ARTICLE_TEXT}"}, None, Path("guide.txt"), {}
+
+    def _fake_confirm(_profile, force=False):
+        return True
+
+    def _fake_pdfs(**_kwargs):
+        return {"success": 6, "failed": 0, "skipped": 0, "no_source": 0}
+
+    def _fake_texts(**_kwargs):
+        return {"success": 6, "failed": 0, "skipped": 0, "no_source": 0}
+
+    monkeypatch.setattr(
+        summarizer,
+        "load_provider_prompt_templates_with_optional_guide",
+        _fake_load_prompts,
+    )
+    monkeypatch.setattr(summarizer, "confirm_real_batch", _fake_confirm)
+    monkeypatch.setattr(summarizer, "summarize_all_pdfs", _fake_pdfs)
+    monkeypatch.setattr(summarizer, "summarize_all_processed_texts", _fake_texts)
+    monkeypatch.setenv("PHASE3_DEV_LIMIT", "5")
+    monkeypatch.setattr(
+        run_phase3,
+        "_paired_summary_stems",
+        lambda _limit, **_kwargs: {"article_1", "article_2"},
+    )
+
+    ret = run_phase3.main(["summarize-all", "--mode", "dev"])
+
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "WARNING: requested 5 matched pairs, but only found 2" in out
+    assert "Only stems present in both data/raw/*.pdf and data/processed/*.jsonl" in out
 
 
 def test_run_phase3_summarize_all_rejects_batch_mode(

@@ -80,6 +80,9 @@ SEED = int(os.getenv("SEED", "42"))
 # readable prose. 500 tokens caused provider-side truncation and unparsable
 # OpenAI responses, so the default leaves headroom for complete summaries.
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
+GEMINI_MAX_OUTPUT_TOKENS = int(
+    os.getenv("GEMINI_MAX_OUTPUT_TOKENS", str(max(MAX_OUTPUT_TOKENS, 2400)))
+)
 PROMPT_FILE = Path(os.getenv("PROMPT_FILE", "llm-sum/prompts/summarization_v1.txt"))
 PROMPT_MODE = os.getenv("PROMPT_MODE", "shared")
 VALID_PROMPT_MODES = ("shared", "provider_specific")
@@ -620,6 +623,56 @@ def gemini_response_schema() -> dict[str, Any]:
     return _gemini_coerce_nullable(stripped)
 
 
+def _gemini_output_token_limit() -> int:
+    """
+    Return Gemini's completion cap.
+
+    Gemini has been truncating otherwise valid VeterinarySummary JSON at the
+    shared 1200-1500 token cap. We keep the shared cap for other providers, but
+    give Gemini a larger default because its JSON output often includes escaped
+    prose and pretty formatting; this is safer than trying to repair partial
+    scientific summaries after truncation.
+    """
+    return GEMINI_MAX_OUTPUT_TOKENS
+
+
+def _gemini_finish_reason(response: object) -> str:
+    """Extract Gemini's finish reason across SDK object/dict shapes."""
+    candidates = getattr(response, "candidates", None) or []
+    candidate = candidates[0] if candidates else None
+    finish = getattr(candidate, "finish_reason", None)
+    if isinstance(candidate, dict):
+        finish = candidate.get("finish_reason", finish)
+    return str(finish or "unknown")
+
+
+def _parse_gemini_veterinary_summary(response: object) -> VeterinarySummary:
+    """
+    Validate Gemini structured output without depending only on response.text.
+
+    The google-genai SDK may expose schema output as ``response.parsed``. Reading
+    that first avoids JSON string edge cases. If the SDK only provides text, we
+    parse it normally and raise a clear truncation-oriented error instead of the
+    opaque ``Unterminated string`` message.
+    """
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        return coerce_veterinary_summary(parsed)
+
+    text = str(getattr(response, "text", "") or "")
+    if not text:
+        raise ValueError(f"Gemini returned empty response.text (finish_reason={_gemini_finish_reason(response)})")
+    try:
+        return coerce_veterinary_summary(json.loads(text))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Gemini returned incomplete or invalid JSON "
+            f"(finish_reason={_gemini_finish_reason(response)}, "
+            f"chars={len(text)}, max_output_tokens={_gemini_output_token_limit()}). "
+            "Increase GEMINI_MAX_OUTPUT_TOKENS if this recurs."
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # DRY_RUN mock summary (no API calls, deterministic)
 # ---------------------------------------------------------------------------
@@ -913,20 +966,14 @@ def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
         contents=user_message,
         config=types.GenerateContentConfig(
             temperature=TEMPERATURE,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
+            max_output_tokens=_gemini_output_token_limit(),
             response_mime_type="application/json",
             response_schema=gemini_response_schema(),
         ),
     )
 
     usage = response.usage_metadata
-    if not response.text:
-        finish = getattr(
-            (getattr(response, "candidates", None) or [None])[0],
-            "finish_reason", "unknown",
-        )
-        raise ValueError(f"Gemini returned empty response.text (finish_reason={finish})")
-    parsed = coerce_veterinary_summary(json.loads(response.text))
+    parsed = _parse_gemini_veterinary_summary(response)
     return _successful_summary_result(
         parsed=parsed,
         input_tokens=int(usage.prompt_token_count),
@@ -1002,14 +1049,18 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     }
     try:
         response = _openai_call_with_backoff(
-            lambda: client.responses.parse(**base_kwargs, temperature=TEMPERATURE, seed=SEED)
+            # The Responses API used for file inputs does not accept ``seed`` in
+            # the installed SDK, unlike Chat Completions. Passing only supported
+            # controls preserves deterministic temperature while avoiding a
+            # local TypeError before the request is sent.
+            lambda: client.responses.parse(**base_kwargs, temperature=TEMPERATURE)
         )
     except Exception as exc:
         if not _openai_is_temperature_error(exc):
             raise
         print(f"[phase3:summarize] {spec.model_id} rejected temperature for PDF — retrying without it.")
         response = _openai_call_with_backoff(
-            lambda: client.responses.parse(**base_kwargs, seed=SEED)
+            lambda: client.responses.parse(**base_kwargs)
         )
 
     parsed = _extract_openai_parsed_summary(response)
@@ -1096,20 +1147,14 @@ def _call_gemini_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
         contents=[uploaded, user_message],
         config=types.GenerateContentConfig(
             temperature=TEMPERATURE,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
+            max_output_tokens=_gemini_output_token_limit(),
             response_mime_type="application/json",
             response_schema=gemini_response_schema(),
         ),
     )
 
     usage = response.usage_metadata
-    if not response.text:
-        finish = getattr(
-            (getattr(response, "candidates", None) or [None])[0],
-            "finish_reason", "unknown",
-        )
-        raise ValueError(f"Gemini returned empty response.text (finish_reason={finish})")
-    parsed = coerce_veterinary_summary(json.loads(response.text))
+    parsed = _parse_gemini_veterinary_summary(response)
     return _successful_summary_result(
         parsed=parsed,
         input_tokens=int(usage.prompt_token_count),
