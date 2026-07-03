@@ -157,28 +157,109 @@ clinical interpretation.
 
 ## How The Score Is Calculated
 
-The judge does not calculate the final score. It only returns five criterion
-scores. Python calculates the weighted average so the math is reproducible.
+### Who does the math?
 
-Weights:
+The **judge LLM does not calculate the final score.** It only returns five
+separate criterion scores (each from 1 to 5), plus hallucination evidence and a
+confidence rating.
 
-- Faithfulness: 1.5
-- Completeness: 1.0
-- Clinical usefulness: 1.2
-- Clarity: 0.8
-- Safety: 1.3
+**Python calculates `jury_score`** after the judge responds. That way:
 
-Formula:
+- The LLM never has to do arithmetic (LLMs sometimes make math mistakes).
+- The same formula runs identically on every paper, every model, every rerun.
+- Anyone reading the study can open `llm-sum/evaluator.py` and verify the math.
+
+This is the same design principle as the older Vet-Score rubric — only the
+number of criteria and the scale changed.
+
+### What is a weighted average?
+
+A **weighted average** means some criteria count more than others. Faithfulness
+and safety matter more than clarity, so their scores pull the final number up or
+down more strongly.
+
+Think of it like a course grade where the final exam is worth 40% and homework
+is worth 10% — not every assignment counts equally.
+
+### The weights (importance multipliers)
+
+| Criterion | Weight | Plain meaning |
+|-----------|--------|----------------|
+| Faithfulness | 1.5 | Most important — wrong facts are the worst failure |
+| Safety | 1.3 | High — misleading clinical wording is dangerous |
+| Clinical usefulness | 1.2 | Important — the summary must help a vet clinician |
+| Completeness | 1.0 | Standard — cover the main paper sections |
+| Clarity | 0.8 | Lowest — readability matters, but not more than correctness |
+
+**Total weight** = 1.5 + 1.3 + 1.2 + 1.0 + 0.8 = **5.8**
+
+### The formula (step by step)
+
+For each criterion, multiply the judge's score by its weight. Add those products
+up. Divide by the total weight.
+
+```text
+jury_score = (score₁ × weight₁ + score₂ × weight₂ + … + score₅ × weight₅)
+             / (weight₁ + weight₂ + … + weight₅)
+```
+
+In code-friendly terms:
 
 ```text
 jury_score =
-  weighted_sum(criteria_score * criterion_weight)
+  weighted_sum(criteria_score × criterion_weight)
   / sum(all criterion weights)
 ```
 
-The primary score is `jury_score`, on a 1 to 5 scale. The row also includes
-`quality_score`, a derived 1 to 10 compatibility field for older notebooks. New
-analysis should use `jury_score`.
+The result is a single number on a **1 to 5 scale**. That is the primary score
+for MedHELM-style evaluation.
+
+### Worked example
+
+Suppose the judge returns these scores for one summary:
+
+| Criterion | Judge score (1–5) | Weight | Score × weight |
+|-----------|-------------------|--------|----------------|
+| Faithfulness | 4 | 1.5 | 4 × 1.5 = **6.0** |
+| Safety | 5 | 1.3 | 5 × 1.3 = **6.5** |
+| Clinical usefulness | 3 | 1.2 | 3 × 1.2 = **3.6** |
+| Completeness | 4 | 1.0 | 4 × 1.0 = **4.0** |
+| Clarity | 4 | 0.8 | 4 × 0.8 = **3.2** |
+
+**Step 1 — add the weighted products:**
+
+```text
+6.0 + 6.5 + 3.6 + 4.0 + 3.2 = 23.3
+```
+
+**Step 2 — divide by total weight (5.8):**
+
+```text
+jury_score = 23.3 / 5.8 = 4.02  (rounded to 4.02)
+```
+
+So this summary would get **`jury_score = 4.02`**. Clinical usefulness (3)
+pulled the average down more than clarity did, because clinical usefulness has a
+higher weight.
+
+**Best possible score:** if every criterion is 5:
+
+```text
+(5×1.5 + 5×1.3 + 5×1.2 + 5×1.0 + 5×0.8) / 5.8 = 29.0 / 5.8 = 5.0
+```
+
+**Worst possible score:** if every criterion is 1:
+
+```text
+(1×1.5 + 1×1.3 + 1×1.2 + 1×1.0 + 1×0.8) / 5.8 = 5.8 / 5.8 = 1.0
+```
+
+### Legacy `quality_score` (1–10)
+
+The row also includes `quality_score`, a **derived** 1–10 field for older
+notebooks and scripts. Python maps `jury_score` onto 1–10 with a simple linear
+scale — it is not a separate judge opinion. **New analysis should use
+`jury_score`.**
 
 ## Why These Weights
 
