@@ -23,7 +23,9 @@ from evaluator import (
     SCORE_SENTINEL_MALFORMED,
     build_judge_prompt,
     build_evaluation_row,
+    aggregate_jury_scores,
     calculate_composite_score,
+    calculate_jury_score,
     needs_human_review,
     parse_judge_response,
 )
@@ -170,7 +172,8 @@ def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
     assert row["system_fingerprint"] == "fp-test"
     # ... new v2 fields are present ...
     assert row["composite_score"] is not None
-    assert row["rubric_version"] == "vet_score_v2.0"
+    assert row["rubric_version"] == "vet_medhelm_score_v1.0"
+    assert "automatic_metrics" in row
     # ... but is NOT in any field that would be reconstructed into a judge prompt.
     rendered = build_judge_prompt("Reference body.", "Candidate body.").lower()
     assert "anthropic" not in rendered
@@ -184,6 +187,35 @@ def test_mock_judge_response_is_stable() -> None:
         "openai", "Reference body.", "Candidate summary."
     )
     assert first["raw_text"] == second["raw_text"]
+
+
+def test_medhelm_schema_parses_criteria_scores() -> None:
+    raw = json.dumps({
+        "criteria_scores": {
+            "faithfulness": {"score": 5, "reasoning": "Supported."},
+            "completeness": {"score": 4, "reasoning": "One minor omission."},
+            "clinical_usefulness": {"score": 5, "reasoning": "Useful."},
+            "clarity": {"score": 4, "reasoning": "Readable."},
+            "safety": {"score": 5, "reasoning": "No safety concern."},
+        },
+        "hallucination": {"present": False, "count": 0, "claims": []},
+        "confidence_score": 5,
+        "reasoning": "Strong summary.",
+    })
+    parsed = parse_judge_response(raw)
+    assert parsed["criteria_scores"]["faithfulness"]["score"] == 5
+    assert parsed["jury_score"] == calculate_jury_score(parsed["criteria_scores"])
+    assert parsed["quality_score"] == 9
+    assert parsed["parse_method"] == "json"
+
+
+def test_aggregate_jury_scores_tracks_disagreement() -> None:
+    rows = [{"jury_score": 4.5}, {"jury_score": 3.5}, {"jury_score": None}]
+    aggregate = aggregate_jury_scores(rows)
+    assert aggregate["jury_score"] == 4.0
+    assert aggregate["judge_count"] == 3
+    assert aggregate["valid_judge_count"] == 2
+    assert aggregate["judge_disagreement"] == 1.0
 
 
 def test_call_judge_uses_call_time_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:

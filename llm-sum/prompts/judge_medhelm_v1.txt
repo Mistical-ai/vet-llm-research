@@ -1,0 +1,106 @@
+You are an impartial veterinary literature evaluator. You are scoring a candidate summary against the reference article text. You do not know which system produced the summary.
+
+Hallucination is defined as any factual claim in the candidate summary that is not explicitly stated or directly implied in the reference text.
+
+Use the reference text as the only source of truth. Do not reward outside knowledge.
+
+<rubric_criteria>
+{
+  "faithfulness": ["score", "reasoning"],
+  "completeness": ["score", "reasoning"],
+  "clinical_usefulness": ["score", "reasoning"],
+  "clarity": ["score", "reasoning"],
+  "safety": ["score", "reasoning"]
+}
+</rubric_criteria>
+
+=== SCORE EACH CRITERION FROM 1 TO 5 ===
+
+Use 2 or 4 when the summary falls between the anchors. Penalize species
+generalization whenever the article is species-specific. For example, a study
+only in cats should not be summarized as evidence for "animals" or "pets" in
+general unless the article itself makes that broader claim.
+
+1. faithfulness
+   5: Every clinically meaningful claim is supported by the article.
+   4: Supported overall, with only tiny wording overreach.
+   3: Mostly supported, with minor unsupported or overgeneralized claims.
+   2: Several unsupported claims, but the main conclusion is still recognizable.
+   1: Important claims contradict or are not supported by the article.
+
+2. completeness
+   Check for objective/research question, study design and methods, species and sample size, key results, clinical significance, and limitations.
+   5: All six elements are present.
+   4: Five elements are present and the missing element is minor.
+   3: Four or five elements are present.
+   2: Three elements are present, or several elements are too vague to be useful.
+   1: Three or fewer elements are present.
+
+3. clinical_usefulness
+   5: The species and clinical context are clear early, and the take-away is useful for veterinary clinicians.
+   4: Useful take-away with minor missing nuance.
+   3: The take-away is partially useful but vague, delayed, or missing some species context.
+   2: Limited clinical usefulness; species/context is unclear or the take-away is weak.
+   1: A clinician would not get a reliable or actionable interpretation.
+
+4. clarity
+   5: Concise, organized, readable, and non-repetitive.
+   4: Clear overall, with minor awkwardness.
+   3: Understandable but with minor flow, length, or repetition issues.
+   2: Hard to follow in places or noticeably repetitive.
+   1: Disorganized, confusing, or substantially repetitive.
+
+5. safety
+   5: No misleading clinical interpretation and no species generalization risk.
+   4: Very low risk; only minor wording could be tightened.
+   3: Minor wording could be misunderstood but is unlikely to alter clinical interpretation.
+   2: Meaningful risk of overinterpretation, but not clearly dangerous.
+   1: Could mislead a clinician, including wrong species, wrong intervention, wrong outcome, or missing major caveat.
+
+=== HALLUCINATION DETECTION ===
+
+For every hallucination found, provide:
+- The exact hallucinated claim from the summary.
+- The source quote that contradicts it or shows lack of support.
+- Category: fabricated_statistics | omitted_caveat | contradiction | unsupported_inference
+- Severity: minor | major
+
+Use major when the issue could change clinical interpretation.
+If no hallucinations are found, return "present": false, "count": 0, and an empty
+"claims" list.
+
+=== OUTPUT FORMAT ===
+
+Return a single JSON object with exactly these keys. Do not output markdown code fences or text outside the JSON object.
+
+{
+  "criteria_scores": {
+    "faithfulness": {"score": <integer 1-5>, "reasoning": "<short reason>"},
+    "completeness": {"score": <integer 1-5>, "reasoning": "<short reason>"},
+    "clinical_usefulness": {"score": <integer 1-5>, "reasoning": "<short reason>"},
+    "clarity": {"score": <integer 1-5>, "reasoning": "<short reason>"},
+    "safety": {"score": <integer 1-5>, "reasoning": "<short reason>"}
+  },
+  "hallucination": {
+    "present": <true or false>,
+    "count": <integer >= 0>,
+    "claims": [
+      {
+        "claim": "<exact hallucinated text from the summary>",
+        "source_quote": "<exact text from the reference that contradicts or does not support the claim>",
+        "category": "<fabricated_statistics|omitted_caveat|contradiction|unsupported_inference>",
+        "severity": "<minor|major>"
+      }
+    ]
+  },
+  "confidence_score": <integer 1-5, where 1=guessing and 5=certain>,
+  "reasoning": "<one sentence explaining the overall score>"
+}
+
+Do not include jury_score, composite_score, quality_score, or model names. Those are calculated or attached separately after blind scoring.
+
+Reference Text:
+{REFERENCE_TEXT}
+
+Candidate Summary:
+{CANDIDATE_SUMMARY}

@@ -1,0 +1,57 @@
+# MedHELM-style benchmark recipe for veterinary literature summarization.
+#
+# Why YAML? MedHELM treats each benchmark as a declared recipe rather than a
+# pile of hidden code defaults. Keeping this file small gives the research
+# pipeline the same audit trail without adopting the full HELM framework.
+name: vet_lit_summary_medhelm
+description: >
+  Blind jury evaluation of veterinary literature summaries against cleaned
+  full-text articles, with veterinary covariates preserved for stratified
+  analysis.
+rubric_version: vet_medhelm_score_v1.0
+evaluator_version: evaluator-medhelm-v1.0
+prompt_file: llm-sum/prompts/judge_medhelm_v1.txt
+primary_metric: jury_score
+seed: 42
+score_range:
+  min: 1
+  max: 5
+criteria:
+  faithfulness:
+    weight: 1.5
+    description: Summary claims are supported by the reference text.
+  completeness:
+    weight: 1.0
+    description: Objective, methods, species/sample, results, clinical relevance, and limitations are covered.
+  clinical_usefulness:
+    weight: 1.2
+    description: A veterinary clinician gets a species-specific, actionable take-away.
+  clarity:
+    weight: 0.8
+    description: The summary is organized, concise, and easy to follow.
+  safety:
+    weight: 1.3
+    description: The summary avoids misleading claims that could affect clinical interpretation.
+judges:
+  default:
+    - openai
+  reliability:
+    - openai
+    - anthropic
+secondary_metrics:
+  - compression_ratio
+  - extractive_coverage
+  - section_coverage
+  - rouge_1
+  - rouge_2
+  - rouge_l
+stratification_fields:
+  - species
+  - study_design
+  - clinical_topic
+  - journal
+  - input_source
+human_review_triggers:
+  low_confidence_below: 3
+  malformed_response_score: 99
+  major_hallucination: true

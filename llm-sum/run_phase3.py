@@ -9,6 +9,7 @@ One CLI for every Phase 3 step:
                 Run paired raw-PDF and processed-text summaries, producing
                 readable text files with three provider outputs per source.
     evaluate    Run the blind judge over data/summaries.jsonl.
+    eval-report Summarize MedHELM-style evaluation rows by clinical strata.
     status      Print counts: extracted / summarised / evaluated / budget.
     clean       Remove temporary data/batch/*.jsonl scratch files.
 
@@ -474,6 +475,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval_report(args: argparse.Namespace) -> int:
+    """Print read-only aggregate reports for MedHELM-style evaluation rows."""
+    from eval_report import main as report_main
+    delegate = ["--evaluations", str(args.evaluations)]
+    if args.json:
+        delegate.append("--json")
+    return report_main(delegate)
+
+
 # ---------------------------------------------------------------------------
 # clean
 # ---------------------------------------------------------------------------
@@ -741,6 +751,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Print per-stage counts.")
     _add_mode_arg(p_status)
     p_status.set_defaults(func=cmd_status)
+
+    p_report = sub.add_parser("eval-report", help="Summarize evaluation rows by model and strata.")
+    p_report.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
+    p_report.add_argument("--json", action="store_true",
+                          help="Print full report JSON instead of compact text.")
+    p_report.set_defaults(func=cmd_eval_report)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")
     p_clean.set_defaults(func=cmd_clean)
