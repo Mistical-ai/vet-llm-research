@@ -324,7 +324,9 @@ paid judge calls.
 
 ## Output Fields
 
-Each evaluation row is appended to `data/evaluations.jsonl`.
+Each evaluation row is appended to `data/evaluations.jsonl`. JSONL means **one
+JSON object per line** — you can open the file in a text editor and read row by
+row, or load it into Python/pandas for analysis.
 
 Important fields:
 
@@ -338,6 +340,158 @@ Important fields:
 - `strata`: species, study design, clinical topic, journal, and input source.
 - `judge_model_version` and `system_fingerprint`: provider version metadata
   when available.
+
+### Example evaluation row
+
+Below is one **pretty-printed** row showing what you would see after evaluating
+one paper-summary pair. In the real file it is stored as a **single line** of
+JSON (no line breaks inside the object).
+
+This example uses the same criterion scores as the worked example above, so
+`jury_score = 4.02` and `quality_score = 9`.
+
+```json
+{
+  "benchmark_name": "vet_lit_summary_medhelm",
+  "doi": "10.1111/jvim.16872",
+  "input_source": "processed",
+  "summarizer": "anthropic",
+  "judge": "openai",
+  "judge_model_version": "gpt-5.4-0325-preview",
+  "system_fingerprint": "fp_abc123example",
+  "evaluator_version": "evaluator-medhelm-v1.0",
+  "rubric_version": "vet_medhelm_score_v1.0",
+  "criteria_scores": {
+    "faithfulness": {
+      "score": 4,
+      "reasoning": "Main findings match the article; one minor overgeneralization."
+    },
+    "completeness": {
+      "score": 4,
+      "reasoning": "Covers objective, methods, species, results, and limitations; clinical significance is brief."
+    },
+    "clinical_usefulness": {
+      "score": 3,
+      "reasoning": "Species is named, but the take-home message is vague."
+    },
+    "clarity": {
+      "score": 4,
+      "reasoning": "Readable and organized with minor repetition."
+    },
+    "safety": {
+      "score": 5,
+      "reasoning": "No misleading clinical interpretation detected."
+    }
+  },
+  "jury_score": 4.02,
+  "judge_count": 1,
+  "valid_judge_count": 1,
+  "judge_disagreement": 0.0,
+  "automatic_metrics": {
+    "compression_ratio": 0.0842,
+    "extractive_coverage": 0.7314,
+    "section_coverage": {
+      "objective": true,
+      "methods": true,
+      "species_sample": true,
+      "results": true,
+      "clinical_significance": true,
+      "limitations": false,
+      "covered_count": 5,
+      "coverage_ratio": 0.8333
+    },
+    "rouge_1": 0.4125,
+    "rouge_2": 0.1893,
+    "rouge_l": 0.3561
+  },
+  "strata": {
+    "species": ["Canine"],
+    "study_design": "Retrospective Case Series",
+    "clinical_topic": "Cardiology",
+    "journal": "Journal of Veterinary Internal Medicine",
+    "input_source": "processed"
+  },
+  "factual_accuracy": 4,
+  "completeness": 4,
+  "clinical_relevance": 3,
+  "organization": 4,
+  "composite_score": 4.02,
+  "hallucination_present": true,
+  "hallucination_claims": [
+    {
+      "claim": "Mortality was significantly reduced in all animals.",
+      "source_quote": "Mortality reduction was observed in the canine cohort only (n=42).",
+      "category": "unsupported_inference",
+      "severity": "minor"
+    }
+  ],
+  "quality_score": 9,
+  "hallucination_count": 1,
+  "hallucination_categories": ["unsupported_inference"],
+  "confidence_score": 4,
+  "requires_human_review": false,
+  "parse_method": "json",
+  "reasoning": "Mostly faithful summary with one minor overgeneralization and vague clinical take-away.",
+  "input_tokens": 8420,
+  "output_tokens": 312,
+  "raw_response_excerpt": "{\"criteria_scores\":{\"faithfulness\":{\"score\":4,\"reasoning\":\"Main findings match...",
+  "timestamp": "2026-07-03T18:45:12.123456+00:00"
+}
+```
+
+#### How to read this row
+
+| Field | What it tells you |
+|-------|-------------------|
+| `doi` + `summarizer` | Which paper and which model's summary was judged |
+| `judge` | Which provider acted as the blind judge (separate from the summarizer) |
+| `criteria_scores` | The five rubric scores the judge returned — Python did not change these |
+| `jury_score` | **Primary score** — Python's weighted average of the five criteria (4.02 here) |
+| `quality_score` | Legacy 1–10 alias derived from `jury_score` (9 here) |
+| `hallucination_claims` | Quoted evidence when the summary says something the paper does not support |
+| `requires_human_review` | `false` here because confidence is high and the hallucination is minor |
+| `automatic_metrics` | Secondary local checks — useful, but not the main clinical score |
+| `strata` | Subgroup labels for reporting (species, topic, study design, journal) |
+| `parse_method` | `json` means the judge response parsed cleanly on the first try |
+
+#### What the file looks like on disk
+
+`data/evaluations.jsonl` is append-only. After scoring three summaries for one
+paper (OpenAI, Anthropic, Gemini), you might have three lines like:
+
+```text
+{"doi":"10.1111/jvim.16872","summarizer":"openai","jury_score":3.85,...}
+{"doi":"10.1111/jvim.16872","summarizer":"anthropic","jury_score":4.02,...}
+{"doi":"10.1111/jvim.16872","summarizer":"gemini","jury_score":3.67,...}
+```
+
+Each line is independent. Re-running evaluation skips rows that already exist for
+the same `(doi, summarizer, judge, input_source, rubric_version)` unless you use
+`--no-resume`.
+
+#### Example report output
+
+After evaluation, you can summarize rows without any API calls:
+
+```powershell
+python llm-sum/run_phase3.py eval-report
+```
+
+Example console output:
+
+```text
+[by_summarizer]
+anthropic: n=15 mean=4.02 halluc=0.067 major=0.0 parse_fail=0.0
+gemini: n=15 mean=3.71 halluc=0.133 major=0.067 parse_fail=0.0
+openai: n=15 mean=3.89 halluc=0.067 major=0.0 parse_fail=0.0
+
+[by_species]
+Canine: n=30 mean=3.95 halluc=0.1 major=0.033 parse_fail=0.0
+Feline: n=15 mean=3.82 halluc=0.067 major=0.0 parse_fail=0.0
+```
+
+This shows mean `jury_score` and reliability rates broken down by model and
+species — the MedHELM-style stratified view of your results.
 
 ## Safe Mock Run
 
