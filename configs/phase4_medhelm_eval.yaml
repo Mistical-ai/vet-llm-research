@@ -1,0 +1,31 @@
+# Versioned evaluation run spec for the MedHELM-style veterinary benchmark.
+#
+# This file is a research protocol artifact. Runtime code may still read some
+# values from .env for backward compatibility, but manuscript-grade runs should
+# archive this config and record its SHA-256 hash in run_manifest.json.
+benchmark_name: vet_lit_summary_medhelm
+rubric_version: vet_medhelm_score_v1.0
+mode: test
+random_seed: 42
+input_source: processed
+prompt_files:
+  judge: llm-sum/prompts/judge_medhelm_v1.txt
+eval_config: llm-sum/eval_config/medhelm_vet_summary.yaml
+frozen_set: frozen_sets/example_medhelm_tiny.jsonl
+outputs:
+  root: runs
+  write_compat_data_jsonl: true
+judges:
+  default:
+    - openai
+  reliability:
+    - openai
+    - anthropic
+reporting:
+  bootstrap_reps: 1000
+  confidence_level: 0.95
+  stratify_by:
+    - journal
+    - year
+    - article_type
+    - input_source

@@ -1,5 +1,8 @@
 .env
 data/
+runs/*
+!runs/README.md
+!runs/.gitkeep
 __pycache__/
 venv/
 .venv/
