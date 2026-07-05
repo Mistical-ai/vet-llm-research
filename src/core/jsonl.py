@@ -12,8 +12,9 @@ whole artifact. These helpers make that behavior consistent across new modules.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:

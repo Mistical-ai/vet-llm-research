@@ -51,7 +51,13 @@ def paired_deltas(
 def paired_win_rate(deltas: list[dict[str, Any]]) -> dict[str, float | int]:
     """Summarize win/loss/tie rates from paired deltas."""
     if not deltas:
-        return {"n": 0, "mean_delta": 0.0, "model_a_win_rate": 0.0, "model_b_win_rate": 0.0, "tie_rate": 0.0}
+        return {
+            "n": 0,
+            "mean_delta": 0.0,
+            "model_a_win_rate": 0.0,
+            "model_b_win_rate": 0.0,
+            "tie_rate": 0.0,
+        }
     values = [float(row["delta_a_minus_b"]) for row in deltas]
     wins_a = sum(1 for value in values if value > 0)
     wins_b = sum(1 for value in values if value < 0)

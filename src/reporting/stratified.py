@@ -9,13 +9,14 @@ from typing import Any
 from metrics.medhelm import flagged_for_review_rate, hallucination_rate
 from reporting.bootstrap import bootstrap_mean_ci
 
-
 DEFAULT_STRATA = ("summarizer", "journal", "year", "article_type", "input_source")
 
 
 def score_value(row: dict[str, Any]) -> float | None:
     """Return the primary score for a row, preferring jury_score."""
     raw = row.get("jury_score", row.get("quality_score"))
+    if raw is None:
+        return None
     try:
         return float(raw)
     except (TypeError, ValueError):

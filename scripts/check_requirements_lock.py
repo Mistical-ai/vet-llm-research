@@ -19,7 +19,6 @@ import re
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REQ_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)(?:\[.*\])?\s*([<>=!~].*)?$")
 PIN_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)(?:\[.*\])?\s*==\s*([^#\s]+)")
@@ -60,9 +59,7 @@ def _check_pair(input_path: Path, lock_path: Path) -> list[str]:
     expected = _direct_requirements(input_path)
     locked = _locked_pins(lock_path)
     missing = sorted(expected - locked)
-    return [
-        f"{lock_path.name} is missing exact pins for: {', '.join(missing)}"
-    ] if missing else []
+    return [f"{lock_path.name} is missing exact pins for: {', '.join(missing)}"] if missing else []
 
 
 def main() -> int:

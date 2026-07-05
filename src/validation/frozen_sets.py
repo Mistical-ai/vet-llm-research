@@ -49,7 +49,8 @@ def load_frozen_set(path: Path, expected_sha256: str | None = None) -> list[dict
     actual_hash = dataset_hash(rows)
     if expected_sha256 and actual_hash != expected_sha256:
         raise FrozenSetChecksumError(
-            f"Frozen set checksum mismatch for {path}: expected {expected_sha256}, got {actual_hash}"
+            "Frozen set checksum mismatch for "
+            f"{path}: expected {expected_sha256}, got {actual_hash}"
         )
     return rows
 

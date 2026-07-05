@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 DEFAULT_CRITERION_WEIGHTS = {
     "faithfulness": 1.5,
     "completeness": 1.0,

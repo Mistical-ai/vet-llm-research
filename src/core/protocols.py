@@ -25,7 +25,9 @@ class LLMProvider(Protocol):
     def summarize(self, instance: DatasetInstance, spec: dict[str, Any]) -> ProviderResponse:
         """Summarize one dataset instance and return a normalized response."""
 
-    def judge(self, reference_text: str, candidate_summary: str, spec: dict[str, Any]) -> ProviderResponse:
+    def judge(
+        self, reference_text: str, candidate_summary: str, spec: dict[str, Any]
+    ) -> ProviderResponse:
         """Judge one candidate summary and return a normalized response."""
 
 

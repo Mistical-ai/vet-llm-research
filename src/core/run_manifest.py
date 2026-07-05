@@ -13,9 +13,9 @@ import json
 import platform
 import subprocess
 import sys
-from datetime import datetime, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
 
 from core.hashing import sha256_file
 from core.paths import REPO_ROOT, RUNS_DIR, resolve_repo_path
@@ -24,7 +24,7 @@ from core.schemas import RunManifest
 
 def create_run_id(prefix: str = "run") -> str:
     """Return a filesystem-safe UTC run id."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"{prefix}_{stamp}"
 
 
@@ -84,7 +84,7 @@ def build_run_manifest(
     return RunManifest(
         run_id=run_id,
         benchmark_name=benchmark_name,
-        started_utc=datetime.now(timezone.utc).isoformat(),
+        started_utc=datetime.now(UTC).isoformat(),
         git_sha=sha,
         git_branch=branch,
         python_version=sys.version.replace("\n", " "),
@@ -120,7 +120,7 @@ def finalize_run_manifest(path: Path, **updates: object) -> RunManifest:
     """
     data = json.loads(path.read_text(encoding="utf-8"))
     data.update(updates)
-    data["finished_utc"] = datetime.now(timezone.utc).isoformat()
+    data["finished_utc"] = datetime.now(UTC).isoformat()
     manifest = RunManifest.model_validate(data)
     write_run_manifest(manifest, path.parent)
     return manifest

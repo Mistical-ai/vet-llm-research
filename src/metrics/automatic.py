@@ -2,24 +2,29 @@
 
 from __future__ import annotations
 
-from collections import Counter
 import re
-
+from collections import Counter
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 SECTION_PATTERNS = {
     "objective": re.compile(r"\b(objective|aim|purpose|research question)\b", re.I),
-    "methods": re.compile(r"\b(method|study design|retrospective|prospective|randomi[sz]ed|trial)\b", re.I),
+    "methods": re.compile(
+        r"\b(method|study design|retrospective|prospective|randomi[sz]ed|trial)\b", re.I
+    ),
     "species_sample": re.compile(
         r"\b(dog|dogs|canine|cat|cats|feline|horse|horses|equine|cow|cattle|bovine|n\s*=\s*\d+|\d+\s+(dogs|cats|horses|cattle|animals|patients))\b",
         re.I,
     ),
-    "results": re.compile(r"\b(result|finding|significant|p\s*[<=>]|increased|decreased|associated)\b", re.I),
+    "results": re.compile(
+        r"\b(result|finding|significant|p\s*[<=>]|increased|decreased|associated)\b", re.I
+    ),
     "clinical_significance": re.compile(
         r"\b(clinical|clinician|practice|treatment|diagnosis|prognosis|recommend)\b",
         re.I,
     ),
-    "limitations": re.compile(r"\b(limit|limitation|small sample|bias|retrospective design|further research)\b", re.I),
+    "limitations": re.compile(
+        r"\b(limit|limitation|small sample|bias|retrospective design|further research)\b", re.I
+    ),
 }
 
 
@@ -86,9 +91,16 @@ def extractive_coverage(reference_text: str, candidate_summary: str) -> float:
 
 def section_coverage(candidate_summary: str) -> dict[str, bool | int | float]:
     """Check whether the summary appears to cover required vet-paper sections."""
-    hits = {name: bool(pattern.search(candidate_summary or "")) for name, pattern in SECTION_PATTERNS.items()}
+    hits = {
+        name: bool(pattern.search(candidate_summary or ""))
+        for name, pattern in SECTION_PATTERNS.items()
+    }
     count = sum(1 for hit in hits.values() if hit)
-    return {**hits, "covered_count": count, "coverage_ratio": round(count / len(SECTION_PATTERNS), 4)}
+    return {
+        **hits,
+        "covered_count": count,
+        "coverage_ratio": round(count / len(SECTION_PATTERNS), 4),
+    }
 
 
 def calculate_automatic_metrics(

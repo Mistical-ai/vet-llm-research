@@ -16,14 +16,23 @@ class ProviderAdapter:
     default_model: str = ""
 
     def __init__(self, model_id: str | None = None) -> None:
-        self.model_id = model_id or os.getenv(f"{self.provider_name.upper()}_MODEL", self.default_model)
+        self.model_id: str = (
+            model_id
+            or os.getenv(f"{self.provider_name.upper()}_MODEL")
+            or self.default_model
+            or self.provider_name
+        )
 
     def healthcheck(self) -> ProviderHealth:
         """Check configuration without making a network request."""
         if not self.env_key:
-            return ProviderHealth(provider=self.provider_name, ok=True, message="No API key required.")
+            return ProviderHealth(
+                provider=self.provider_name, ok=True, message="No API key required."
+            )
         if os.getenv("DRY_RUN", "true").lower() == "true":
-            return ProviderHealth(provider=self.provider_name, ok=True, message="DRY_RUN=true; network disabled.")
+            return ProviderHealth(
+                provider=self.provider_name, ok=True, message="DRY_RUN=true; network disabled."
+            )
         ok = bool(os.getenv(self.env_key))
         message = "API key present." if ok else f"Missing {self.env_key}."
         return ProviderHealth(provider=self.provider_name, ok=ok, message=message)
@@ -38,12 +47,14 @@ class ProviderAdapter:
             )
         raise NotImplementedError("Live summarize calls are still handled by legacy summarizer.py.")
 
-    def judge(self, reference_text: str, candidate_summary: str, spec: dict[str, Any]) -> ProviderResponse:
+    def judge(
+        self, reference_text: str, candidate_summary: str, spec: dict[str, Any]
+    ) -> ProviderResponse:
         """Return a deterministic dry-run judge response or fail before live migration."""
         if spec.get("dry_run", True):
             return normalize_response(
                 provider=self.provider_name,
-                raw_text="{\"criteria_scores\": {}, \"reasoning\": \"DRY_RUN adapter response\"}",
+                raw_text='{"criteria_scores": {}, "reasoning": "DRY_RUN adapter response"}',
                 model_version=self.model_id,
             )
         raise NotImplementedError("Live judge calls are still handled by legacy evaluator.py.")

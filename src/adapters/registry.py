@@ -7,7 +7,6 @@ from adapters.base import ProviderAdapter
 from adapters.gemini_adapter import GeminiAdapter
 from adapters.openai_adapter import OpenAIAdapter
 
-
 ADAPTERS: dict[str, type[ProviderAdapter]] = {
     "openai": OpenAIAdapter,
     "anthropic": AnthropicAdapter,
