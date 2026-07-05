@@ -72,6 +72,7 @@ from dotenv import load_dotenv
 
 from file_paths import preferred_pdf_path
 from utils import log_error
+from validation.text import truncate_to_sentence_boundary
 
 load_dotenv()
 
@@ -245,19 +246,9 @@ def truncate_to_limit(text: str, limit: int = MAX_CHARS) -> str:
     text  : str — Input text.
     limit : int — Maximum character count.  Default MAX_CHARS (12,000).
     """
-    if len(text) <= limit:
+    truncated = truncate_to_sentence_boundary(text, limit)
+    if truncated == text:
         return text  # Already within limits — nothing to do.
-
-    # Search backwards from `limit` for the last sentence-ending period.
-    window = text[:limit]
-    last_period = window.rfind(".")
-
-    if last_period > limit // 2:
-        # Found a period in a reasonable position; cut there.
-        truncated = window[: last_period + 1]
-    else:
-        # No good sentence boundary found; fall back to a hard cut.
-        truncated = window
 
     chars_cut = len(text) - len(truncated)
     print(f"  [extract] Truncated text ({chars_cut:,} chars removed, "
