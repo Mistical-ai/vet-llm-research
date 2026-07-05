@@ -558,6 +558,11 @@ def cmd_eval_report(args: argparse.Namespace) -> int:
     delegate = ["--evaluations", str(args.evaluations)]
     if args.json:
         delegate.append("--json")
+    if args.output_dir:
+        delegate += ["--output-dir", str(args.output_dir)]
+    if args.bootstrap_reps:
+        delegate += ["--bootstrap-reps", str(args.bootstrap_reps)]
+    delegate += ["--seed", str(args.seed)]
     return report_main(delegate)
 
 
@@ -839,6 +844,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
     p_report.add_argument("--json", action="store_true",
                           help="Print full report JSON instead of compact text.")
+    p_report.add_argument("--output-dir", type=Path, default=None,
+                          help="Optional directory for summary.json and CSV report exports.")
+    p_report.add_argument("--bootstrap-reps", type=int, default=1000,
+                          help="Bootstrap repetitions for confidence intervals.")
+    p_report.add_argument("--seed", type=int, default=42,
+                          help="Deterministic seed for bootstrap resampling.")
     p_report.set_defaults(func=cmd_eval_report)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")
