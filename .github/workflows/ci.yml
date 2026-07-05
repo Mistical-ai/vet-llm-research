@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    env:
+      DRY_RUN: "true"
+      PHASE3_MODE: "test"
+      BUDGET_HARD_STOP: "1000.00"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev-lock.txt
+
+      - name: Check dependency lock consistency
+        run: python scripts/check_requirements_lock.py
+
+      - name: Lint typed architecture modules
+        run: ruff check src/core src/metrics src/reporting src/adapters src/validation scripts/check_requirements_lock.py
+
+      - name: Check formatting on typed architecture modules
+        run: black --check src/core src/metrics src/reporting src/adapters src/validation scripts/check_requirements_lock.py
+
+      - name: Type check typed architecture modules
+        run: mypy src/core src/metrics src/reporting src/adapters src/validation
+
+      - name: Run tests
+        run: python -m pytest tests -q

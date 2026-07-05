@@ -28,6 +28,11 @@ data/summaries.jsonl      one row per paper, holding all three models' summaries
 data/evaluations.jsonl    one row per (paper, summary, judge) — the scores
 ```
 
+The current default judge is the MedHELM-style veterinary rubric documented in
+[`medhelm_evaluation.md`](medhelm_evaluation.md). For manuscript-grade reruns,
+use frozen sets and run manifests so the exact prompts, dependency lock,
+dataset hash, seed, branch, and git SHA are recorded under `runs/<run_id>/`.
+
 Everything you run lives in two folders:
 
 ```

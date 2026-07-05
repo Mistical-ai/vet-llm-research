@@ -47,11 +47,27 @@ This is required for a fair model comparison.
 
 ---
 
-## The rubric: Vet-Score v2.0
+## The rubric: MedHELM-style veterinary summary score
 
-The judge uses a **veterinary-specific checklist** defined in `llm-sum/prompts/judge_v2.txt`. It is **not** a vague “rate 1–10 from the gut.”
+The current default judge uses the **MedHELM-style veterinary checklist** defined
+in `llm-sum/prompts/judge_medhelm_v1.txt`. It is **not** a vague “rate it from
+the gut” prompt. The judge scores separate criteria, and Python calculates the
+final `jury_score` from those criterion scores so the arithmetic is reproducible.
 
-The judge scores **four dimensions**, each from **1 (poor)** to **3 (excellent)**:
+The current judge scores **five dimensions**, each from **1 (poor)** to
+**5 (excellent)**:
+
+- Faithfulness
+- Completeness
+- Clinical usefulness
+- Clarity
+- Safety
+
+For the full beginner-friendly explanation, examples, and scoring formula, read
+[MedHELM Evaluation](medhelm_evaluation.md). The older Vet-Score v2.0 rubric
+below is retained only as legacy context for older evaluation rows.
+
+## Legacy rubric: Vet-Score v2.0
 
 ### 1. Factual accuracy + species (most important)
 

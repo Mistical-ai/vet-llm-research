@@ -21,6 +21,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from reporting.exports import build_report_payload, write_standard_reports
+
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 DEFAULT_GROUP_FIELDS = ("summarizer", "species", "study_design", "clinical_topic", "journal", "input_source")
 
@@ -108,7 +110,12 @@ def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarize
     return summary
 
 
-def build_report(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def build_report(
+    rows: Iterable[dict[str, Any]],
+    *,
+    bootstrap_reps: int = 1000,
+    seed: int = 42,
+) -> dict[str, Any]:
     """Build a multi-stratum report from evaluation rows."""
     materialized = list(rows)
     return {
@@ -119,6 +126,11 @@ def build_report(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "by_clinical_topic": summarize_rows(materialized, group_field="clinical_topic"),
         "by_journal": summarize_rows(materialized, group_field="journal"),
         "by_input_source": summarize_rows(materialized, group_field="input_source"),
+        "uncertainty_aware": build_report_payload(
+            materialized,
+            bootstrap_reps=bootstrap_reps,
+            seed=seed,
+        ),
     }
 
 
@@ -126,14 +138,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Summarize MedHELM-style evaluation JSONL.")
     parser.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
     parser.add_argument("--json", action="store_true", help="Print full report JSON.")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Optional directory for summary.json and CSV exports.")
+    parser.add_argument("--bootstrap-reps", type=int, default=1000,
+                        help="Bootstrap repetitions for uncertainty-aware reports.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Deterministic seed for bootstrap resampling.")
     args = parser.parse_args(argv)
 
-    report = build_report(iter_evaluation_rows(args.evaluations))
+    rows = list(iter_evaluation_rows(args.evaluations))
+    report = build_report(rows, bootstrap_reps=args.bootstrap_reps, seed=args.seed)
+    if args.output_dir is not None:
+        paths = write_standard_reports(
+            args.output_dir,
+            rows,
+            bootstrap_reps=args.bootstrap_reps,
+            seed=args.seed,
+        )
+        print(f"[eval-report] wrote machine-readable reports: {paths}")
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
 
     for section, rows in report.items():
+        if section == "uncertainty_aware":
+            continue
         print(f"\n[{section}]")
         for row in rows:
             print(

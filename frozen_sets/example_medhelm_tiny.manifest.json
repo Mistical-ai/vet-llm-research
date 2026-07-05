@@ -1,0 +1,8 @@
+{
+  "name": "example_medhelm_tiny",
+  "path": "frozen_sets\\example_medhelm_tiny.jsonl",
+  "sha256": "90af9fc9de498fde2616973988bb5fbb58454ed21349840208e7a44df6a1c2e0",
+  "row_count": 2,
+  "created_utc": "2026-07-05T22:36:10Z",
+  "description": "Tiny deterministic fixture for smoke reproducibility tests."
+}

@@ -843,7 +843,8 @@ def confirm_real_judge(profile: ModeProfile, force: bool) -> bool:
 
 def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                    paper_limit: int | None = None,
-                   doi_filter: set[str] | None = None) -> dict[str, int]:
+                   doi_filter: set[str] | None = None,
+                   output_path: Path | None = None) -> dict[str, int]:
     """Run the blind judge loop over summaries.jsonl.
 
     doi_filter: when provided, only evaluate DOIs in this set. Used by
@@ -895,7 +896,7 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                 strata=instance.strata,
                 automatic_metrics=automatic_metrics,
             )
-            append_evaluation(row)
+            append_evaluation(row, path=output_path)
             counts["evaluated"] += 1
             cost = compute_cost(
                 judge,

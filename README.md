@@ -1,5 +1,9 @@
 # Veterinary LLM Research Pipeline
 
+[![CI](https://github.com/Mistical-ai/vet-llm-research/actions/workflows/ci.yml/badge.svg)](https://github.com/Mistical-ai/vet-llm-research/actions/workflows/ci.yml)
+[![Smoke Reproducibility](https://github.com/Mistical-ai/vet-llm-research/actions/workflows/smoke-repro.yml/badge.svg)](https://github.com/Mistical-ai/vet-llm-research/actions/workflows/smoke-repro.yml)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+
 **Goal:** Collect 250 veterinary journal papers (50 from each of 5 journals, 2023–2026), download open-access PDFs, clean the text, and prepare for LLM summarization and evaluation.
 
 **Project context:** OVC Pet Trust Summer Studentship, 2026.

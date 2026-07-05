@@ -1,0 +1,45 @@
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+  "data",
+  "runs",
+  ".venv",
+  "venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+  # Existing scripts use module-level imports after sys.path bootstrapping.
+  "E402",
+  # Keep TypeVar syntax for beginner readability instead of Python 3.12-only
+  # generic function syntax.
+  "UP047",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+ignore_missing_imports = true
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = [
+  "core.*",
+  "metrics.*",
+  "reporting.*",
+  "validation.*",
+  "adapters.*",
+]
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true

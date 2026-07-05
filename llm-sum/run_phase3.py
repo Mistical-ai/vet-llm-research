@@ -346,28 +346,88 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         [j.strip() for j in args.judges.split(",") if j.strip()]
         if args.judges else None
     )
+    active_judges = judges or [j.strip() for j in os.getenv("JUDGE_MODELS", "openai").split(",") if j.strip()]
+
+    # Optional reproducibility mode: load a frozen DOI set and/or write a run
+    # manifest under runs/<run_id>. When omitted, the historical data/*.jsonl
+    # behavior is preserved.
+    run_dir = None
+    manifest_path = None
+    output_path = None
+    frozen_dois: set[str] | None = None
+    selected_instance_ids: list[str] = []
+    dataset_digest = None
+    if args.frozen_set:
+        from core.hashing import dataset_hash
+        from validation.frozen_sets import load_frozen_set
+
+        frozen_rows = load_frozen_set(args.frozen_set)
+        frozen_dois = {str(row.get("doi", "")).strip() for row in frozen_rows if row.get("doi")}
+        selected_instance_ids = [
+            str(row.get("instance_id") or row.get("doi"))
+            for row in frozen_rows
+            if row.get("instance_id") or row.get("doi")
+        ]
+        dataset_digest = dataset_hash(frozen_rows)
+
+    if args.run_id or args.run_dir or args.frozen_set:
+        from core.run_manifest import build_run_manifest, resolve_run_dir, write_run_manifest
+
+        run_dir = resolve_run_dir(args.run_id, args.run_dir)
+        output_path = run_dir / "evaluations.jsonl"
+        seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
+        manifest = build_run_manifest(
+            run_id=run_dir.name,
+            benchmark_name=os.getenv("EVAL_BENCHMARK_NAME", "vet_lit_summary_medhelm"),
+            mode=profile.name,
+            random_seed=seed,
+            cli_args=sys.argv[1:],
+            selected_instance_ids=selected_instance_ids,
+            prompt_paths=[os.getenv("JUDGE_PROMPT_FILE", "llm-sum/prompts/judge_medhelm_v1.txt")],
+            config_paths=["configs/phase4_medhelm_eval.yaml", "llm-sum/eval_config/medhelm_vet_summary.yaml"],
+            dataset_hash=dataset_digest,
+            model_ids={judge: os.getenv(f"{judge.upper()}_MODEL", "") for judge in active_judges},
+            artifact_paths={"evaluations": str(output_path)},
+        )
+        manifest_path = write_run_manifest(manifest, run_dir)
 
     # test mode: simple delegation, no journal stratification (mock, $0)
     if profile.name == "test" or profile.dry_run:
-        from evaluator import main as evaluate_main
-        delegate = ["--mode", profile.name]
-        if args.limit is not None:
-            delegate += ["--limit", str(args.limit)]
-        if args.force:
-            delegate.append("--force")
-        if args.no_resume:
-            delegate.append("--no-resume")
-        if args.judges:
-            delegate += ["--judges", args.judges]
-        return evaluate_main(delegate)
+        from evaluator import run_evaluation
+
+        counts = run_evaluation(
+            judges=judges,
+            resume=not args.no_resume,
+            paper_limit=args.limit if args.limit is not None else profile.paper_limit,
+            doi_filter=frozen_dois,
+            output_path=output_path,
+        )
+        if manifest_path is not None:
+            from core.run_manifest import finalize_run_manifest
+
+            finalize_run_manifest(
+                manifest_path,
+                artifact_paths={
+                    "evaluations": str(output_path),
+                    "run_manifest": str(manifest_path),
+                },
+                selected_instance_ids=selected_instance_ids or sorted(frozen_dois or []),
+                resolved_model_versions={},
+            )
+        return 0 if counts.get("failed", 0) == 0 else 1
 
     # single / dev / batch modes: journal-stratified sampling
     from evaluator import run_evaluation, confirm_real_judge
 
-    by_journal = _load_summaries_by_journal(SUMMARIES_PATH, MANIFEST_PATH)
+    if frozen_dois is not None:
+        by_journal = {}
+        doi_filter = frozen_dois
+        journal_map = {"frozen_set": sorted(frozen_dois)}
+    else:
+        by_journal = _load_summaries_by_journal(SUMMARIES_PATH, MANIFEST_PATH)
 
     # Warn about and log unmapped DOIs
-    unknown_entries = by_journal.pop("unknown", [])
+    unknown_entries = by_journal.pop("unknown", []) if by_journal else []
     if unknown_entries:
         unknown_dois = [str(e.get("doi", "?")) for e in unknown_entries]
         msg_lines = [
@@ -385,18 +445,21 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         with open(log_path, "a", encoding="utf-8") as lf:
             lf.write(f"\n[{ts}]\n" + "\n".join(msg_lines) + "\n")
 
-    if not by_journal:
+    if frozen_dois is None and not by_journal:
         print("[phase3:evaluate] No journal-mapped summaries found. "
               "Run 'extract' and 'summarize' first, or check manifest.jsonl.")
         return 1
 
-    per_journal = (
-        args.limit
-        if args.limit is not None
-        else (1 if profile.name == "single" else (profile.paper_limit or 1))
-    )
     seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
-    doi_filter, journal_map = _sample_by_journal(by_journal, per_journal, seed=seed)
+    if frozen_dois is None:
+        per_journal = (
+            args.limit
+            if args.limit is not None
+            else (1 if profile.name == "single" else (profile.paper_limit or 1))
+        )
+        doi_filter, journal_map = _sample_by_journal(by_journal, per_journal, seed=seed)
+    else:
+        per_journal = len(frozen_dois)
 
     # Pre-evaluation summary (anonymized — journal names only, no DOIs, no model names)
     print("\n[phase3:evaluate] Journal-stratified sampling plan:")
@@ -410,15 +473,29 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     if not confirm_real_judge(profile, force=args.force):
         return 1
 
-    run_evaluation(
+    counts = run_evaluation(
         judges=judges,
         resume=not args.no_resume,
         paper_limit=None,
         doi_filter=doi_filter,
+        output_path=output_path,
     )
 
+    if manifest_path is not None:
+        from core.run_manifest import finalize_run_manifest
+
+        finalize_run_manifest(
+            manifest_path,
+            artifact_paths={
+                "evaluations": str(output_path),
+                "run_manifest": str(manifest_path),
+            },
+            selected_instance_ids=selected_instance_ids or sorted(doi_filter),
+            resolved_model_versions={},
+        )
+
     _print_reveal_table(doi_filter, journal_map)
-    return 0
+    return 0 if counts.get("failed", 0) == 0 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +558,11 @@ def cmd_eval_report(args: argparse.Namespace) -> int:
     delegate = ["--evaluations", str(args.evaluations)]
     if args.json:
         delegate.append("--json")
+    if args.output_dir:
+        delegate += ["--output-dir", str(args.output_dir)]
+    if args.bootstrap_reps:
+        delegate += ["--bootstrap-reps", str(args.bootstrap_reps)]
+    delegate += ["--seed", str(args.seed)]
     return report_main(delegate)
 
 
@@ -746,6 +828,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Re-evaluate even pairs already in evaluations.jsonl.")
     p_eval.add_argument("--force", action="store_true",
                         help="Bypass confirmation. USE WITH CAUTION.")
+    p_eval.add_argument("--run-id", default=None,
+                        help="Optional immutable run id under runs/<run_id>.")
+    p_eval.add_argument("--run-dir", type=Path, default=None,
+                        help="Optional explicit output directory for run artifacts.")
+    p_eval.add_argument("--frozen-set", type=Path, default=None,
+                        help="Optional frozen_sets/*.jsonl file; limits evaluation to those DOIs.")
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_status = sub.add_parser("status", help="Print per-stage counts.")
@@ -756,6 +844,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
     p_report.add_argument("--json", action="store_true",
                           help="Print full report JSON instead of compact text.")
+    p_report.add_argument("--output-dir", type=Path, default=None,
+                          help="Optional directory for summary.json and CSV report exports.")
+    p_report.add_argument("--bootstrap-reps", type=int, default=1000,
+                          help="Bootstrap repetitions for confidence intervals.")
+    p_report.add_argument("--seed", type=int, default=42,
+                          help="Deterministic seed for bootstrap resampling.")
     p_report.set_defaults(func=cmd_eval_report)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")

@@ -1,0 +1,26 @@
+# Runtime dependencies for the veterinary LLM research pipeline.
+#
+# Keep this file human-readable. Update requirements-lock.txt whenever a direct
+# dependency changes so CI and manuscript reruns install the same versions.
+python-dotenv
+pydantic
+pandas
+requests
+urllib3
+pdfplumber
+pymupdf4llm
+tenacity
+tqdm
+beautifulsoup4
+openai
+anthropic
+google-genai
+tiktoken
+
+# Optional external CLI:
+#   fulltext-download
+#
+# The downloader uses the fulltext-article-downloader command-line tool only
+# when it is already installed. The package name does not currently resolve from
+# PyPI in CI, so it is documented as an optional local tool instead of a locked
+# runtime dependency. The code skips this fallback gracefully when absent.

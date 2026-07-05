@@ -1,0 +1,8 @@
+-r requirements.in
+
+# Test and quality gates.
+pytest
+ruff
+black
+mypy
+pip-tools

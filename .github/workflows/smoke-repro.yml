@@ -1,0 +1,63 @@
+name: Smoke Reproducibility
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    env:
+      DRY_RUN: "true"
+      PHASE3_MODE: "test"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev-lock.txt
+
+      - name: Verify frozen set and manifest helpers
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("src").resolve()))
+
+          from core.hashing import dataset_hash
+          from core.run_manifest import build_run_manifest, write_run_manifest
+          from validation.frozen_sets import load_frozen_set
+
+          manifest = json.loads(Path("frozen_sets/example_medhelm_tiny.manifest.json").read_text())
+          rows = load_frozen_set(Path("frozen_sets/example_medhelm_tiny.jsonl"), manifest["sha256"])
+          assert len(rows) == 2
+          assert dataset_hash(rows) == manifest["sha256"]
+
+          run_dir = Path("runs/smoke-repro")
+          run_manifest = build_run_manifest(
+              run_id="smoke-repro",
+              benchmark_name="vet_lit_summary_medhelm",
+              mode="test",
+              random_seed=42,
+              cli_args=["smoke-repro"],
+              selected_instance_ids=[row["instance_id"] for row in rows],
+              prompt_paths=["llm-sum/prompts/judge_medhelm_v1.txt"],
+              config_paths=["configs/phase4_medhelm_eval.yaml"],
+              dataset_hash=manifest["sha256"],
+          )
+          path = write_run_manifest(run_manifest, run_dir)
+          assert path.exists()
+          assert json.loads(path.read_text())["dataset_hash"] == manifest["sha256"]
+          PY

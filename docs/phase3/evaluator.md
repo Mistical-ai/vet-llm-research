@@ -4,14 +4,14 @@
 
 ## What it does
 
-Reads every `(paper, summariser)` pair from `data/summaries.jsonl` and asks a **judge model** to score the summary against the original cleaned text. Records quality (1-10), hallucination count, hallucination categories, confidence (1-5), and a `requires_human_review` flag for the Phase-5 sample. The judge is **blind to the summariser identity** — the prompt template only sees `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`.
+Reads every `(paper, summariser)` pair from `data/summaries.jsonl` and asks a **judge model** to score the summary against the original cleaned text. The current default is the MedHELM-style rubric in `llm-sum/prompts/judge_medhelm_v1.txt`: the judge returns criterion-level 1-5 scores, and Python calculates the final `jury_score`. Legacy Vet-Score v2 rows may still exist in older outputs, but new runs should use `rubric_version=vet_medhelm_score_v1.0`.
 
 Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alongside summarisation, and the results are collected by `check_batch_status.py`.
 
 ## When to run it
 
 * After `data/summaries.jsonl` has at least one row with `status=success`.
-* In `single`/`dev` mode whenever you change the judge prompt configured by `JUDGE_PROMPT_FILE` (default: `llm-sum/prompts/judge_v2.txt`).
+* In `single`/`dev` mode whenever you change the judge prompt configured by `JUDGE_PROMPT_FILE` (default: `llm-sum/prompts/judge_medhelm_v1.txt`).
 
 ## Inputs
 
@@ -20,14 +20,14 @@ Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alo
 | `data/summaries.jsonl`                | Source of (paper, summariser, summary) triples.                            |
 | `data/processed/*.jsonl`              | Cleaned reference text the judge compares against.                         |
 | `data/evaluations.jsonl` (if exists)  | Used by `--resume` (default on).                                           |
-| `llm-sum/prompts/judge_v2.txt`        | Default vet-specific judge prompt — must contain `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`. |
+| `llm-sum/prompts/judge_medhelm_v1.txt` | Default MedHELM-style judge prompt — must contain `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`. |
 | `.env`                                | `PHASE3_MODE`, `JUDGE_MODELS` (default `openai`), `JUDGE_PROMPT_FILE`, plus the API key for whatever judges are listed. |
 
 ## Outputs
 
 | Path                       | Schema                                                                                         |
 |----------------------------|------------------------------------------------------------------------------------------------|
-| `data/evaluations.jsonl`   | Append-only. One row per `(doi, summariser, judge, input_source)` tuple: vet-rubric scores, hallucination fields, `requires_human_review`, `parse_method`, token counts, `judge_model_version`, optional `system_fingerprint`, `raw_response_excerpt`, `timestamp`. |
+| `data/evaluations.jsonl`   | Append-only. One row per `(doi, summariser, judge, input_source)` tuple: benchmark/rubric IDs, criterion scores, Python-calculated `jury_score`, hallucination fields, `requires_human_review`, automatic metrics, strata, token counts, `judge_model_version`, optional `system_fingerprint`, `raw_response_excerpt`, `timestamp`. |
 | `data/error_log.jsonl`     | Any judge call that exhausted retries.                                                         |
 
 ## CLI
@@ -72,7 +72,7 @@ Tried in order:
 
 | Symptom                                                              | Cause                                                       | Fix                                                                                |
 |----------------------------------------------------------------------|-------------------------------------------------------------|------------------------------------------------------------------------------------|
-| `quality_score = 99` in many rows                                    | Judge keeps returning conversational text instead of JSON.  | Open the file named by `JUDGE_PROMPT_FILE` (default `llm-sum/prompts/judge_v2.txt`); tighten the "return JSON only" instruction. |
+| `quality_score = 99` or missing `jury_score` in many rows             | Judge keeps returning conversational text instead of JSON.  | Open the file named by `JUDGE_PROMPT_FILE` (default `llm-sum/prompts/judge_medhelm_v1.txt`); tighten the "return JSON only" instruction. |
 | `Judge failed after retries`                                         | Network/API issue.                                          | Check `data/error_log.jsonl` for the underlying error; re-run with `--resume`.     |
 | Forbidden-token assertion failure in `tests/test_evaluator.py`       | Someone edited the judge prompt to mention a model name.    | Remove the mention; the blind protocol is non-negotiable for study validity.        |
 
