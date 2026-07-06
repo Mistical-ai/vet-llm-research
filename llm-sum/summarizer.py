@@ -64,7 +64,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from models_config import all_providers, compute_cost, get_model_spec  # noqa: E402
 from file_paths import doi_to_slug, resolve_existing_pdf_path  # noqa: E402
-from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
+from utils import (
+    BudgetGuard,
+    log_error,
+    require_positive_budget_for_real_run,
+    sleep_for_model,
+)  # noqa: E402
 from extract import truncate_to_limit  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 
@@ -88,7 +93,9 @@ PROMPT_MODE = os.getenv("PROMPT_MODE", "shared")
 VALID_PROMPT_MODES = ("shared", "provider_specific")
 PROVIDER_PROMPT_FILES = {
     "openai": Path(os.getenv("OPENAI_PROMPT_FILE", "llm-sum/prompts/summarization_openai_v1.txt")),
-    "anthropic": Path(os.getenv("ANTHROPIC_PROMPT_FILE", "llm-sum/prompts/summarization_anthropic_v1.txt")),
+    "anthropic": Path(
+        os.getenv("ANTHROPIC_PROMPT_FILE", "llm-sum/prompts/summarization_anthropic_v1.txt")
+    ),
     "gemini": Path(os.getenv("GEMINI_PROMPT_FILE", "llm-sum/prompts/summarization_gemini_v1.txt")),
 }
 GUIDE_SUMMARY_FILE = Path(
@@ -112,6 +119,7 @@ OPENAI_RETRY_MAX_DELAY: float = float(os.getenv("OPENAI_RETRY_MAX_DELAY", "60.0"
 # Structured summary schema
 # ---------------------------------------------------------------------------
 
+
 class VeterinarySummary(BaseModel):
     """
     One provider-independent schema for every Phase 3 clinical summary.
@@ -121,6 +129,7 @@ class VeterinarySummary(BaseModel):
     to data/summaries.jsonl, so downstream analysis receives a predictable
     database-shaped object instead of provider-specific prose.
     """
+
     model_config = ConfigDict(extra="forbid")
 
     headline: str = Field(
@@ -273,9 +282,7 @@ def coerce_veterinary_summary(payload: Any) -> VeterinarySummary:
     repaired["sample_size"] = repaired.get("sample_size")
     repaired["key_methods"] = _as_list(repaired.get("key_methods"))
     repaired["key_findings"] = _as_list(repaired.get("key_findings"))
-    repaired["clinical_significance"] = str(
-        repaired.get("clinical_significance") or "Not reported"
-    )
+    repaired["clinical_significance"] = str(repaired.get("clinical_significance") or "Not reported")
     repaired["limitations"] = _as_list(repaired.get("limitations"))
     repaired["summary_text"] = str(
         repaired.get("summary_text") or _summary_text_from_payload(repaired)
@@ -306,14 +313,16 @@ def _successful_summary_result(
 ) -> dict:
     """Wrap a validated summary with provider metadata used downstream."""
     result = veterinary_summary_to_result(parsed)
-    result.update({
-        "status": "success",
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "model_version": model_version,
-        "system_fingerprint": system_fingerprint,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    result.update(
+        {
+            "status": "success",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "model_version": model_version,
+            "system_fingerprint": system_fingerprint,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     return result
 
 
@@ -341,6 +350,7 @@ DRY_RUN = _is_dry_run()
 # Prompt loading
 # ---------------------------------------------------------------------------
 
+
 def load_prompt(prompt_file: Path = PROMPT_FILE) -> str:
     """
     Load the summarisation prompt template. Must contain '{ARTICLE_TEXT}'.
@@ -350,9 +360,7 @@ def load_prompt(prompt_file: Path = PROMPT_FILE) -> str:
         raise FileNotFoundError(f"Prompt template not found: {path}")
     template = path.read_text(encoding="utf-8")
     if "{ARTICLE_TEXT}" not in template:
-        raise ValueError(
-            f"Prompt template {path} must contain the '{{ARTICLE_TEXT}}' placeholder."
-        )
+        raise ValueError(f"Prompt template {path} must contain the '{{ARTICLE_TEXT}}' placeholder.")
     return template
 
 
@@ -661,7 +669,9 @@ def _parse_gemini_veterinary_summary(response: object) -> VeterinarySummary:
 
     text = str(getattr(response, "text", "") or "")
     if not text:
-        raise ValueError(f"Gemini returned empty response.text (finish_reason={_gemini_finish_reason(response)})")
+        raise ValueError(
+            f"Gemini returned empty response.text (finish_reason={_gemini_finish_reason(response)})"
+        )
     try:
         return coerce_veterinary_summary(json.loads(text))
     except json.JSONDecodeError as exc:
@@ -676,6 +686,7 @@ def _parse_gemini_veterinary_summary(response: object) -> VeterinarySummary:
 # ---------------------------------------------------------------------------
 # DRY_RUN mock summary (no API calls, deterministic)
 # ---------------------------------------------------------------------------
+
 
 def _mock_summary(model_name: str, article_text: str, title_hint: str = "") -> dict:
     """
@@ -725,6 +736,7 @@ def _mock_pdf_summary(model_name: str, pdf_path: Path) -> dict:
 # Provider-specific real-time callers
 # ---------------------------------------------------------------------------
 
+
 def _openai_is_temperature_error(exc: Exception) -> bool:
     """Return True when exc says this OpenAI model doesn't accept temperature."""
     msg = str(exc).lower()
@@ -741,6 +753,7 @@ def _is_non_retriable_openai_error(exc: Exception) -> bool:
     """
     try:
         import openai as _openai  # noqa: import-outside-toplevel
+
         _APIStatusError = getattr(_openai, "APIStatusError", None)
         if _APIStatusError is not None and isinstance(exc, _APIStatusError):
             return exc.status_code in (400, 401, 403)
@@ -800,13 +813,17 @@ def _openai_call_with_backoff(api_call_fn):
                         except (ValueError, TypeError):
                             pass
                 if candidates:
-                    header_wait = min(c for c in candidates if c > 0) if any(c > 0 for c in candidates) else None
+                    header_wait = (
+                        min(c for c in candidates if c > 0)
+                        if any(c > 0 for c in candidates)
+                        else None
+                    )
                     if header_wait is not None:
                         delay = min(header_wait + random.uniform(0, 1), OPENAI_RETRY_MAX_DELAY)
 
             if delay is None:
                 delay = min(
-                    OPENAI_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1),
+                    OPENAI_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1),
                     OPENAI_RETRY_MAX_DELAY,
                 )
 
@@ -886,14 +903,16 @@ def _call_anthropic(article_text: str, *, prompt_template: str | None) -> dict:
         max_tokens=MAX_OUTPUT_TOKENS,
         temperature=TEMPERATURE,
         messages=[{"role": "user", "content": user_message}],
-        tools=[{
-            "name": "VeterinarySummary",
-            "description": (
-                "Return the veterinary article summary using exactly the "
-                "VeterinarySummary schema."
-            ),
-            "input_schema": VeterinarySummary.model_json_schema(),
-        }],
+        tools=[
+            {
+                "name": "VeterinarySummary",
+                "description": (
+                    "Return the veterinary article summary using exactly the "
+                    "VeterinarySummary schema."
+                ),
+                "input_schema": VeterinarySummary.model_json_schema(),
+            }
+        ],
         tool_choice={"type": "tool", "name": "VeterinarySummary"},
     )
 
@@ -945,7 +964,7 @@ def _load_google_genai():
     except ImportError as exc:
         raise ImportError(
             "Gemini provider requires the google-genai package in the active "
-            "virtual environment. Run: python -m pip install -r requirements.txt"
+            "virtual environment. Run: python -m pip install -r requirements-lock.txt"
         ) from exc
     return genai, types
 
@@ -1037,13 +1056,15 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
 
     base_kwargs: dict[str, Any] = {
         "model": spec.model_id,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_file", "file_id": upload.id},
-                {"type": "input_text", "text": user_message},
-            ],
-        }],
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": upload.id},
+                    {"type": "input_text", "text": user_message},
+                ],
+            }
+        ],
         "max_output_tokens": MAX_OUTPUT_TOKENS,
         "text_format": VeterinarySummary,
     }
@@ -1058,10 +1079,10 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     except Exception as exc:
         if not _openai_is_temperature_error(exc):
             raise
-        print(f"[phase3:summarize] {spec.model_id} rejected temperature for PDF — retrying without it.")
-        response = _openai_call_with_backoff(
-            lambda: client.responses.parse(**base_kwargs)
+        print(
+            f"[phase3:summarize] {spec.model_id} rejected temperature for PDF — retrying without it."
         )
+        response = _openai_call_with_backoff(lambda: client.responses.parse(**base_kwargs))
 
     parsed = _extract_openai_parsed_summary(response)
     usage = response.usage
@@ -1093,28 +1114,32 @@ def _call_anthropic_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
         model=spec.model_id,
         max_tokens=MAX_OUTPUT_TOKENS,
         temperature=TEMPERATURE,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": pdf_b64,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64,
+                        },
                     },
-                },
-                {"type": "text", "text": user_message},
-            ],
-        }],
-        tools=[{
-            "name": "VeterinarySummary",
-            "description": (
-                "Return the veterinary article summary using exactly the "
-                "VeterinarySummary schema."
-            ),
-            "input_schema": VeterinarySummary.model_json_schema(),
-        }],
+                    {"type": "text", "text": user_message},
+                ],
+            }
+        ],
+        tools=[
+            {
+                "name": "VeterinarySummary",
+                "description": (
+                    "Return the veterinary article summary using exactly the "
+                    "VeterinarySummary schema."
+                ),
+                "input_schema": VeterinarySummary.model_json_schema(),
+            }
+        ],
         tool_choice={"type": "tool", "name": "VeterinarySummary"},
     )
 
@@ -1180,6 +1205,7 @@ PROVIDER_PDF_CALLERS: dict[str, Callable[..., dict]] = {
 # Public router
 # ---------------------------------------------------------------------------
 
+
 def generate_summary(
     model_name: str,
     text: str,
@@ -1212,11 +1238,13 @@ def generate_summary(
                 break
             if attempt < max_retries - 1:
                 if _is_gemini_overload(exc):
-                    wait = min(15 * (2 ** attempt) + random.uniform(0, 2), 120.0)
+                    wait = min(15 * (2**attempt) + random.uniform(0, 2), 120.0)
                 else:
-                    wait = min(2 ** attempt + random.uniform(0, 1), 30.0)
-                print(f"[phase3:summarize] {model_name} attempt {attempt+1} failed: {exc}; "
-                      f"retrying in {wait:.1f}s")
+                    wait = min(2**attempt + random.uniform(0, 1), 30.0)
+                print(
+                    f"[phase3:summarize] {model_name} attempt {attempt+1} failed: {exc}; "
+                    f"retrying in {wait:.1f}s"
+                )
                 time.sleep(wait)
 
     log_error(
@@ -1267,11 +1295,13 @@ def generate_summary_from_pdf(
                 break
             if attempt < max_retries - 1:
                 if _is_gemini_overload(exc):
-                    wait = min(15 * (2 ** attempt) + random.uniform(0, 2), 120.0)
+                    wait = min(15 * (2**attempt) + random.uniform(0, 2), 120.0)
                 else:
-                    wait = min(2 ** attempt + random.uniform(0, 1), 30.0)
-                print(f"[phase3:summarize] {model_name} PDF attempt {attempt+1} failed: {exc}; "
-                      f"retrying in {wait:.1f}s")
+                    wait = min(2**attempt + random.uniform(0, 1), 30.0)
+                print(
+                    f"[phase3:summarize] {model_name} PDF attempt {attempt+1} failed: {exc}; "
+                    f"retrying in {wait:.1f}s"
+                )
                 time.sleep(wait)
 
     log_error(
@@ -1293,6 +1323,7 @@ def generate_summary_from_pdf(
 # ---------------------------------------------------------------------------
 # Persistence: data/summaries.jsonl
 # ---------------------------------------------------------------------------
+
 
 def _empty_model_slot() -> dict:
     return {
@@ -1380,6 +1411,7 @@ def _write_all_summaries(path: Path, summaries_by_doi: dict[str, dict]) -> None:
 # Confirmation guard
 # ---------------------------------------------------------------------------
 
+
 def confirm_real_batch(profile: ModeProfile, force: bool) -> bool:
     """
     Final interactive guardrail. Returns True if it's safe to proceed.
@@ -1402,13 +1434,16 @@ def confirm_real_batch(profile: ModeProfile, force: bool) -> bool:
         print(audit_line.strip())
         return True
 
-    label = "REAL batch jobs to paid APIs" if profile.use_batch else (
-        f"REAL real-time API calls (limit={profile.paper_limit or 'no limit'})"
+    label = (
+        "REAL batch jobs to paid APIs"
+        if profile.use_batch
+        else (f"REAL real-time API calls (limit={profile.paper_limit or 'no limit'})")
     )
-    reply = input(
-        f"\n[phase3:safety] About to submit {label}.\n"
-        "Type 'yes' to confirm: "
-    ).strip().lower()
+    reply = (
+        input(f"\n[phase3:safety] About to submit {label}.\n" "Type 'yes' to confirm: ")
+        .strip()
+        .lower()
+    )
     if reply != "yes":
         print("[phase3:safety] Confirmation not received; aborting.")
         return False
@@ -1418,6 +1453,7 @@ def confirm_real_batch(profile: ModeProfile, force: bool) -> bool:
 # ---------------------------------------------------------------------------
 # Real-time run loop
 # ---------------------------------------------------------------------------
+
 
 def _iter_manifest(path: Path):
     with open(path, encoding="utf-8") as f:
@@ -1442,6 +1478,7 @@ def _read_cached_text(record_or_doi, input_source: str = "processed") -> str | N
     lookup) or a bare DOI string (legacy fallback only).
     """
     from prepare_texts import read_cached_text as _shared_read
+
     return _shared_read(record_or_doi, input_source=input_source)
 
 
@@ -1508,15 +1545,21 @@ def run_realtime(
 
         if input_source == "pdf" and pdf_path is None:
             counts["no_text"] += 1
-            log_error(doi, "summarize",
-                      f"No PDF file found for {slug} in data/raw (looked for "
-                      "descriptive name + legacy DOI filename)")
+            log_error(
+                doi,
+                "summarize",
+                f"No PDF file found for {slug} in data/raw (looked for "
+                "descriptive name + legacy DOI filename)",
+            )
             continue
         if input_source != "pdf" and article_text is None:
             counts["no_text"] += 1
-            log_error(doi, "summarize",
-                      f"No {input_source} cached text for {slug} (looked for "
-                      f"descriptive name + legacy {slug}.jsonl)")
+            log_error(
+                doi,
+                "summarize",
+                f"No {input_source} cached text for {slug} (looked for "
+                f"descriptive name + legacy {slug}.jsonl)",
+            )
             continue
 
         key = _summary_key(doi, input_source)
@@ -1543,9 +1586,7 @@ def run_realtime(
                     provider, pdf_path, prompt_template=provider_prompt
                 )
             else:
-                result = generate_summary(
-                    provider, article_text, prompt_template=provider_prompt
-                )
+                result = generate_summary(provider, article_text, prompt_template=provider_prompt)
 
             entry["models"][provider] = result
 
@@ -1558,9 +1599,11 @@ def run_realtime(
                     batched=False,
                 )
                 guard.add_cost(cost)
-                print(f"  {provider}: success "
-                      f"(in={result['input_tokens']}, out={result['output_tokens']}, "
-                      f"ver={result['model_version']}, ${cost:.4f})")
+                print(
+                    f"  {provider}: success "
+                    f"(in={result['input_tokens']}, out={result['output_tokens']}, "
+                    f"ver={result['model_version']}, ${cost:.4f})"
+                )
             else:
                 counts["failed"] += 1
                 print(f"  {provider}: FAILED — {result.get('error')}")
@@ -1573,6 +1616,7 @@ def run_realtime(
 # ---------------------------------------------------------------------------
 # Folder-based summarisation (summarize-all workflow)
 # ---------------------------------------------------------------------------
+
 
 class SummaryRunStats(dict[str, int]):
     """Counts dict plus the actual USD spent by that summarize-all source run."""
@@ -1654,31 +1698,41 @@ def _format_folder_entry_as_text(entry: dict) -> str:
 
     models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
     for provider in all_providers():
-        result = models.get(provider) if isinstance(models.get(provider), dict) else _empty_model_slot()
-        lines.extend([
-            "",
-            "=" * 78,
-            f"{provider.upper()} SUMMARY",
-            "=" * 78,
-            f"Status: {result.get('status') or 'unknown'}",
-            f"Model Version: {result.get('model_version') or 'Not recorded'}",
-            f"Timestamp: {result.get('timestamp') or 'Not recorded'}",
-        ])
+        result = (
+            models.get(provider) if isinstance(models.get(provider), dict) else _empty_model_slot()
+        )
+        lines.extend(
+            [
+                "",
+                "=" * 78,
+                f"{provider.upper()} SUMMARY",
+                "=" * 78,
+                f"Status: {result.get('status') or 'unknown'}",
+                f"Model Version: {result.get('model_version') or 'Not recorded'}",
+                f"Timestamp: {result.get('timestamp') or 'Not recorded'}",
+            ]
+        )
 
         if result.get("status") != "success":
-            lines.extend([
-                "",
-                f"No readable summary was produced. Error: {result.get('error') or 'Not recorded'}",
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"No readable summary was produced. Error: {result.get('error') or 'Not recorded'}",
+                ]
+            )
             continue
 
-        readable = result.get("human_readable") or result.get("summary") or "No summary text returned."
-        lines.extend([
-            f"Input Tokens: {result.get('input_tokens') or 'Not recorded'}",
-            f"Output Tokens: {result.get('output_tokens') or 'Not recorded'}",
-            "",
-            str(readable).strip(),
-        ])
+        readable = (
+            result.get("human_readable") or result.get("summary") or "No summary text returned."
+        )
+        lines.extend(
+            [
+                f"Input Tokens: {result.get('input_tokens') or 'Not recorded'}",
+                f"Output Tokens: {result.get('output_tokens') or 'Not recorded'}",
+                "",
+                str(readable).strip(),
+            ]
+        )
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1751,14 +1805,18 @@ def _iter_processed_text_files(processed_dir: Path) -> list[dict[str, Any]]:
             continue
 
         slug = payload.get("slug") if isinstance(payload, dict) else None
-        records.append({
-            "path": path,
-            "stem": path.stem,
-            "source_filename": path.name,
-            "doi": payload.get("doi") if isinstance(payload, dict) else None,
-            "slug": slug if isinstance(slug, str) and slug else _slug_from_source_stem(path.stem),
-            "text": text,
-        })
+        records.append(
+            {
+                "path": path,
+                "stem": path.stem,
+                "source_filename": path.name,
+                "doi": payload.get("doi") if isinstance(payload, dict) else None,
+                "slug": (
+                    slug if isinstance(slug, str) and slug else _slug_from_source_stem(path.stem)
+                ),
+                "text": text,
+            }
+        )
 
     return records
 
@@ -1854,20 +1912,22 @@ def summarize_all_pdfs(
                     batched=False,
                 )
                 guard.add_cost(cost)
-                print(f"  {provider}: success "
-                      f"(in={result['input_tokens']}, out={result['output_tokens']}, "
-                      f"ver={result['model_version']}, ${cost:.4f})")
+                print(
+                    f"  {provider}: success "
+                    f"(in={result['input_tokens']}, out={result['output_tokens']}, "
+                    f"ver={result['model_version']}, ${cost:.4f})"
+                )
             else:
                 counts["failed"] += 1
                 print(f"  {provider}: FAILED — {result.get('error')}")
 
-        written_path = _write_folder_output(
-            out_dir, stem, entry, output_suffix=output_suffix
-        )
+        written_path = _write_folder_output(out_dir, stem, entry, output_suffix=output_suffix)
         print(f"  wrote: {written_path}")
 
-    print(f"\n[phase3:summarize-all] PDFs done. counts={counts}  "
-          f"budget_spent=${guard.total_spent:.4f}")
+    print(
+        f"\n[phase3:summarize-all] PDFs done. counts={counts}  "
+        f"budget_spent=${guard.total_spent:.4f}"
+    )
     return SummaryRunStats(counts, budget_spent=guard.total_spent)
 
 
@@ -1962,20 +2022,22 @@ def summarize_all_processed_texts(
                     batched=False,
                 )
                 guard.add_cost(cost)
-                print(f"  {provider}: success "
-                      f"(in={result['input_tokens']}, out={result['output_tokens']}, "
-                      f"ver={result['model_version']}, ${cost:.4f})")
+                print(
+                    f"  {provider}: success "
+                    f"(in={result['input_tokens']}, out={result['output_tokens']}, "
+                    f"ver={result['model_version']}, ${cost:.4f})"
+                )
             else:
                 counts["failed"] += 1
                 print(f"  {provider}: FAILED — {result.get('error')}")
 
-        written_path = _write_folder_output(
-            out_dir, stem, entry, output_suffix=output_suffix
-        )
+        written_path = _write_folder_output(out_dir, stem, entry, output_suffix=output_suffix)
         print(f"  wrote: {written_path}")
 
-    print(f"\n[phase3:summarize-all] Texts done. counts={counts}  "
-          f"budget_spent=${guard.total_spent:.4f}")
+    print(
+        f"\n[phase3:summarize-all] Texts done. counts={counts}  "
+        f"budget_spent=${guard.total_spent:.4f}"
+    )
     return SummaryRunStats(counts, budget_spent=guard.total_spent)
 
 
@@ -1983,24 +2045,50 @@ def summarize_all_processed_texts(
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase 3 — multi-model summariser.")
-    parser.add_argument("--mode", choices=VALID_MODES, default=None,
-                        help="Override PHASE3_MODE from .env: test|single|dev|batch.")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Override the mode's default paper_limit (e.g. --limit 3).")
-    parser.add_argument("--resume", action="store_true",
-                        help="Skip (doi, model) pairs already at status=success.")
-    parser.add_argument("--force", action="store_true",
-                        help="Bypass the interactive confirmation. USE WITH CAUTION.")
-    parser.add_argument("--providers", default=",".join(all_providers()),
-                        help="Comma-separated provider keys (subset of openai,anthropic,gemini).")
+    parser.add_argument(
+        "--mode",
+        choices=VALID_MODES,
+        default=None,
+        help="Override PHASE3_MODE from .env: test|single|dev|batch.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Override the mode's default paper_limit (e.g. --limit 3).",
+    )
+    parser.add_argument(
+        "--resume", action="store_true", help="Skip (doi, model) pairs already at status=success."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the interactive confirmation. USE WITH CAUTION.",
+    )
+    parser.add_argument(
+        "--providers",
+        default=",".join(all_providers()),
+        help="Comma-separated provider keys (subset of openai,anthropic,gemini).",
+    )
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
-    parser.add_argument("--input-source", choices=VALID_INPUT_SOURCES, default="processed",
-                        help="Input to summarize: processed (default), raw_text, or pdf.")
-    parser.add_argument("--guide-summary", type=Path, default=GUIDE_SUMMARY_FILE,
-                        help=("Optional human-written format guide. If the file exists and "
-                              "has text, it is used for structure only, never as source facts."))
+    parser.add_argument(
+        "--input-source",
+        choices=VALID_INPUT_SOURCES,
+        default="processed",
+        help="Input to summarize: processed (default), raw_text, or pdf.",
+    )
+    parser.add_argument(
+        "--guide-summary",
+        type=Path,
+        default=GUIDE_SUMMARY_FILE,
+        help=(
+            "Optional human-written format guide. If the file exists and "
+            "has text, it is used for structure only, never as source facts."
+        ),
+    )
     args = parser.parse_args(argv)
 
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
@@ -2042,6 +2130,7 @@ def main(argv: list[str] | None = None) -> int:
     if profile.use_batch:
         # Lazy import so unit tests don't need the batch dependencies loaded.
         from batch_utils import run_batch_summarisation
+
         run_batch_summarisation(
             manifest_path=args.manifest,
             resume=args.resume,

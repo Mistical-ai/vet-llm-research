@@ -6,6 +6,7 @@ from collections import defaultdict
 from statistics import mean
 from typing import Any
 
+from core.constants import get_random_seed
 from metrics.medhelm import flagged_for_review_rate, hallucination_rate
 from reporting.bootstrap import bootstrap_mean_ci
 
@@ -25,8 +26,11 @@ def score_value(row: dict[str, Any]) -> float | None:
 
 def strata_value(row: dict[str, Any], field: str) -> str:
     """Read a grouping field from the row or nested strata dict."""
-    if field in row and row.get(field) not in (None, ""):
-        return str(row[field])
+    if field in row and row.get(field) not in (None, "", []):
+        value = row[field]
+        if isinstance(value, list):
+            return "|".join(str(item) for item in value) if value else "unknown"
+        return str(value)
     strata = row.get("strata") or {}
     value = strata.get(field)
     if isinstance(value, list):
@@ -38,7 +42,7 @@ def summarize_group(
     rows: list[dict[str, Any]],
     *,
     bootstrap_reps: int = 1000,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Summarize one group of evaluation rows."""
     scores = [score for row in rows if (score := score_value(row)) is not None]
@@ -57,9 +61,10 @@ def stratified_summary(
     *,
     strata_fields: tuple[str, ...] = DEFAULT_STRATA,
     bootstrap_reps: int = 1000,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return summaries for each requested stratum."""
+    resolved_seed = get_random_seed() if seed is None else seed
     output: list[dict[str, Any]] = []
     for field in strata_fields:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -70,7 +75,9 @@ def stratified_summary(
                 {
                     "stratum": field,
                     "value": value,
-                    **summarize_group(group_rows, bootstrap_reps=bootstrap_reps, seed=seed),
+                    **summarize_group(
+                        group_rows, bootstrap_reps=bootstrap_reps, seed=resolved_seed
+                    ),
                 }
             )
     return output

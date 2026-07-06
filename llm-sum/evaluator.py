@@ -62,7 +62,12 @@ from typing import Any
 
 from models_config import compute_cost, get_model_spec  # noqa: E402
 from file_paths import doi_to_slug  # noqa: E402
-from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
+from utils import (
+    BudgetGuard,
+    log_error,
+    require_positive_budget_for_real_run,
+    sleep_for_model,
+)  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 from eval_instances import iter_evaluation_instances  # noqa: E402
 from eval_metrics import calculate_automatic_metrics  # noqa: E402
@@ -79,9 +84,7 @@ MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1500"))
 # llm-sum/prompts/judge_v2.txt only when you intentionally need the older
 # Vet-Score v2.0 rubric for comparison.
 JUDGE_PROMPT_FILE = Path(os.getenv("JUDGE_PROMPT_FILE", "llm-sum/prompts/judge_medhelm_v1.txt"))
-JUDGE_MODELS = [
-    p.strip() for p in os.getenv("JUDGE_MODELS", "openai").split(",") if p.strip()
-]
+JUDGE_MODELS = [p.strip() for p in os.getenv("JUDGE_MODELS", "openai").split(",") if p.strip()]
 
 BENCHMARK_NAME = os.getenv("EVAL_BENCHMARK_NAME", "vet_lit_summary_medhelm")
 RUBRIC_VERSION = os.getenv("EVAL_RUBRIC_VERSION", "vet_medhelm_score_v1.0")
@@ -121,6 +124,7 @@ BLIND_FORBIDDEN_TOKENS = ("openai", "anthropic", "gemini", "gpt", "claude", "cha
 # Prompt loading + blind builder
 # ---------------------------------------------------------------------------
 
+
 def load_judge_prompt(prompt_file: Path = JUDGE_PROMPT_FILE) -> str:
     path = prompt_file if prompt_file.is_absolute() else REPO_ROOT / prompt_file
     if not path.exists():
@@ -132,8 +136,9 @@ def load_judge_prompt(prompt_file: Path = JUDGE_PROMPT_FILE) -> str:
     return template
 
 
-def build_judge_prompt(reference_text: str, candidate_summary: str,
-                       template: str | None = None) -> str:
+def build_judge_prompt(
+    reference_text: str, candidate_summary: str, template: str | None = None
+) -> str:
     """
     Render the judge prompt with the (reference, candidate) pair. The
     summariser name is deliberately NOT a parameter — keeping it out of the
@@ -141,9 +146,9 @@ def build_judge_prompt(reference_text: str, candidate_summary: str,
     the dedicated unit test that scans the rendered output.
     """
     tmpl = template if template is not None else load_judge_prompt()
-    return (tmpl
-            .replace("{REFERENCE_TEXT}", reference_text)
-            .replace("{CANDIDATE_SUMMARY}", candidate_summary))
+    return tmpl.replace("{REFERENCE_TEXT}", reference_text).replace(
+        "{CANDIDATE_SUMMARY}", candidate_summary
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +156,10 @@ def build_judge_prompt(reference_text: str, candidate_summary: str,
 # ---------------------------------------------------------------------------
 
 VALID_HALLUCINATION_CATEGORIES = (
-    "fabricated statistics", "omitted caveat", "contradiction", "unsupported_inference",
+    "fabricated statistics",
+    "omitted caveat",
+    "contradiction",
+    "unsupported_inference",
 )
 SCORE_SENTINEL_MALFORMED = 99
 
@@ -181,16 +189,17 @@ def calculate_composite_score(scores: dict) -> float:
         max       = (3×1.5) + (3×1.0) + (3×1.2) + (3×0.8) = 13.5
         normalized = (composite / 13.5) × 9 + 1   → range [1.0, 10.0]
     """
-    fa = _clamp(scores.get("factual_accuracy",  1), 1, 3)
-    c  = _clamp(scores.get("completeness",       1), 1, 3)
+    fa = _clamp(scores.get("factual_accuracy", 1), 1, 3)
+    c = _clamp(scores.get("completeness", 1), 1, 3)
     cr = _clamp(scores.get("clinical_relevance", 1), 1, 3)
-    o  = _clamp(scores.get("organization",       1), 1, 3)
+    o = _clamp(scores.get("organization", 1), 1, 3)
     composite = (fa * 1.5) + (c * 1.0) + (cr * 1.2) + (o * 0.8)
     return round((composite / 13.5) * 9 + 1, 2)
 
 
-def calculate_jury_score(criteria_scores: dict, *,
-                         weights: dict[str, float] | None = None) -> float:
+def calculate_jury_score(
+    criteria_scores: dict, *, weights: dict[str, float] | None = None
+) -> float:
     """Compute the MedHELM-style weighted jury score on a 1-5 scale.
 
     The judge supplies criterion scores only. Python performs the weighted
@@ -231,9 +240,7 @@ def aggregate_jury_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
     cross-judge view without rewriting history.
     """
     valid_scores = [
-        float(row["jury_score"])
-        for row in rows
-        if isinstance(row.get("jury_score"), (int, float))
+        float(row["jury_score"]) for row in rows if isinstance(row.get("jury_score"), (int, float))
     ]
     if not valid_scores:
         return {
@@ -300,7 +307,7 @@ def _try_parse_json_block(text: str) -> dict | None:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = text[start:i + 1]
+                    candidate = text[start : i + 1]
                     try:
                         return json.loads(candidate)
                     except json.JSONDecodeError:
@@ -311,17 +318,18 @@ def _try_parse_json_block(text: str) -> dict | None:
 
 _REGEX_FALLBACK = {
     # v2 dimension fields (checked first — if found, use vet rubric path)
-    "factual_accuracy":   re.compile(r'"?factual_accuracy"?\s*[:=]\s*(\d+)'),
-    "completeness":       re.compile(r'"?completeness"?\s*[:=]\s*(\d+)'),
+    "factual_accuracy": re.compile(r'"?factual_accuracy"?\s*[:=]\s*(\d+)'),
+    "completeness": re.compile(r'"?completeness"?\s*[:=]\s*(\d+)'),
     "clinical_relevance": re.compile(r'"?clinical_relevance"?\s*[:=]\s*(\d+)'),
-    "organization":       re.compile(r'"?organization"?\s*[:=]\s*(\d+)'),
+    "organization": re.compile(r'"?organization"?\s*[:=]\s*(\d+)'),
     # legacy / shared fields
-    "quality_score":      re.compile(r'"?quality_score"?\s*[:=]\s*(\d+)'),
+    "quality_score": re.compile(r'"?quality_score"?\s*[:=]\s*(\d+)'),
     "hallucination_count": re.compile(r'"?hallucination_count"?\s*[:=]\s*(\d+)'),
-    "confidence_score":   re.compile(r'"?confidence_score"?\s*[:=]\s*(\d+)'),
+    "confidence_score": re.compile(r'"?confidence_score"?\s*[:=]\s*(\d+)'),
 }
 _REGEX_CATEGORIES = re.compile(
-    r'"?hallucination_categories"?\s*[:=]\s*\[(.*?)\]', re.DOTALL,
+    r'"?hallucination_categories"?\s*[:=]\s*\[(.*?)\]',
+    re.DOTALL,
 )
 
 
@@ -367,7 +375,9 @@ def parse_judge_response(raw_text: str) -> dict:
             "hallucination_present": bool(halluc_block.get("present", len(claims) > 0)),
             "hallucination_count": int(halluc_block.get("count", len(claims))),
             "hallucination_claims": claims,
-            "hallucination_categories": list({c.get("category", "") for c in claims if c.get("category")}),
+            "hallucination_categories": list(
+                {c.get("category", "") for c in claims if c.get("category")}
+            ),
             "confidence_score": confidence,
             "reasoning": str(obj.get("reasoning", "")),
             "quality_score": scale_jury_to_quality_score(jury_score),
@@ -386,15 +396,17 @@ def parse_judge_response(raw_text: str) -> dict:
             "judge_count": 1,
             "valid_judge_count": 1,
             "judge_disagreement": 0.0,
-            "factual_accuracy":   _clamp(obj.get("factual_accuracy",  1), 1, 3),
-            "completeness":       _clamp(obj.get("completeness",       1), 1, 3),
+            "factual_accuracy": _clamp(obj.get("factual_accuracy", 1), 1, 3),
+            "completeness": _clamp(obj.get("completeness", 1), 1, 3),
             "clinical_relevance": _clamp(obj.get("clinical_relevance", 1), 1, 3),
-            "organization":       _clamp(obj.get("organization",       1), 1, 3),
-            "composite_score":    composite,
-            "hallucination_present":   bool(halluc_block.get("present", len(claims) > 0)),
-            "hallucination_count":     int(halluc_block.get("count", len(claims))),
-            "hallucination_claims":    claims,
-            "hallucination_categories": list({c.get("category", "") for c in claims if c.get("category")}),
+            "organization": _clamp(obj.get("organization", 1), 1, 3),
+            "composite_score": composite,
+            "hallucination_present": bool(halluc_block.get("present", len(claims) > 0)),
+            "hallucination_count": int(halluc_block.get("count", len(claims))),
+            "hallucination_claims": claims,
+            "hallucination_categories": list(
+                {c.get("category", "") for c in claims if c.get("category")}
+            ),
             "confidence_score": confidence,
             "reasoning": str(obj.get("reasoning", "")),
             # quality_score kept for backward compat with any Phase 5 code
@@ -406,12 +418,18 @@ def parse_judge_response(raw_text: str) -> dict:
         # --- legacy schema (judge_v1 responses) ---
         confidence = _clamp(obj.get("confidence_score", 1), 1, 5)
         return {
-            "criteria_scores": {}, "jury_score": None,
-            "judge_count": 1, "valid_judge_count": 1, "judge_disagreement": 0.0,
-            "factual_accuracy": None, "completeness": None,
-            "clinical_relevance": None, "organization": None,
+            "criteria_scores": {},
+            "jury_score": None,
+            "judge_count": 1,
+            "valid_judge_count": 1,
+            "judge_disagreement": 0.0,
+            "factual_accuracy": None,
+            "completeness": None,
+            "clinical_relevance": None,
+            "organization": None,
             "composite_score": None,
-            "hallucination_present": None, "hallucination_claims": [],
+            "hallucination_present": None,
+            "hallucination_claims": [],
             "quality_score": int(obj.get("quality_score", SCORE_SENTINEL_MALFORMED)),
             "hallucination_count": int(obj.get("hallucination_count", 0)),
             "hallucination_categories": list(obj.get("hallucination_categories") or []),
@@ -437,14 +455,18 @@ def parse_judge_response(raw_text: str) -> dict:
         composite = calculate_composite_score(fields)
         confidence = _clamp(fields.get("confidence_score", 1), 1, 5)
         return {
-            "criteria_scores": {}, "jury_score": None,
-            "judge_count": 1, "valid_judge_count": 1, "judge_disagreement": 0.0,
-            "factual_accuracy":   _clamp(fields.get("factual_accuracy",  1), 1, 3),
-            "completeness":       _clamp(fields.get("completeness",       1), 1, 3),
+            "criteria_scores": {},
+            "jury_score": None,
+            "judge_count": 1,
+            "valid_judge_count": 1,
+            "judge_disagreement": 0.0,
+            "factual_accuracy": _clamp(fields.get("factual_accuracy", 1), 1, 3),
+            "completeness": _clamp(fields.get("completeness", 1), 1, 3),
             "clinical_relevance": _clamp(fields.get("clinical_relevance", 1), 1, 3),
-            "organization":       _clamp(fields.get("organization",       1), 1, 3),
-            "composite_score":    composite,
-            "hallucination_present": None, "hallucination_claims": [],
+            "organization": _clamp(fields.get("organization", 1), 1, 3),
+            "composite_score": composite,
+            "hallucination_present": None,
+            "hallucination_claims": [],
             "hallucination_count": fields.get("hallucination_count", 0),
             "hallucination_categories": [],
             "confidence_score": confidence,
@@ -463,12 +485,18 @@ def parse_judge_response(raw_text: str) -> dict:
             categories = []
         confidence = _clamp(fields.get("confidence_score", 1), 1, 5)
         return {
-            "criteria_scores": {}, "jury_score": None,
-            "judge_count": 1, "valid_judge_count": 1, "judge_disagreement": 0.0,
-            "factual_accuracy": None, "completeness": None,
-            "clinical_relevance": None, "organization": None,
+            "criteria_scores": {},
+            "jury_score": None,
+            "judge_count": 1,
+            "valid_judge_count": 1,
+            "judge_disagreement": 0.0,
+            "factual_accuracy": None,
+            "completeness": None,
+            "clinical_relevance": None,
+            "organization": None,
             "composite_score": None,
-            "hallucination_present": None, "hallucination_claims": [],
+            "hallucination_present": None,
+            "hallucination_claims": [],
             "quality_score": fields["quality_score"],
             "hallucination_count": fields.get("hallucination_count", 0),
             "hallucination_categories": categories,
@@ -485,10 +513,13 @@ def parse_judge_response(raw_text: str) -> dict:
         "judge_count": 1,
         "valid_judge_count": 0,
         "judge_disagreement": None,
-        "factual_accuracy": None, "completeness": None,
-        "clinical_relevance": None, "organization": None,
+        "factual_accuracy": None,
+        "completeness": None,
+        "clinical_relevance": None,
+        "organization": None,
         "composite_score": None,
-        "hallucination_present": None, "hallucination_claims": [],
+        "hallucination_present": None,
+        "hallucination_claims": [],
         "quality_score": SCORE_SENTINEL_MALFORMED,
         "hallucination_count": 0,
         "hallucination_categories": [],
@@ -507,8 +538,7 @@ def needs_human_review(parsed: dict) -> bool:
       clinician must be checked by a human even if overall confidence is high
     """
     any_major = any(
-        c.get("severity") == "major"
-        for c in (parsed.get("hallucination_claims") or [])
+        c.get("severity") == "major" for c in (parsed.get("hallucination_claims") or [])
     )
     return (
         parsed.get("confidence_score", 0) < 3
@@ -521,13 +551,13 @@ def needs_human_review(parsed: dict) -> bool:
 # Judge call (real-time; per-pair). Batch path mirrors summariser's.
 # ---------------------------------------------------------------------------
 
+
 def _stable_hash_int(text: str) -> int:
     """Use SHA-256 instead of Python's salted hash() for reproducible dry runs."""
     return int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16)
 
 
-def _mock_judge_response(provider: str, reference_text: str,
-                         candidate_summary: str) -> dict:
+def _mock_judge_response(provider: str, reference_text: str, candidate_summary: str) -> dict:
     """
     Deterministic fake response for DRY_RUN. Uses hashes of the text so
     different summaries get different (but reproducible) scores. Returns
@@ -535,7 +565,7 @@ def _mock_judge_response(provider: str, reference_text: str,
     """
     spec = get_model_spec(provider)
     h_cand = _stable_hash_int(candidate_summary)
-    h_ref  = _stable_hash_int(reference_text)
+    h_ref = _stable_hash_int(reference_text)
     # Criterion scores: deterministic, spread across 1-5 so dry-run exercises
     # the MedHELM parser without spending money or depending on random state.
     faithfulness = (h_cand % 5) + 1
@@ -548,7 +578,10 @@ def _mock_judge_response(provider: str, reference_text: str,
         "criteria_scores": {
             "faithfulness": {"score": faithfulness, "reasoning": "[MOCK] source support"},
             "completeness": {"score": completeness, "reasoning": "[MOCK] checklist coverage"},
-            "clinical_usefulness": {"score": clinical_usefulness, "reasoning": "[MOCK] clinical value"},
+            "clinical_usefulness": {
+                "score": clinical_usefulness,
+                "reasoning": "[MOCK] clinical value",
+            },
             "clarity": {"score": clarity, "reasoning": "[MOCK] readability"},
             "safety": {"score": safety, "reasoning": "[MOCK] clinical safety"},
         },
@@ -568,9 +601,14 @@ def _mock_judge_response(provider: str, reference_text: str,
     }
 
 
-def call_judge(provider: str, reference_text: str, candidate_summary: str,
-               *, prompt_template: str | None = None,
-               max_retries: int = 3) -> dict:
+def call_judge(
+    provider: str,
+    reference_text: str,
+    candidate_summary: str,
+    *,
+    prompt_template: str | None = None,
+    max_retries: int = 3,
+) -> dict:
     """
     Call a judge model and return the raw text + token + version metadata.
     Parsing happens in a separate step so failed parses can still log the
@@ -594,7 +632,7 @@ def call_judge(provider: str, reference_text: str, candidate_summary: str,
         except Exception as exc:
             last_error = exc
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
 
     log_error("N/A", f"evaluate_{provider}", f"Judge failed after retries: {last_error}")
     raise RuntimeError(f"Judge {provider} failed: {last_error}")
@@ -602,6 +640,7 @@ def call_judge(provider: str, reference_text: str, candidate_summary: str,
 
 def _call_judge_openai(user_message: str) -> dict:
     import openai  # type: ignore[import-not-found]
+
     spec = get_model_spec("openai")
     client = openai.OpenAI()
     response = client.chat.completions.create(
@@ -625,6 +664,7 @@ def _call_judge_openai(user_message: str) -> dict:
 
 def _call_judge_anthropic(user_message: str) -> dict:
     import anthropic  # type: ignore[import-not-found]
+
     spec = get_model_spec("anthropic")
     client = anthropic.Anthropic()
     response = client.messages.create(
@@ -649,7 +689,7 @@ def _call_judge_gemini(user_message: str) -> dict:
     except ImportError as exc:
         raise ImportError(
             "Gemini judge requires the google-genai package in the active "
-            "virtual environment. Run: python -m pip install -r requirements.txt"
+            "virtual environment. Run: python -m pip install -r requirements-lock.txt"
         ) from exc
 
     spec = get_model_spec("gemini")
@@ -677,12 +717,19 @@ def _call_judge_gemini(user_message: str) -> dict:
 # Evaluation row builder + persistence
 # ---------------------------------------------------------------------------
 
-def build_evaluation_row(*, doi: str, summariser: str, judge: str,
-                         input_source: str = "processed",
-                         reference_text: str, candidate_summary: str,
-                         judge_response: dict,
-                         strata: dict[str, Any] | None = None,
-                         automatic_metrics: dict[str, Any] | None = None) -> dict:
+
+def build_evaluation_row(
+    *,
+    doi: str,
+    summariser: str,
+    judge: str,
+    input_source: str = "processed",
+    reference_text: str,
+    candidate_summary: str,
+    judge_response: dict,
+    strata: dict[str, Any] | None = None,
+    automatic_metrics: dict[str, Any] | None = None,
+) -> dict:
     # Parse first, then enrich. Keeping parsing separate from row construction
     # makes it possible to test malformed judge responses without creating fake
     # DOI/source metadata.
@@ -708,26 +755,26 @@ def build_evaluation_row(*, doi: str, summariser: str, judge: str,
         "judge_model_version": judge_response["model_version"],
         "system_fingerprint": judge_response.get("system_fingerprint"),
         "evaluator_version": EVALUATOR_VERSION,
-        "rubric_version":       RUBRIC_VERSION,
+        "rubric_version": RUBRIC_VERSION,
         # MedHELM primary scoring fields. jury_score is the primary endpoint for
         # new evaluation; quality_score below is only a compatibility alias.
-        "criteria_scores":      parsed.get("criteria_scores", {}),
-        "jury_score":           parsed.get("jury_score"),
-        "judge_count":          parsed.get("judge_count", 1),
-        "valid_judge_count":    parsed.get("valid_judge_count", 1),
-        "judge_disagreement":   parsed.get("judge_disagreement", 0.0),
+        "criteria_scores": parsed.get("criteria_scores", {}),
+        "jury_score": parsed.get("jury_score"),
+        "judge_count": parsed.get("judge_count", 1),
+        "valid_judge_count": parsed.get("valid_judge_count", 1),
+        "judge_disagreement": parsed.get("judge_disagreement", 0.0),
         # Automatic metrics are stored as secondary evidence, not as the main
         # score, because word overlap cannot prove clinical correctness.
-        "automatic_metrics":    resolved_metrics,
+        "automatic_metrics": resolved_metrics,
         # Strata carry species/study/topic/journal labels for MedHELM-style
         # subgroup reporting.
-        "strata":               strata or {"input_source": input_source},
+        "strata": strata or {"input_source": input_source},
         # Legacy/v2 aliases stay present so existing notebooks do not fail.
-        "factual_accuracy":     parsed.get("factual_accuracy"),
-        "completeness":         parsed.get("completeness"),
-        "clinical_relevance":   parsed.get("clinical_relevance"),
-        "organization":         parsed.get("organization"),
-        "composite_score":      parsed.get("composite_score"),
+        "factual_accuracy": parsed.get("factual_accuracy"),
+        "completeness": parsed.get("completeness"),
+        "clinical_relevance": parsed.get("clinical_relevance"),
+        "organization": parsed.get("organization"),
+        "composite_score": parsed.get("composite_score"),
         "hallucination_present": parsed.get("hallucination_present"),
         "hallucination_claims": parsed.get("hallucination_claims", []),
         # legacy / shared fields (always present)
@@ -756,6 +803,7 @@ def append_evaluation(row: dict, path: Path | None = None) -> None:
 # Run loop
 # ---------------------------------------------------------------------------
 
+
 def _iter_summaries(path: Path | None = None):
     # Resolved at call time so tests can monkeypatch evaluator.SUMMARIES_PATH.
     resolved = path if path is not None else SUMMARIES_PATH
@@ -782,23 +830,30 @@ def _read_cached_text(record_or_doi) -> str | None:
     ``{doi_to_slug(doi)}.jsonl`` name automatically.
     """
     from prepare_texts import read_cached_text as _shared_read
+
     source = "processed"
     if not isinstance(record_or_doi, str):
         source = str(record_or_doi.get("input_source") or "processed")
     return _shared_read(record_or_doi, input_source=source)
 
 
-def already_evaluated(doi: str, summariser: str, judge: str,
-                      input_source: str = "processed",
-                      rubric_version: str = RUBRIC_VERSION) -> bool:
+def already_evaluated(
+    doi: str,
+    summariser: str,
+    judge: str,
+    input_source: str = "processed",
+    rubric_version: str = RUBRIC_VERSION,
+    evaluations_path: Path | None = None,
+) -> bool:
     """Check evaluations.jsonl to support a manual resume.
 
     Rubric version is part of the resume key so a new methodology can be run
     next to older scores without silently skipping already-seen DOI/model pairs.
     """
-    if not EVALUATIONS_PATH.exists():
+    resolved_path = evaluations_path if evaluations_path is not None else EVALUATIONS_PATH
+    if not resolved_path.exists():
         return False
-    with open(EVALUATIONS_PATH, encoding="utf-8") as f:
+    with open(resolved_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -807,11 +862,13 @@ def already_evaluated(doi: str, summariser: str, judge: str,
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if (row.get("doi") == doi
-                    and (row.get("input_source") or "processed") == input_source
-                    and row.get("summarizer") == summariser
-                    and row.get("judge") == judge
-                    and row.get("rubric_version") == rubric_version):
+            if (
+                row.get("doi") == doi
+                and (row.get("input_source") or "processed") == input_source
+                and row.get("summarizer") == summariser
+                and row.get("judge") == judge
+                and row.get("rubric_version") == rubric_version
+            ):
                 return True
     return False
 
@@ -825,26 +882,36 @@ def confirm_real_judge(profile: ModeProfile, force: bool) -> bool:
         return True
     if force:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        line = (f"[phase3:safety] evaluator confirmation bypassed via --force at "
-                f"{datetime.now(timezone.utc).isoformat()}\n")
+        line = (
+            f"[phase3:safety] evaluator confirmation bypassed via --force at "
+            f"{datetime.now(timezone.utc).isoformat()}\n"
+        )
         with open(LOGS_DIR / "phase3_safety.log", "a", encoding="utf-8") as f:
             f.write(line)
         print(line.strip())
         return True
-    reply = input(
-        "\n[phase3:safety] About to call the judge with REAL API requests.\n"
-        "Type 'yes' to confirm: "
-    ).strip().lower()
+    reply = (
+        input(
+            "\n[phase3:safety] About to call the judge with REAL API requests.\n"
+            "Type 'yes' to confirm: "
+        )
+        .strip()
+        .lower()
+    )
     if reply != "yes":
         print("[phase3:safety] Confirmation not received; aborting.")
         return False
     return True
 
 
-def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
-                   paper_limit: int | None = None,
-                   doi_filter: set[str] | None = None,
-                   output_path: Path | None = None) -> dict[str, int]:
+def run_evaluation(
+    *,
+    judges: list[str] | None = None,
+    resume: bool = True,
+    paper_limit: int | None = None,
+    doi_filter: set[str] | None = None,
+    output_path: Path | None = None,
+) -> dict[str, int]:
     """Run the blind judge loop over summaries.jsonl.
 
     doi_filter: when provided, only evaluate DOIs in this set. Used by
@@ -852,6 +919,7 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
     subset without changing evaluator logic.
     """
     judges = judges or JUDGE_MODELS
+    evaluations_path = output_path if output_path is not None else EVALUATIONS_PATH
     prompt_template = load_judge_prompt()
     guard = BudgetGuard()
     counts = {"evaluated": 0, "skipped": 0, "failed": 0, "no_text": 0}
@@ -872,14 +940,20 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
 
         for judge in judges:
             if resume and already_evaluated(
-                instance.doi, instance.summarizer, judge, instance.input_source,
+                instance.doi,
+                instance.summarizer,
+                judge,
+                instance.input_source,
+                evaluations_path=evaluations_path,
             ):
                 counts["skipped"] += 1
                 continue
             sleep_for_model(judge)
             try:
                 response = call_judge(
-                    judge, instance.reference_text, instance.candidate_summary,
+                    judge,
+                    instance.reference_text,
+                    instance.candidate_summary,
                     prompt_template=prompt_template,
                 )
             except Exception as exc:
@@ -888,7 +962,9 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                 continue
 
             row = build_evaluation_row(
-                doi=instance.doi, summariser=instance.summarizer, judge=judge,
+                doi=instance.doi,
+                summariser=instance.summarizer,
+                judge=judge,
                 input_source=instance.input_source,
                 reference_text=instance.reference_text,
                 candidate_summary=instance.candidate_summary,
@@ -906,27 +982,38 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
             )
             guard.add_cost(cost)
             score = row.get("jury_score") or row.get("quality_score")
-            print(f"[phase3:evaluate] {instance.doi} {instance.summarizer} -> {judge} "
-                  f"score={score} via {row['parse_method']} "
-                  f"(${cost:.4f})")
+            print(
+                f"[phase3:evaluate] {instance.doi} {instance.summarizer} -> {judge} "
+                f"score={score} via {row['parse_method']} "
+                f"(${cost:.4f})"
+            )
 
-    print(f"\n[phase3:evaluate] done. counts={counts}  "
-          f"budget_spent=${guard.total_spent:.4f}")
+    print(f"\n[phase3:evaluate] done. counts={counts}  " f"budget_spent=${guard.total_spent:.4f}")
     return counts
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Phase 3 — blind judge evaluator.")
-    parser.add_argument("--mode", choices=VALID_MODES, default=None,
-                        help="Override PHASE3_MODE from .env: test|single|dev|batch.")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Override the mode's default paper_limit.")
-    parser.add_argument("--judges", default=",".join(JUDGE_MODELS),
-                        help="Comma-separated judge provider keys.")
-    parser.add_argument("--no-resume", action="store_true",
-                        help="Re-evaluate even pairs already in evaluations.jsonl.")
-    parser.add_argument("--force", action="store_true",
-                        help="Bypass interactive confirmation. USE WITH CAUTION.")
+    parser.add_argument(
+        "--mode",
+        choices=VALID_MODES,
+        default=None,
+        help="Override PHASE3_MODE from .env: test|single|dev|batch.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Override the mode's default paper_limit."
+    )
+    parser.add_argument(
+        "--judges", default=",".join(JUDGE_MODELS), help="Comma-separated judge provider keys."
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Re-evaluate even pairs already in evaluations.jsonl.",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Bypass interactive confirmation. USE WITH CAUTION."
+    )
     args = parser.parse_args(argv)
 
     judges = [j.strip() for j in args.judges.split(",") if j.strip()]
@@ -936,9 +1023,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(profile.banner())
     if profile.use_batch:
-        print("[phase3:evaluate] mode=batch: this script only runs the real-time judge "
-              "loop. Judge batch jobs are submitted by run_phase3 summarize and collected "
-              "by check_batch_status.py.")
+        print(
+            "[phase3:evaluate] mode=batch: this script only runs the real-time judge "
+            "loop. Judge batch jobs are submitted by run_phase3 summarize and collected "
+            "by check_batch_status.py."
+        )
     if args.limit is not None:
         print(f"[phase3:evaluate] --limit {args.limit} overrides mode default.")
 

@@ -48,10 +48,16 @@ def sha256_json(data: Any) -> str:
 def dataset_hash(rows: Iterable[dict[str, Any]]) -> str:
     """Hash a dataset independent of original JSON key order.
 
-    Rows are sorted by ``instance_id`` when present, otherwise by DOI. This
-    makes frozen-set hashes stable even if the source file was written in a
-    different order.
+    Rows are sorted by ``instance_id``, then DOI, then title. The explicit
+    fallbacks match frozen-set loading so checksums do not depend on the module
+    that prepared the rows.
     """
     materialized = list(rows)
-    materialized.sort(key=lambda row: str(row.get("instance_id") or row.get("doi") or ""))
+    materialized.sort(
+        key=lambda row: (
+            str(row.get("instance_id") or ""),
+            str(row.get("doi") or ""),
+            str(row.get("title") or ""),
+        )
+    )
     return sha256_json(materialized)

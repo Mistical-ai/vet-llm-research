@@ -59,7 +59,7 @@ python llm-sum/cost_estimator.py     # works if you import + invoke its run() fu
 |----------------------------------------------------------------------|----------------------------------------------------|------------------------------------------------------------------|
 | `No cached texts in data/processed/` or `data/raw_text/`             | `prepare_texts.py` has not run, or raw caches predate this feature. | `python llm-sum/run_phase3.py extract`.                          |
 | `Direct PDF cost cannot be estimated offline`                        | PDF token counts are provider-specific and only known after a live call. | Run `python llm-sum/run_phase3.py summarize --mode single --input-source pdf`. |
-| Token counts look ~5-10% off                                         | Fallback to `words × 1.33` because tiktoken isn't installed. | `pip install tiktoken` (already in `requirements.txt`).      |
+| Token counts look ~5-10% off                                         | Fallback to `words × 1.33` because tiktoken isn't installed. | Install locked deps from `requirements-lock.txt`.             |
 | Forecast says `OVER BUDGET`                                          | Real cost would exceed `BUDGET_HARD_STOP`.         | Either raise the budget in `.env` or reduce paper count via `--mode dev` / `--limit`. |
 
 ## Worked example

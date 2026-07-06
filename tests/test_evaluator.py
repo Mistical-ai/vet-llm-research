@@ -20,7 +20,9 @@ import pytest
 import evaluator
 from evaluator import (
     BLIND_FORBIDDEN_TOKENS,
+    RUBRIC_VERSION,
     SCORE_SENTINEL_MALFORMED,
+    already_evaluated,
     build_judge_prompt,
     build_evaluation_row,
     aggregate_jury_scores,
@@ -43,6 +45,7 @@ def _force_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
 # Blind protocol
 # ---------------------------------------------------------------------------
 
+
 def test_blind_judge_prompt_contains_no_model_identifiers() -> None:
     reference = "Reference text body about a clinical trial in dogs."
     candidate = "Some candidate summary text claiming X and Y."
@@ -58,29 +61,43 @@ def test_build_judge_prompt_signature_excludes_summariser_name() -> None:
     """The signature must not accept a summariser identifier — that is the
     structural guarantee of the blind protocol."""
     import inspect
+
     sig = inspect.signature(build_judge_prompt)
     forbidden_params = {"summarizer", "summariser", "model_name", "provider"}
-    assert not (set(sig.parameters) & forbidden_params), (
-        "build_judge_prompt must not take a summariser identifier parameter."
-    )
+    assert not (
+        set(sig.parameters) & forbidden_params
+    ), "build_judge_prompt must not take a summariser identifier parameter."
 
 
 # ---------------------------------------------------------------------------
 # JSON parsing + fallback
 # ---------------------------------------------------------------------------
 
+
 def test_clean_json_parsed_directly() -> None:
     """v2 schema: 4 dimension scores → composite computed, quality_score = round(composite)."""
-    raw = json.dumps({
-        "factual_accuracy": 3, "completeness": 2, "clinical_relevance": 3,
-        "organization": 2,
-        "hallucination": {"present": True, "count": 1, "claims": [
-            {"claim": "X", "source_quote": "Y",
-             "category": "omitted_caveat", "severity": "minor"},
-        ]},
-        "confidence_score": 4,
-        "reasoning": "Mostly accurate.",
-    })
+    raw = json.dumps(
+        {
+            "factual_accuracy": 3,
+            "completeness": 2,
+            "clinical_relevance": 3,
+            "organization": 2,
+            "hallucination": {
+                "present": True,
+                "count": 1,
+                "claims": [
+                    {
+                        "claim": "X",
+                        "source_quote": "Y",
+                        "category": "omitted_caveat",
+                        "severity": "minor",
+                    },
+                ],
+            },
+            "confidence_score": 4,
+            "reasoning": "Mostly accurate.",
+        }
+    )
     parsed = parse_judge_response(raw)
     assert parsed["factual_accuracy"] == 3
     assert parsed["completeness"] == 2
@@ -94,11 +111,13 @@ def test_clean_json_parsed_directly() -> None:
 
 
 def test_json_with_conversational_wrapper_still_parses() -> None:
-    raw = ("Sure! Here is the evaluation: "
-           '{"quality_score": 7, "hallucination_count": 0, '
-           '"hallucination_categories": [], "confidence_score": 5, '
-           '"reasoning": "Faithful summary."} '
-           "Let me know if you need anything else.")
+    raw = (
+        "Sure! Here is the evaluation: "
+        '{"quality_score": 7, "hallucination_count": 0, '
+        '"hallucination_categories": [], "confidence_score": 5, '
+        '"reasoning": "Faithful summary."} '
+        "Let me know if you need anything else."
+    )
     parsed = parse_judge_response(raw)
     assert parsed["quality_score"] == 7
     assert parsed["parse_method"] == "json"
@@ -106,9 +125,11 @@ def test_json_with_conversational_wrapper_still_parses() -> None:
 
 def test_regex_fallback_extracts_when_json_is_broken() -> None:
     # Missing braces / quotes but the named fields are still grep-able.
-    raw = ("quality_score: 6, hallucination_count: 2, "
-           "hallucination_categories: [fabricated statistics, contradiction], "
-           "confidence_score: 3")
+    raw = (
+        "quality_score: 6, hallucination_count: 2, "
+        "hallucination_categories: [fabricated statistics, contradiction], "
+        "confidence_score: 3"
+    )
     parsed = parse_judge_response(raw)
     assert parsed["quality_score"] == 6
     assert parsed["hallucination_count"] == 2
@@ -127,6 +148,7 @@ def test_completely_malformed_response_triggers_99_sentinel() -> None:
 # ---------------------------------------------------------------------------
 # requires_human_review flag
 # ---------------------------------------------------------------------------
+
 
 def test_requires_human_review_on_low_confidence() -> None:
     parsed = {"quality_score": 7, "confidence_score": 2}
@@ -147,15 +169,22 @@ def test_does_not_require_review_on_good_response() -> None:
 # Evaluation row construction
 # ---------------------------------------------------------------------------
 
+
 def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
     judge_response = {
-        "raw_text": json.dumps({
-            "factual_accuracy": 3, "completeness": 3,
-            "clinical_relevance": 3, "organization": 3,
-            "hallucination": {"present": False, "count": 0, "claims": []},
-            "confidence_score": 5, "reasoning": "ok",
-        }),
-        "input_tokens": 1500, "output_tokens": 200,
+        "raw_text": json.dumps(
+            {
+                "factual_accuracy": 3,
+                "completeness": 3,
+                "clinical_relevance": 3,
+                "organization": 3,
+                "hallucination": {"present": False, "count": 0, "claims": []},
+                "confidence_score": 5,
+                "reasoning": "ok",
+            }
+        ),
+        "input_tokens": 1500,
+        "output_tokens": 200,
         "model_version": "gpt-5.4-test",
         "system_fingerprint": "fp-test",
     }
@@ -180,28 +209,26 @@ def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
 
 
 def test_mock_judge_response_is_stable() -> None:
-    first = evaluator._mock_judge_response(
-        "openai", "Reference body.", "Candidate summary."
-    )
-    second = evaluator._mock_judge_response(
-        "openai", "Reference body.", "Candidate summary."
-    )
+    first = evaluator._mock_judge_response("openai", "Reference body.", "Candidate summary.")
+    second = evaluator._mock_judge_response("openai", "Reference body.", "Candidate summary.")
     assert first["raw_text"] == second["raw_text"]
 
 
 def test_medhelm_schema_parses_criteria_scores() -> None:
-    raw = json.dumps({
-        "criteria_scores": {
-            "faithfulness": {"score": 5, "reasoning": "Supported."},
-            "completeness": {"score": 4, "reasoning": "One minor omission."},
-            "clinical_usefulness": {"score": 5, "reasoning": "Useful."},
-            "clarity": {"score": 4, "reasoning": "Readable."},
-            "safety": {"score": 5, "reasoning": "No safety concern."},
-        },
-        "hallucination": {"present": False, "count": 0, "claims": []},
-        "confidence_score": 5,
-        "reasoning": "Strong summary.",
-    })
+    raw = json.dumps(
+        {
+            "criteria_scores": {
+                "faithfulness": {"score": 5, "reasoning": "Supported."},
+                "completeness": {"score": 4, "reasoning": "One minor omission."},
+                "clinical_usefulness": {"score": 5, "reasoning": "Useful."},
+                "clarity": {"score": 4, "reasoning": "Readable."},
+                "safety": {"score": 5, "reasoning": "No safety concern."},
+            },
+            "hallucination": {"present": False, "count": 0, "claims": []},
+            "confidence_score": 5,
+            "reasoning": "Strong summary.",
+        }
+    )
     parsed = parse_judge_response(raw)
     assert parsed["criteria_scores"]["faithfulness"]["score"] == 5
     assert parsed["jury_score"] == calculate_jury_score(parsed["criteria_scores"])
@@ -228,22 +255,22 @@ def test_call_judge_uses_call_time_dry_run(monkeypatch: pytest.MonkeyPatch) -> N
     def _fake_openai(user_message: str) -> dict:
         captured["message"] = user_message
         return {
-            "raw_text": json.dumps({
-                "quality_score": 8,
-                "hallucination_count": 0,
-                "hallucination_categories": [],
-                "confidence_score": 4,
-                "reasoning": "ok",
-            }),
+            "raw_text": json.dumps(
+                {
+                    "quality_score": 8,
+                    "hallucination_count": 0,
+                    "hallucination_categories": [],
+                    "confidence_score": 4,
+                    "reasoning": "ok",
+                }
+            ),
             "input_tokens": 10,
             "output_tokens": 5,
             "model_version": "gpt-test",
         }
 
     monkeypatch.setattr(evaluator, "_call_judge_openai", _fake_openai)
-    response = evaluator.call_judge(
-        "openai", "Reference body.", "Candidate body.", max_retries=1
-    )
+    response = evaluator.call_judge("openai", "Reference body.", "Candidate body.", max_retries=1)
     assert response["model_version"] == "gpt-test"
     assert "Reference body." in captured["message"]
 
@@ -259,13 +286,15 @@ def test_gemini_judge_uses_google_genai(monkeypatch: pytest.MonkeyPatch) -> None
         def generate_content(self, **kwargs):
             captured["kwargs"] = kwargs
             return SimpleNamespace(
-                text=json.dumps({
-                    "quality_score": 7,
-                    "hallucination_count": 0,
-                    "hallucination_categories": [],
-                    "confidence_score": 4,
-                    "reasoning": "ok",
-                }),
+                text=json.dumps(
+                    {
+                        "quality_score": 7,
+                        "hallucination_count": 0,
+                        "hallucination_categories": [],
+                        "confidence_score": 4,
+                        "reasoning": "ok",
+                    }
+                ),
                 usage_metadata=SimpleNamespace(
                     prompt_token_count=123,
                     candidates_token_count=45,
@@ -303,8 +332,8 @@ def test_gemini_judge_uses_google_genai(monkeypatch: pytest.MonkeyPatch) -> None
 # PHASE3_MODE=dev paper cap
 # ---------------------------------------------------------------------------
 
-def test_dev_mode_caps_paper_count(tmp_path: Path,
-                                    monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_dev_mode_caps_paper_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Replaces the old DEVELOPMENT_MODE cap test. Build fake summaries with
     5 papers; with PHASE3_MODE=dev and PHASE3_DEV_LIMIT=2 the evaluator
@@ -334,20 +363,25 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
             # Cache file under legacy slug name. The summary entry below
             # has no journal/title, so the descriptive path resolves back
             # to the legacy slug naming and this file is found.
-            (processed_dir / f"{slug}.jsonl").write_text(
-                json.dumps(entry) + "\n", encoding="utf-8")
-            f.write(json.dumps({
-                "doi": doi,
-                "custom_id": slug,
-                "models": {
-                    "openai": {
-                        "status": "success",
-                        "summary": f"summary for paper {i}",
-                        "model_version": "gpt-5.4-test",
-                        "input_tokens": 100, "output_tokens": 50,
+            (processed_dir / f"{slug}.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+            f.write(
+                json.dumps(
+                    {
+                        "doi": doi,
+                        "custom_id": slug,
+                        "models": {
+                            "openai": {
+                                "status": "success",
+                                "summary": f"summary for paper {i}",
+                                "model_version": "gpt-5.4-test",
+                                "input_tokens": 100,
+                                "output_tokens": 50,
+                            }
+                        },
                     }
-                }
-            }) + "\n")
+                )
+                + "\n"
+            )
 
     monkeypatch.setattr(evaluator, "SUMMARIES_PATH", summaries_path)
     monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
@@ -355,7 +389,8 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
     monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
 
     counts = evaluator.run_evaluation(
-        judges=["openai"], resume=False,
+        judges=["openai"],
+        resume=False,
         paper_limit=profile.paper_limit,
     )
 
@@ -364,9 +399,35 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
     assert len(lines) == 2
 
 
+def test_already_evaluated_uses_requested_evaluation_path(tmp_path: Path) -> None:
+    custom_path = tmp_path / "runs" / "evaluations.jsonl"
+    custom_path.parent.mkdir(parents=True)
+    custom_path.write_text(
+        json.dumps(
+            {
+                "doi": "10.9999/custom",
+                "input_source": "processed",
+                "summarizer": "openai",
+                "judge": "openai",
+                "rubric_version": RUBRIC_VERSION,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert already_evaluated(
+        "10.9999/custom",
+        "openai",
+        "openai",
+        evaluations_path=custom_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Composite score (Vet-Score v2.0)
 # ---------------------------------------------------------------------------
+
 
 def test_composite_score_all_threes() -> None:
     """Max possible scores → normalized to 10.0."""
@@ -406,14 +467,14 @@ def test_composite_score_formula() -> None:
 
 def test_composite_score_clamps_out_of_range() -> None:
     """LLM returning 0 or 5 on a 1-3 scale should not corrupt the composite."""
-    result_low  = calculate_composite_score(
+    result_low = calculate_composite_score(
         {"factual_accuracy": 0, "completeness": 0, "clinical_relevance": 0, "organization": 0}
     )
     result_high = calculate_composite_score(
         {"factual_accuracy": 5, "completeness": 5, "clinical_relevance": 5, "organization": 5}
     )
     # Clamped to 1 and 3 respectively → same as all-ones (4.0) and all-threes (10.0)
-    assert result_low  == 4.0
+    assert result_low == 4.0
     assert result_high == 10.0
 
 
@@ -421,23 +482,31 @@ def test_composite_score_clamps_out_of_range() -> None:
 # v2 schema parsing
 # ---------------------------------------------------------------------------
 
+
 def test_new_schema_parses_correctly() -> None:
     """New 4-dim JSON → all fields extracted, composite computed."""
-    raw = json.dumps({
-        "factual_accuracy": 2, "completeness": 3, "clinical_relevance": 2,
-        "organization": 3,
-        "hallucination": {
-            "present": True, "count": 1,
-            "claims": [{
-                "claim": "Mortality was 20%",
-                "source_quote": "The study did not report mortality",
-                "category": "fabricated_statistics",
-                "severity": "major",
-            }],
-        },
-        "confidence_score": 4,
-        "reasoning": "One fabricated statistic found.",
-    })
+    raw = json.dumps(
+        {
+            "factual_accuracy": 2,
+            "completeness": 3,
+            "clinical_relevance": 2,
+            "organization": 3,
+            "hallucination": {
+                "present": True,
+                "count": 1,
+                "claims": [
+                    {
+                        "claim": "Mortality was 20%",
+                        "source_quote": "The study did not report mortality",
+                        "category": "fabricated_statistics",
+                        "severity": "major",
+                    }
+                ],
+            },
+            "confidence_score": 4,
+            "reasoning": "One fabricated statistic found.",
+        }
+    )
     parsed = parse_judge_response(raw)
     assert parsed["factual_accuracy"] == 2
     assert parsed["completeness"] == 3
@@ -454,21 +523,28 @@ def test_new_schema_parses_correctly() -> None:
 
 def test_species_penalty_schema_present() -> None:
     """Hallucination claims in v2 responses include source_quote field."""
-    raw = json.dumps({
-        "factual_accuracy": 1, "completeness": 2, "clinical_relevance": 2,
-        "organization": 2,
-        "hallucination": {
-            "present": True, "count": 1,
-            "claims": [{
-                "claim": "The drug was tested in horses",
-                "source_quote": "All subjects were domestic cats",
-                "category": "contradiction",
-                "severity": "major",
-            }],
-        },
-        "confidence_score": 5,
-        "reasoning": "Species mislabelled.",
-    })
+    raw = json.dumps(
+        {
+            "factual_accuracy": 1,
+            "completeness": 2,
+            "clinical_relevance": 2,
+            "organization": 2,
+            "hallucination": {
+                "present": True,
+                "count": 1,
+                "claims": [
+                    {
+                        "claim": "The drug was tested in horses",
+                        "source_quote": "All subjects were domestic cats",
+                        "category": "contradiction",
+                        "severity": "major",
+                    }
+                ],
+            },
+            "confidence_score": 5,
+            "reasoning": "Species mislabelled.",
+        }
+    )
     parsed = parse_judge_response(raw)
     assert "source_quote" in parsed["hallucination_claims"][0]
     assert parsed["hallucination_claims"][0]["severity"] == "major"
@@ -476,13 +552,15 @@ def test_species_penalty_schema_present() -> None:
 
 def test_backward_compat_old_schema() -> None:
     """Legacy quality_score-only JSON still parses; composite_score is None."""
-    raw = json.dumps({
-        "quality_score": 8,
-        "hallucination_count": 0,
-        "hallucination_categories": [],
-        "confidence_score": 5,
-        "reasoning": "Good summary.",
-    })
+    raw = json.dumps(
+        {
+            "quality_score": 8,
+            "hallucination_count": 0,
+            "hallucination_categories": [],
+            "confidence_score": 5,
+            "reasoning": "Good summary.",
+        }
+    )
     parsed = parse_judge_response(raw)
     assert parsed["quality_score"] == 8
     assert parsed["composite_score"] is None
@@ -492,8 +570,10 @@ def test_backward_compat_old_schema() -> None:
 
 def test_regex_fallback_new_fields() -> None:
     """Broken JSON with v2 dimension fields → regex path computes composite."""
-    raw = ("factual_accuracy: 3, completeness: 2, clinical_relevance: 3, "
-           "organization: 2, confidence_score: 4")
+    raw = (
+        "factual_accuracy: 3, completeness: 2, clinical_relevance: 3, "
+        "organization: 2, confidence_score: 4"
+    )
     parsed = parse_judge_response(raw)
     assert parsed["factual_accuracy"] == 3
     assert parsed["completeness"] == 2
@@ -506,6 +586,7 @@ def test_regex_fallback_new_fields() -> None:
 # Hallucination major-severity flag
 # ---------------------------------------------------------------------------
 
+
 def test_hallucination_major_triggers_review() -> None:
     """A major-severity hallucination must flag the row for human review even
     when confidence is high and quality_score is not sentinel."""
@@ -513,8 +594,12 @@ def test_hallucination_major_triggers_review() -> None:
         "quality_score": 7,
         "confidence_score": 5,
         "hallucination_claims": [
-            {"claim": "...", "source_quote": "...",
-             "category": "contradiction", "severity": "major"},
+            {
+                "claim": "...",
+                "source_quote": "...",
+                "category": "contradiction",
+                "severity": "major",
+            },
         ],
     }
     assert needs_human_review(parsed) is True
@@ -526,8 +611,12 @@ def test_minor_hallucination_does_not_trigger_review_alone() -> None:
         "quality_score": 7,
         "confidence_score": 4,
         "hallucination_claims": [
-            {"claim": "...", "source_quote": "...",
-             "category": "omitted_caveat", "severity": "minor"},
+            {
+                "claim": "...",
+                "source_quote": "...",
+                "category": "omitted_caveat",
+                "severity": "minor",
+            },
         ],
     }
     assert needs_human_review(parsed) is False

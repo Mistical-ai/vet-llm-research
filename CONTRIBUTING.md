@@ -42,4 +42,5 @@ change matters for reproducibility, safety, or validity.
   `docs/phase3/` guide.
 - New run outputs are written under `runs/<run_id>/` or ignored local `data/`,
   not committed as ad hoc files.
-- New dependencies are reflected in the requirements input and lock files.
+- New dependencies are reflected in the requirements input and lock files, and
+  `python scripts/check_requirements_lock.py` passes.

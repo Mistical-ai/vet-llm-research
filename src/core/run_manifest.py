@@ -10,6 +10,7 @@ these outputs?
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from pathlib import Path
 
 from core.hashing import sha256_file
 from core.paths import REPO_ROOT, RUNS_DIR, resolve_repo_path
-from core.schemas import RunManifest
+from core.schemas import RunManifest, utc_now_iso
 
 
 def create_run_id(prefix: str = "run") -> str:
@@ -46,7 +47,28 @@ def _git_value(args: list[str]) -> str | None:
 
 def collect_git_metadata() -> tuple[str | None, str | None]:
     """Return (branch, sha) for the current checkout."""
-    return _git_value(["branch", "--show-current"]), _git_value(["rev-parse", "HEAD"])
+    branch = _git_value(["branch", "--show-current"]) or os.getenv("GITHUB_REF_NAME")
+    sha = (
+        _git_value(["rev-parse", "HEAD"])
+        or os.getenv("GITHUB_SHA")
+        or os.getenv("GIT_COMMIT")
+        or os.getenv("SOURCE_VERSION")
+    )
+    return branch or "unknown", sha or "unknown"
+
+
+def repo_relative_path(path: str | Path) -> str:
+    """Return a stable repo-relative path when possible."""
+    resolved = resolve_repo_path(path)
+    try:
+        return str(resolved.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
+def _normalize_artifact_paths(paths: dict[str, str] | None) -> dict[str, str]:
+    """Store artifact locations in a cross-machine form where possible."""
+    return {name: repo_relative_path(path) for name, path in (paths or {}).items()}
 
 
 def hash_existing_files(paths: Iterable[str | Path]) -> dict[str, str]:
@@ -84,7 +106,7 @@ def build_run_manifest(
     return RunManifest(
         run_id=run_id,
         benchmark_name=benchmark_name,
-        started_utc=datetime.now(UTC).isoformat(),
+        started_utc=utc_now_iso(),
         git_sha=sha,
         git_branch=branch,
         python_version=sys.version.replace("\n", " "),
@@ -98,7 +120,7 @@ def build_run_manifest(
         cli_args=cli_args,
         selected_instance_ids=selected_instance_ids or [],
         model_ids=model_ids or {},
-        artifact_paths=artifact_paths or {},
+        artifact_paths=_normalize_artifact_paths(artifact_paths),
     )
 
 
@@ -119,8 +141,10 @@ def finalize_run_manifest(path: Path, **updates: object) -> RunManifest:
     versions, or artifact paths without losing the start-time provenance.
     """
     data = json.loads(path.read_text(encoding="utf-8"))
+    if "artifact_paths" in updates and isinstance(updates["artifact_paths"], dict):
+        updates["artifact_paths"] = _normalize_artifact_paths(updates["artifact_paths"])
     data.update(updates)
-    data["finished_utc"] = datetime.now(UTC).isoformat()
+    data["finished_utc"] = utc_now_iso()
     manifest = RunManifest.model_validate(data)
     write_run_manifest(manifest, path.parent)
     return manifest

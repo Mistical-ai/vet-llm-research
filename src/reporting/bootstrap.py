@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 from statistics import mean
 
+from core.constants import get_random_seed
+
 
 def percentile(values: list[float], q: float) -> float:
     """Return a simple percentile from sorted values."""
@@ -22,7 +24,7 @@ def bootstrap_mean_ci(
     values: list[float],
     *,
     reps: int = 1000,
-    seed: int = 42,
+    seed: int | None = None,
     confidence: float = 0.95,
 ) -> dict[str, float]:
     """Return deterministic bootstrap CI for a mean.
@@ -34,7 +36,7 @@ def bootstrap_mean_ci(
     clean = [float(value) for value in values if value is not None]
     if not clean:
         return {"mean": 0.0, "low": 0.0, "high": 0.0}
-    rng = random.Random(seed)
+    rng = random.Random(get_random_seed() if seed is None else seed)
     estimates: list[float] = []
     for _ in range(reps):
         sample = [rng.choice(clean) for _ in clean]

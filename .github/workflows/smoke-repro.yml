@@ -27,6 +27,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev-lock.txt
 
+      - name: Check dependency lock consistency
+        run: python scripts/check_requirements_lock.py
+
       - name: Verify frozen set and manifest helpers
         run: |
           python - <<'PY'
@@ -36,16 +39,29 @@ jobs:
 
           sys.path.insert(0, str(Path("src").resolve()))
 
-          from core.hashing import dataset_hash
+          from core.hashing import dataset_hash, sha256_file
           from core.run_manifest import build_run_manifest, write_run_manifest
+          from core.schemas import RunManifest
           from validation.frozen_sets import load_frozen_set
+
+          expected_hashes = {
+              "requirements-lock.txt": "111be697ce522b13067ac8717c53f03d6e1d0bb0b8252ed86b42707a01265e51",
+              "llm-sum/prompts/judge_medhelm_v1.txt": "5da767424973c5cd1e07cf8629c03120edcda0ecb042b7139349bbdcd0511ab5",
+              "configs/phase4_medhelm_eval.yaml": "cb4d12025fa4a65b4518f1b84d1801b84498ee0965e08a38daa573392c34f2e3",
+          }
+          for path, expected in expected_hashes.items():
+              assert sha256_file(Path(path)) == expected
 
           manifest = json.loads(Path("frozen_sets/example_medhelm_tiny.manifest.json").read_text())
           rows = load_frozen_set(Path("frozen_sets/example_medhelm_tiny.jsonl"), manifest["sha256"])
           assert len(rows) == 2
+          assert manifest["row_count"] == len(rows)
           assert dataset_hash(rows) == manifest["sha256"]
 
           run_dir = Path("runs/smoke-repro")
+          evaluations_path = run_dir / "evaluations.jsonl"
+          evaluations_path.parent.mkdir(parents=True, exist_ok=True)
+          evaluations_path.write_text("", encoding="utf-8")
           run_manifest = build_run_manifest(
               run_id="smoke-repro",
               benchmark_name="vet_lit_summary_medhelm",
@@ -56,8 +72,14 @@ jobs:
               prompt_paths=["llm-sum/prompts/judge_medhelm_v1.txt"],
               config_paths=["configs/phase4_medhelm_eval.yaml"],
               dataset_hash=manifest["sha256"],
+              artifact_paths={"evaluations": evaluations_path},
           )
           path = write_run_manifest(run_manifest, run_dir)
           assert path.exists()
-          assert json.loads(path.read_text())["dataset_hash"] == manifest["sha256"]
+          data = json.loads(path.read_text())
+          assert RunManifest.model_validate(data).dataset_hash == manifest["sha256"]
+          assert data["dataset_hash"] == manifest["sha256"]
+          assert data["selected_instance_ids"] == [row["instance_id"] for row in rows]
+          assert data["artifact_paths"]["evaluations"].endswith("evaluations.jsonl")
+          assert evaluations_path.exists()
           PY

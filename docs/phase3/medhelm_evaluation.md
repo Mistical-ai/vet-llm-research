@@ -477,6 +477,19 @@ After evaluation, you can summarize rows without any API calls:
 python llm-sum/run_phase3.py eval-report
 ```
 
+For manuscript-grade frozen-set runs, keep legacy outputs by default or opt into
+run-scoped artifacts explicitly:
+
+```powershell
+python llm-sum/run_phase3.py evaluate --mode test --frozen-set frozen_sets/example_medhelm_tiny.jsonl
+python llm-sum/run_phase3.py evaluate --mode test --frozen-set frozen_sets/example_medhelm_tiny.jsonl --run-id phase4_medhelm_test
+```
+
+`--frozen-set` requires the matching `.manifest.json` sidecar checksum. Adding
+`--run-id` or `--run-dir` writes `evaluations.jsonl` and `run_manifest.json`
+under `runs/<run_id>/`; without those flags, existing `data/evaluations.jsonl`
+compatibility is preserved.
+
 Example console output:
 
 ```text
@@ -515,6 +528,7 @@ For machine-readable output:
 
 ```powershell
 python llm-sum/run_phase3.py eval-report --json
+python llm-sum/run_phase3.py eval-report --output-dir runs/phase4_medhelm_test/reports --bootstrap-reps 1000 --seed 42
 ```
 
 ## Live Evaluation

@@ -9,7 +9,7 @@ scripts can migrate gradually instead of rewriting every entrypoint at once.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -180,4 +180,4 @@ class ProviderResponse(StrictBaseModel):
 
 def utc_now_iso() -> str:
     """Return an ISO UTC timestamp for manifests and records."""
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")

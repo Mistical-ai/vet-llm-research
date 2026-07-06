@@ -118,8 +118,8 @@ cd vet-llm-research
 python -m venv .venv
 .venv\Scripts\activate          # Windows PowerShell
 
-# 3. Install dependencies
-pip install -r requirements.txt
+# 3. Install locked dependencies
+pip install -r requirements-dev-lock.txt
 
 # 4. Copy the environment template and fill it in
 copy .env.template .env

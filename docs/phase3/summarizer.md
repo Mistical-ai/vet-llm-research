@@ -140,7 +140,7 @@ That produces 6 summaries for the same paper: 3 from the processed JSONL text an
 | `[phase3:safety] Confirmation not received; aborting.`        | You typed something other than `yes` at the prompt.                  | Re-run; type exactly `yes`. Pass `--force` for unattended/overnight runs.            |
 | `Cannot start Phase 3 summarization with BUDGET_HARD_STOP=$0.00` or hard-stop output | The budget cap in `.env` is still zero or has been exceeded. | Set a positive `BUDGET_HARD_STOP` before paid modes, or stay in `PHASE3_MODE=test`; partial progress is on disk. |
 | Provider returns HTTP 429 repeatedly                          | Rate limit; the retry loop sleeps but the QPS may still be too high. | Raise `RATE_LIMIT_<PROVIDER>` in `.env`.                                             |
-| Provider fails with a schema/validation error                  | The model response did not satisfy `VeterinarySummary`, or the provider SDK does not support the requested structured-output feature. | Check SDK versions from `requirements.txt`, then retry in `single` mode.             |
+| Provider fails with a schema/validation error                  | The model response did not satisfy `VeterinarySummary`, or the provider SDK does not support the requested structured-output feature. | Check SDK versions from `requirements-lock.txt`, then retry in `single` mode.        |
 | `model_version` looks like `gpt-5.4` (no date suffix)         | Some providers return only the alias for niche models.               | Not a bug — Anthropic and OpenAI usually return the dated string for production models. |
 
 ## Worked example

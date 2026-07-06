@@ -81,10 +81,7 @@ def _summarize_all_output_set() -> str:
     normalized = raw.replace("_", "-")
     if normalized in SUMMARIZE_ALL_OUTPUT_SETS:
         return normalized
-    print(
-        f"[phase3] WARNING: invalid SUMMARIZE_ALL_OUTPUT_SET={raw!r}; "
-        "using 'auto'."
-    )
+    print(f"[phase3] WARNING: invalid SUMMARIZE_ALL_OUTPUT_SET={raw!r}; " "using 'auto'.")
     return "auto"
 
 
@@ -119,18 +116,22 @@ def _summarize_all_output_dirs(
 # extract
 # ---------------------------------------------------------------------------
 
+
 def cmd_extract(args: argparse.Namespace) -> int:
     # Extract is mode-agnostic (no API calls), but we still print the
     # banner so the user knows what the next steps will do.
     print(resolve_mode(args.mode).banner())
     from prepare_texts import main as prepare_main
-    return prepare_main(["--manifest", str(args.manifest)] +
-                        (["--limit", str(args.limit)] if args.limit else []))
+
+    return prepare_main(
+        ["--manifest", str(args.manifest)] + (["--limit", str(args.limit)] if args.limit else [])
+    )
 
 
 # ---------------------------------------------------------------------------
 # summarize  (with --estimate short-circuit)
 # ---------------------------------------------------------------------------
+
 
 def cmd_summarize(args: argparse.Namespace) -> int:
     profile = resolve_mode(args.mode)
@@ -148,12 +149,15 @@ def cmd_summarize(args: argparse.Namespace) -> int:
             # Direct-PDF billing depends on each provider's file-ingestion path,
             # so an offline tokenizer cannot predict it reliably. The live
             # single-paper run records real token counts and cost after each call.
-            print("[phase3:estimate] Direct PDF cost cannot be estimated offline. "
-                  "Run single mode to record real token counts from the providers.")
+            print(
+                "[phase3:estimate] Direct PDF cost cannot be estimated offline. "
+                "Run single mode to record real token counts from the providers."
+            )
             return 1
         # Import lazily so a missing tiktoken / SDK doesn't break other commands.
         import os
         from cost_estimator import run as run_estimate
+
         judges = [j.strip() for j in os.getenv("JUDGE_MODELS", "openai").split(",") if j.strip()]
         run_estimate(
             batched=profile.use_batch,
@@ -163,6 +167,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         return 0
 
     from summarizer import main as summarize_main
+
     delegate = ["--mode", profile.name]
     if args.limit is not None:
         delegate += ["--limit", str(args.limit)]
@@ -185,6 +190,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
 # evaluate helpers (journal-stratified sampling)
 # ---------------------------------------------------------------------------
 
+
 def _iter_summaries_simple(summaries_path: Path):
     """Minimal summary iterator used by journal-stratified helpers."""
     if not summaries_path.exists():
@@ -200,9 +206,7 @@ def _iter_summaries_simple(summaries_path: Path):
                 continue
 
 
-def _load_summaries_by_journal(
-    summaries_path: Path, manifest_path: Path
-) -> dict[str, list[dict]]:
+def _load_summaries_by_journal(summaries_path: Path, manifest_path: Path) -> dict[str, list[dict]]:
     """Group summary entries by journal name (lowercased).
 
     summaries.jsonl entries may not carry a journal field. We build a
@@ -228,9 +232,8 @@ def _load_summaries_by_journal(
     by_journal: dict[str, list[dict]] = {}
     for entry in _iter_summaries_simple(summaries_path):
         doi = str(entry.get("doi", "")).strip()
-        journal = (
-            str(entry.get("journal", "")).strip().lower()
-            or doi_to_journal.get(doi, "unknown")
+        journal = str(entry.get("journal", "")).strip().lower() or doi_to_journal.get(
+            doi, "unknown"
         )
         by_journal.setdefault(journal, []).append(entry)
     return by_journal
@@ -259,18 +262,22 @@ def _sample_by_journal(
     return doi_filter, journal_map
 
 
-def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]]) -> None:
+def _print_reveal_table(
+    doi_filter: set[str],
+    journal_map: dict[str, list[str]],
+    evaluations_path: Path = EVALUATIONS_PATH,
+) -> None:
     """Print the post-evaluation identity reveal table.
 
     Called AFTER run_evaluation() completes — never before — so model
     identities are not visible during scoring (blind protocol).
     """
-    if not EVALUATIONS_PATH.exists():
+    if not evaluations_path.exists():
         return
 
     # Build lookup: doi → list of evaluation rows
     rows_by_doi: dict[str, list[dict]] = {}
-    with open(EVALUATIONS_PATH, encoding="utf-8") as f:
+    with open(evaluations_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -292,8 +299,10 @@ def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]])
     print("  EVALUATION COMPLETE  ·  IDENTITY REVEAL")
     print("  (Summaries were scored blind; identities shown only now)")
     print("=" * 68)
-    print(f"  {'Journal':<16} {'Summarizer':<14} {'Judge':<10} "
-          f"{'Score':>5}  {'Halluc':>6}  {'Review?':>7}")
+    print(
+        f"  {'Journal':<16} {'Summarizer':<14} {'Judge':<10} "
+        f"{'Score':>5}  {'Halluc':>6}  {'Review?':>7}"
+    )
     print("  " + "-" * 64)
 
     total_cost = 0.0
@@ -301,9 +310,7 @@ def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]])
     for doi in sorted(doi_filter):
         journal = doi_to_journal.get(doi, "unknown")
         for row in rows_by_doi.get(doi, []):
-            score_disp = (
-                f"{row.get('composite_score', row.get('quality_score', '?'))}"
-            )
+            score_disp = f"{row.get('composite_score', row.get('quality_score', '?'))}"
             halluc = row.get("hallucination_count", "?")
             review = "Yes" if row.get("requires_human_review") else "No"
             summarizer = str(row.get("summarizer", "?"))
@@ -314,6 +321,7 @@ def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]])
             # Approximate cost from token counts (display only)
             try:
                 from models_config import compute_cost
+
                 cost = compute_cost(
                     judge,
                     int(row.get("input_tokens") or 0),
@@ -323,8 +331,10 @@ def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]])
                 total_cost += cost
             except Exception:
                 pass
-            print(f"  {journal:<16} {summarizer:<14} {judge:<10} "
-                  f"{score_disp:>5}  {str(halluc):>6}  {review:>7}")
+            print(
+                f"  {journal:<16} {summarizer:<14} {judge:<10} "
+                f"{score_disp:>5}  {str(halluc):>6}  {review:>7}"
+            )
 
     print("=" * 68)
     if judge_model_seen:
@@ -334,19 +344,37 @@ def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]])
     print("=" * 68 + "\n")
 
 
+def _collect_resolved_judge_versions(path: Path, judges: list[str]) -> dict[str, str]:
+    """Read observed judge model versions from an evaluation artifact."""
+    versions: dict[str, str] = {}
+    if not path.exists():
+        return versions
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            judge = str(row.get("judge") or "")
+            version = str(row.get("judge_model_version") or "")
+            if judge in judges and version:
+                versions.setdefault(judge, version)
+    return versions
+
+
 # ---------------------------------------------------------------------------
 # evaluate
 # ---------------------------------------------------------------------------
+
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
     profile = resolve_mode(args.mode)
     print(profile.banner())
 
-    judges = (
-        [j.strip() for j in args.judges.split(",") if j.strip()]
-        if args.judges else None
-    )
-    active_judges = judges or [j.strip() for j in os.getenv("JUDGE_MODELS", "openai").split(",") if j.strip()]
+    judges = [j.strip() for j in args.judges.split(",") if j.strip()] if args.judges else None
+    active_judges = judges or [
+        j.strip() for j in os.getenv("JUDGE_MODELS", "openai").split(",") if j.strip()
+    ]
 
     # Optional reproducibility mode: load a frozen DOI set and/or write a run
     # manifest under runs/<run_id>. When omitted, the historical data/*.jsonl
@@ -358,10 +386,14 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     selected_instance_ids: list[str] = []
     dataset_digest = None
     if args.frozen_set:
+        from validation.frozen_sets import FrozenSetChecksumError, load_frozen_set
         from core.hashing import dataset_hash
-        from validation.frozen_sets import load_frozen_set
 
-        frozen_rows = load_frozen_set(args.frozen_set)
+        try:
+            frozen_rows = load_frozen_set(args.frozen_set, require_manifest=True)
+        except FrozenSetChecksumError as exc:
+            print(f"[phase3:evaluate] {exc}")
+            return 1
         frozen_dois = {str(row.get("doi", "")).strip() for row in frozen_rows if row.get("doi")}
         selected_instance_ids = [
             str(row.get("instance_id") or row.get("doi"))
@@ -370,12 +402,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         ]
         dataset_digest = dataset_hash(frozen_rows)
 
-    if args.run_id or args.run_dir or args.frozen_set:
+    if args.run_id or args.run_dir:
+        from core.constants import get_random_seed
         from core.run_manifest import build_run_manifest, resolve_run_dir, write_run_manifest
 
         run_dir = resolve_run_dir(args.run_id, args.run_dir)
         output_path = run_dir / "evaluations.jsonl"
-        seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
+        seed = get_random_seed()
         manifest = build_run_manifest(
             run_id=run_dir.name,
             benchmark_name=os.getenv("EVAL_BENCHMARK_NAME", "vet_lit_summary_medhelm"),
@@ -384,7 +417,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             cli_args=sys.argv[1:],
             selected_instance_ids=selected_instance_ids,
             prompt_paths=[os.getenv("JUDGE_PROMPT_FILE", "llm-sum/prompts/judge_medhelm_v1.txt")],
-            config_paths=["configs/phase4_medhelm_eval.yaml", "llm-sum/eval_config/medhelm_vet_summary.yaml"],
+            config_paths=[
+                "configs/phase4_medhelm_eval.yaml",
+                "llm-sum/eval_config/medhelm_vet_summary.yaml",
+            ],
             dataset_hash=dataset_digest,
             model_ids={judge: os.getenv(f"{judge.upper()}_MODEL", "") for judge in active_judges},
             artifact_paths={"evaluations": str(output_path)},
@@ -412,7 +448,9 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                     "run_manifest": str(manifest_path),
                 },
                 selected_instance_ids=selected_instance_ids or sorted(frozen_dois or []),
-                resolved_model_versions={},
+                resolved_model_versions=_collect_resolved_judge_versions(
+                    output_path, active_judges
+                ),
             )
         return 0 if counts.get("failed", 0) == 0 else 1
 
@@ -430,13 +468,17 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     unknown_entries = by_journal.pop("unknown", []) if by_journal else []
     if unknown_entries:
         unknown_dois = [str(e.get("doi", "?")) for e in unknown_entries]
-        msg_lines = [
-            f"[phase3:evaluate] WARNING: {len(unknown_dois)} summaries could not be "
-            "mapped to a journal and will be excluded from stratified sampling.",
-            "  DOIs without a journal mapping in manifest.jsonl:",
-        ] + [f"    {d}" for d in unknown_dois] + [
-            "  Add the journal field to manifest.jsonl to include these articles.",
-        ]
+        msg_lines = (
+            [
+                f"[phase3:evaluate] WARNING: {len(unknown_dois)} summaries could not be "
+                "mapped to a journal and will be excluded from stratified sampling.",
+                "  DOIs without a journal mapping in manifest.jsonl:",
+            ]
+            + [f"    {d}" for d in unknown_dois]
+            + [
+                "  Add the journal field to manifest.jsonl to include these articles.",
+            ]
+        )
         for line in msg_lines:
             print(line)
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -446,11 +488,15 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             lf.write(f"\n[{ts}]\n" + "\n".join(msg_lines) + "\n")
 
     if frozen_dois is None and not by_journal:
-        print("[phase3:evaluate] No journal-mapped summaries found. "
-              "Run 'extract' and 'summarize' first, or check manifest.jsonl.")
+        print(
+            "[phase3:evaluate] No journal-mapped summaries found. "
+            "Run 'extract' and 'summarize' first, or check manifest.jsonl."
+        )
         return 1
 
-    seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
+    from core.constants import get_random_seed
+
+    seed = get_random_seed()
     if frozen_dois is None:
         per_journal = (
             args.limit
@@ -491,16 +537,17 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 "run_manifest": str(manifest_path),
             },
             selected_instance_ids=selected_instance_ids or sorted(doi_filter),
-            resolved_model_versions={},
+            resolved_model_versions=_collect_resolved_judge_versions(output_path, active_judges),
         )
 
-    _print_reveal_table(doi_filter, journal_map)
+    _print_reveal_table(doi_filter, journal_map, output_path or EVALUATIONS_PATH)
     return 0 if counts.get("failed", 0) == 0 else 1
 
 
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
+
 
 def cmd_status(args: argparse.Namespace) -> int:
     print(resolve_mode(args.mode).banner())
@@ -529,8 +576,10 @@ def cmd_status(args: argparse.Namespace) -> int:
                     per_model[prov][status] = per_model[prov].get(status, 0) + 1
     print(f"[phase3:status] data/summaries.jsonl  : {paper_total} papers")
     for prov, c in per_model.items():
-        print(f"    {prov:>10}: success={c.get('success',0)} "
-              f"failed={c.get('failed',0)} pending={c.get('pending',0)}")
+        print(
+            f"    {prov:>10}: success={c.get('success',0)} "
+            f"failed={c.get('failed',0)} pending={c.get('pending',0)}"
+        )
 
     eval_total = 0
     requires_review = 0
@@ -547,14 +596,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                 eval_total += 1
                 if row.get("requires_human_review"):
                     requires_review += 1
-    print(f"[phase3:status] data/evaluations.jsonl: {eval_total} rows "
-          f"({requires_review} flagged for human review)")
+    print(
+        f"[phase3:status] data/evaluations.jsonl: {eval_total} rows "
+        f"({requires_review} flagged for human review)"
+    )
     return 0
 
 
 def cmd_eval_report(args: argparse.Namespace) -> int:
     """Print read-only aggregate reports for MedHELM-style evaluation rows."""
     from eval_report import main as report_main
+
     delegate = ["--evaluations", str(args.evaluations)]
     if args.json:
         delegate.append("--json")
@@ -562,13 +614,15 @@ def cmd_eval_report(args: argparse.Namespace) -> int:
         delegate += ["--output-dir", str(args.output_dir)]
     if args.bootstrap_reps:
         delegate += ["--bootstrap-reps", str(args.bootstrap_reps)]
-    delegate += ["--seed", str(args.seed)]
+    if args.seed is not None:
+        delegate += ["--seed", str(args.seed)]
     return report_main(delegate)
 
 
 # ---------------------------------------------------------------------------
 # clean
 # ---------------------------------------------------------------------------
+
 
 def cmd_clean(_args: argparse.Namespace) -> int:
     if BATCH_DIR.exists():
@@ -585,6 +639,7 @@ def cmd_clean(_args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # summarize-all  (folder-based: data/raw/*.pdf + data/processed/*.jsonl)
 # ---------------------------------------------------------------------------
+
 
 def _paired_summary_stems(
     limit: int | None,
@@ -636,8 +691,10 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     print(profile.banner())
 
     if profile.use_batch:
-        print("[phase3:summarize-all] batch mode is not supported because direct PDF "
-              "summarisation is real-time only. Use --mode single or --mode dev.")
+        print(
+            "[phase3:summarize-all] batch mode is not supported because direct PDF "
+            "summarisation is real-time only. Use --mode single or --mode dev."
+        )
         return 1
 
     from summarizer import (
@@ -648,8 +705,7 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
     )
 
     providers = (
-        [p.strip() for p in args.providers.split(",") if p.strip()]
-        if args.providers else None
+        [p.strip() for p in args.providers.split(",") if p.strip()] if args.providers else None
     )
     try:
         prompt_templates, guide_summary, resolved_guide_path, _prompt_paths = (
@@ -674,24 +730,32 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
         else (1 if profile.name in {"test", "single"} else profile.paper_limit)
     )
     if args.limit is None and profile.name in {"test", "single"}:
-        print(f"[phase3:summarize-all] {profile.name} mode defaults to --limit 1; "
-              "pass --limit N to create more matched comparison files.")
+        print(
+            f"[phase3:summarize-all] {profile.name} mode defaults to --limit 1; "
+            "pass --limit N to create more matched comparison files."
+        )
     elif args.limit is None and profile.name == "dev":
-        print("[phase3:summarize-all] dev mode defaults to "
-              f"PHASE3_DEV_LIMIT={effective_limit} matched article pairs.")
+        print(
+            "[phase3:summarize-all] dev mode defaults to "
+            f"PHASE3_DEV_LIMIT={effective_limit} matched article pairs."
+        )
     random_match = _summarize_all_random_match()
     unique_output = _summarize_all_unique_output()
     paired_stems = _paired_summary_stems(effective_limit, random_match=random_match)
     if not paired_stems:
-        print("[phase3:summarize-all] No matching article stems found between "
-              "data/raw/*.pdf and data/processed/*.jsonl.")
+        print(
+            "[phase3:summarize-all] No matching article stems found between "
+            "data/raw/*.pdf and data/processed/*.jsonl."
+        )
         return 1
     print(f"[phase3:summarize-all] paired articles selected: {len(paired_stems)}")
     if effective_limit is not None and len(paired_stems) < effective_limit:
-        print("[phase3:summarize-all] WARNING: requested "
-              f"{effective_limit} matched pairs, but only found {len(paired_stems)}. "
-              "Only stems present in both data/raw/*.pdf and "
-              "data/processed/*.jsonl can be processed.")
+        print(
+            "[phase3:summarize-all] WARNING: requested "
+            f"{effective_limit} matched pairs, but only found {len(paired_stems)}. "
+            "Only stems present in both data/raw/*.pdf and "
+            "data/processed/*.jsonl can be processed."
+        )
     print(f"[phase3:summarize-all] random match: {str(random_match).lower()}")
     output_suffix = _summary_run_suffix() if unique_output else None
     if output_suffix:
@@ -727,8 +791,9 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
         output_suffix=output_suffix,
     )
 
-    total = {k: pdf_counts.get(k, 0) + txt_counts.get(k, 0)
-             for k in set(pdf_counts) | set(txt_counts)}
+    total = {
+        k: pdf_counts.get(k, 0) + txt_counts.get(k, 0) for k in set(pdf_counts) | set(txt_counts)
+    }
     pdf_cost = float(getattr(pdf_counts, "budget_spent", 0.0))
     txt_cost = float(getattr(txt_counts, "budget_spent", 0.0))
     combined_cost = pdf_cost + txt_cost
@@ -744,6 +809,7 @@ def cmd_summarize_all(args: argparse.Namespace) -> int:
 # CLI wiring
 # ---------------------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_phase3.py",
@@ -754,9 +820,12 @@ def build_parser() -> argparse.ArgumentParser:
     # --mode is shared by every subcommand: any of test|single|dev|batch
     # overrides PHASE3_MODE from .env for this invocation only.
     def _add_mode_arg(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--mode", choices=VALID_MODES, default=None,
-                       help="Override PHASE3_MODE for this run "
-                            "(test|single|dev|batch).")
+        p.add_argument(
+            "--mode",
+            choices=VALID_MODES,
+            default=None,
+            help="Override PHASE3_MODE for this run " "(test|single|dev|batch).",
+        )
 
     p_extract = sub.add_parser("extract", help="Build data/processed/*.jsonl cache.")
     _add_mode_arg(p_extract)
@@ -766,44 +835,70 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sum = sub.add_parser("summarize", help="Run the three summarisers.")
     _add_mode_arg(p_sum)
-    p_sum.add_argument("--limit", type=int, default=None,
-                       help="Override the mode's paper_limit (e.g. --limit 1).")
-    p_sum.add_argument("--estimate", action="store_true",
-                       help="Print projected cost (uses tiktoken on cached texts); no API calls.")
-    p_sum.add_argument("--resume", action="store_true",
-                       help="Skip (doi, model) pairs already at status=success.")
-    p_sum.add_argument("--force", action="store_true",
-                       help="Bypass interactive confirmation. USE WITH CAUTION.")
-    p_sum.add_argument("--providers", default=None,
-                       help="Comma-separated subset of providers.")
+    p_sum.add_argument(
+        "--limit", type=int, default=None, help="Override the mode's paper_limit (e.g. --limit 1)."
+    )
+    p_sum.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Print projected cost (uses tiktoken on cached texts); no API calls.",
+    )
+    p_sum.add_argument(
+        "--resume", action="store_true", help="Skip (doi, model) pairs already at status=success."
+    )
+    p_sum.add_argument(
+        "--force", action="store_true", help="Bypass interactive confirmation. USE WITH CAUTION."
+    )
+    p_sum.add_argument("--providers", default=None, help="Comma-separated subset of providers.")
     p_sum.add_argument("--manifest", type=Path, default=None)
-    p_sum.add_argument("--input-source", choices=("processed", "raw_text", "pdf"),
-                       default="processed",
-                       help=("Input to summarize: processed JSONL (default), raw_text JSONL, "
-                             "or pdf for direct PDF comparison in test/single only."))
-    p_sum.add_argument("--guide-summary", type=Path, default=None,
-                       help=("Optional human-written format guide file. The guide controls "
-                             "section style only; facts must still come from the target paper."))
+    p_sum.add_argument(
+        "--input-source",
+        choices=("processed", "raw_text", "pdf"),
+        default="processed",
+        help=(
+            "Input to summarize: processed JSONL (default), raw_text JSONL, "
+            "or pdf for direct PDF comparison in test/single only."
+        ),
+    )
+    p_sum.add_argument(
+        "--guide-summary",
+        type=Path,
+        default=None,
+        help=(
+            "Optional human-written format guide file. The guide controls "
+            "section style only; facts must still come from the target paper."
+        ),
+    )
     p_sum.set_defaults(func=cmd_summarize)
 
     p_sum_all = sub.add_parser(
         "summarize-all",
         help="Summarize paired PDFs (data/raw/) and processed texts (data/processed/) "
-             "with OpenAI, Anthropic, and Gemini. "
-             "Outputs readable .txt files; dev mode defaults to data/dev_tests/.",
+        "with OpenAI, Anthropic, and Gemini. "
+        "Outputs readable .txt files; dev mode defaults to data/dev_tests/.",
     )
     _add_mode_arg(p_sum_all)
-    p_sum_all.add_argument("--limit", type=int, default=None,
-                            help=("Override the paired article limit. Without this, "
-                                  "test/single/dev process 1 matched PDF + 1 "
-                                  "matched processed text."))
-    p_sum_all.add_argument("--resume", action="store_true",
-                            help="Skip provider slots already at status=success.")
-    p_sum_all.add_argument("--force", action="store_true",
-                            help="Bypass interactive confirmation. USE WITH CAUTION.")
-    p_sum_all.add_argument("--providers", default=None,
-                            help="Comma-separated subset of providers "
-                                 "(default: openai,anthropic,gemini).")
+    p_sum_all.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Override the paired article limit. Without this, "
+            "test/single/dev process 1 matched PDF + 1 "
+            "matched processed text."
+        ),
+    )
+    p_sum_all.add_argument(
+        "--resume", action="store_true", help="Skip provider slots already at status=success."
+    )
+    p_sum_all.add_argument(
+        "--force", action="store_true", help="Bypass interactive confirmation. USE WITH CAUTION."
+    )
+    p_sum_all.add_argument(
+        "--providers",
+        default=None,
+        help="Comma-separated subset of providers " "(default: openai,anthropic,gemini).",
+    )
     p_sum_all.add_argument(
         "--output-set",
         choices=SUMMARIZE_ALL_OUTPUT_SETS,
@@ -820,20 +915,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_eval = sub.add_parser("evaluate", help="Run the blind judge.")
     _add_mode_arg(p_eval)
-    p_eval.add_argument("--limit", type=int, default=None,
-                        help="Override the mode's paper_limit.")
-    p_eval.add_argument("--judges", default=None,
-                        help="Comma-separated judge provider keys.")
-    p_eval.add_argument("--no-resume", action="store_true",
-                        help="Re-evaluate even pairs already in evaluations.jsonl.")
-    p_eval.add_argument("--force", action="store_true",
-                        help="Bypass confirmation. USE WITH CAUTION.")
-    p_eval.add_argument("--run-id", default=None,
-                        help="Optional immutable run id under runs/<run_id>.")
-    p_eval.add_argument("--run-dir", type=Path, default=None,
-                        help="Optional explicit output directory for run artifacts.")
-    p_eval.add_argument("--frozen-set", type=Path, default=None,
-                        help="Optional frozen_sets/*.jsonl file; limits evaluation to those DOIs.")
+    p_eval.add_argument("--limit", type=int, default=None, help="Override the mode's paper_limit.")
+    p_eval.add_argument("--judges", default=None, help="Comma-separated judge provider keys.")
+    p_eval.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Re-evaluate even pairs already in evaluations.jsonl.",
+    )
+    p_eval.add_argument(
+        "--force", action="store_true", help="Bypass confirmation. USE WITH CAUTION."
+    )
+    p_eval.add_argument(
+        "--run-id", default=None, help="Optional immutable run id under runs/<run_id>."
+    )
+    p_eval.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Optional explicit output directory for run artifacts.",
+    )
+    p_eval.add_argument(
+        "--frozen-set",
+        type=Path,
+        default=None,
+        help="Optional frozen_sets/*.jsonl file; limits evaluation to those DOIs.",
+    )
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_status = sub.add_parser("status", help="Print per-stage counts.")
@@ -842,14 +948,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_report = sub.add_parser("eval-report", help="Summarize evaluation rows by model and strata.")
     p_report.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
-    p_report.add_argument("--json", action="store_true",
-                          help="Print full report JSON instead of compact text.")
-    p_report.add_argument("--output-dir", type=Path, default=None,
-                          help="Optional directory for summary.json and CSV report exports.")
-    p_report.add_argument("--bootstrap-reps", type=int, default=1000,
-                          help="Bootstrap repetitions for confidence intervals.")
-    p_report.add_argument("--seed", type=int, default=42,
-                          help="Deterministic seed for bootstrap resampling.")
+    p_report.add_argument(
+        "--json", action="store_true", help="Print full report JSON instead of compact text."
+    )
+    p_report.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for summary.json and CSV report exports.",
+    )
+    p_report.add_argument(
+        "--bootstrap-reps",
+        type=int,
+        default=1000,
+        help="Bootstrap repetitions for confidence intervals.",
+    )
+    p_report.add_argument(
+        "--seed", type=int, default=None, help="Deterministic seed for bootstrap resampling."
+    )
     p_report.set_defaults(func=cmd_eval_report)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")

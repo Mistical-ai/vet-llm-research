@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from core.constants import get_random_seed
 from reporting.paired import all_pairwise_comparisons
 from reporting.stratified import stratified_summary, summarize_group
 
@@ -15,13 +16,14 @@ def build_report_payload(
     rows: list[dict[str, Any]],
     *,
     bootstrap_reps: int = 1000,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Build the standard report JSON payload."""
+    resolved_seed = get_random_seed() if seed is None else seed
     return {
         "schema_version": "report_v1",
-        "overall": summarize_group(rows, bootstrap_reps=bootstrap_reps, seed=seed),
-        "strata": stratified_summary(rows, bootstrap_reps=bootstrap_reps, seed=seed),
+        "overall": summarize_group(rows, bootstrap_reps=bootstrap_reps, seed=resolved_seed),
+        "strata": stratified_summary(rows, bootstrap_reps=bootstrap_reps, seed=resolved_seed),
         "paired_model_comparisons": all_pairwise_comparisons(rows),
     }
 
@@ -47,10 +49,11 @@ def write_standard_reports(
     rows: list[dict[str, Any]],
     *,
     bootstrap_reps: int = 1000,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict[str, str]:
     """Write JSON/CSV report artifacts and return their paths."""
-    payload = build_report_payload(rows, bootstrap_reps=bootstrap_reps, seed=seed)
+    resolved_seed = get_random_seed() if seed is None else seed
+    payload = build_report_payload(rows, bootstrap_reps=bootstrap_reps, seed=resolved_seed)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_json = output_dir / "summary.json"
     strata_csv = output_dir / "strata_summary.csv"

@@ -10,7 +10,7 @@ from reporting.stratified import score_value
 
 
 def _instance_key(row: dict[str, Any]) -> tuple[str, str]:
-    return (str(row.get("doi") or row.get("instance_id") or ""), str(row.get("input_source") or ""))
+    return (str(row.get("instance_id") or row.get("doi") or ""), str(row.get("input_source") or ""))
 
 
 def paired_deltas(
@@ -20,7 +20,7 @@ def paired_deltas(
     model_b: str,
 ) -> list[dict[str, Any]]:
     """Return per-instance score deltas for two summarizer models."""
-    by_instance: dict[tuple[str, str], dict[str, float]] = defaultdict(dict)
+    by_instance: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"scores": {}})
     for row in rows:
         summarizer = str(row.get("summarizer") or "")
         if summarizer not in {model_a, model_b}:
@@ -28,15 +28,19 @@ def paired_deltas(
         score = score_value(row)
         if score is None:
             continue
-        by_instance[_instance_key(row)][summarizer] = score
+        key = _instance_key(row)
+        by_instance[key]["scores"][summarizer] = score
+        by_instance[key].setdefault("doi", str(row.get("doi") or ""))
 
     deltas: list[dict[str, Any]] = []
-    for (doi, input_source), scores in sorted(by_instance.items()):
+    for (instance_id, input_source), payload in sorted(by_instance.items()):
+        scores = payload["scores"]
         if model_a not in scores or model_b not in scores:
             continue
         deltas.append(
             {
-                "doi": doi,
+                "instance_id": instance_id,
+                "doi": payload.get("doi") or instance_id,
                 "input_source": input_source,
                 "model_a": model_a,
                 "model_b": model_b,

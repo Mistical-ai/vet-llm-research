@@ -21,10 +21,18 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from core.constants import get_random_seed
 from reporting.exports import build_report_payload, write_standard_reports
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
-DEFAULT_GROUP_FIELDS = ("summarizer", "species", "study_design", "clinical_topic", "journal", "input_source")
+DEFAULT_GROUP_FIELDS = (
+    "summarizer",
+    "species",
+    "study_design",
+    "clinical_topic",
+    "journal",
+    "input_source",
+)
 
 
 def iter_evaluation_rows(path: Path | None = None) -> Iterable[dict[str, Any]]:
@@ -75,7 +83,9 @@ def _strata_value(row: dict[str, Any], field: str) -> str:
     return str(value or "unknown")
 
 
-def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarizer") -> list[dict[str, Any]]:
+def summarize_rows(
+    rows: Iterable[dict[str, Any]], group_field: str = "summarizer"
+) -> list[dict[str, Any]]:
     """Aggregate scores and reliability signals by one grouping field."""
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -93,20 +103,25 @@ def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarize
             for row in items
             if isinstance(row.get("judge_disagreement"), (int, float))
         ]
-        summary.append({
-            "group": group,
-            "n_rows": len(items),
-            "n_scored": len(scores),
-            "mean_score": round(sum(scores) / len(scores), 3) if scores else None,
-            "hallucination_rate": round(len(hallucination_rows) / len(items), 3) if items else 0.0,
-            "major_hallucination_rate": round(len(major_rows) / len(items), 3) if items else 0.0,
-            "low_confidence_rate": round(len(low_confidence) / len(items), 3) if items else 0.0,
-            "parse_failure_rate": round(len(malformed) / len(items), 3) if items else 0.0,
-            "mean_judge_disagreement": (
-                round(sum(disagreements) / len(disagreements), 3)
-                if disagreements else None
-            ),
-        })
+        summary.append(
+            {
+                "group": group,
+                "n_rows": len(items),
+                "n_scored": len(scores),
+                "mean_score": round(sum(scores) / len(scores), 3) if scores else None,
+                "hallucination_rate": (
+                    round(len(hallucination_rows) / len(items), 3) if items else 0.0
+                ),
+                "major_hallucination_rate": (
+                    round(len(major_rows) / len(items), 3) if items else 0.0
+                ),
+                "low_confidence_rate": round(len(low_confidence) / len(items), 3) if items else 0.0,
+                "parse_failure_rate": round(len(malformed) / len(items), 3) if items else 0.0,
+                "mean_judge_disagreement": (
+                    round(sum(disagreements) / len(disagreements), 3) if disagreements else None
+                ),
+            }
+        )
     return summary
 
 
@@ -114,10 +129,11 @@ def build_report(
     rows: Iterable[dict[str, Any]],
     *,
     bootstrap_reps: int = 1000,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Build a multi-stratum report from evaluation rows."""
     materialized = list(rows)
+    resolved_seed = get_random_seed() if seed is None else seed
     return {
         "overall": summarize_rows(materialized, group_field="benchmark_name"),
         "by_summarizer": summarize_rows(materialized, group_field="summarizer"),
@@ -129,7 +145,7 @@ def build_report(
         "uncertainty_aware": build_report_payload(
             materialized,
             bootstrap_reps=bootstrap_reps,
-            seed=seed,
+            seed=resolved_seed,
         ),
     }
 
@@ -138,12 +154,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Summarize MedHELM-style evaluation JSONL.")
     parser.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
     parser.add_argument("--json", action="store_true", help="Print full report JSON.")
-    parser.add_argument("--output-dir", type=Path, default=None,
-                        help="Optional directory for summary.json and CSV exports.")
-    parser.add_argument("--bootstrap-reps", type=int, default=1000,
-                        help="Bootstrap repetitions for uncertainty-aware reports.")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Deterministic seed for bootstrap resampling.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for summary.json and CSV exports.",
+    )
+    parser.add_argument(
+        "--bootstrap-reps",
+        type=int,
+        default=1000,
+        help="Bootstrap repetitions for uncertainty-aware reports.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Deterministic seed for bootstrap resampling."
+    )
     args = parser.parse_args(argv)
 
     rows = list(iter_evaluation_rows(args.evaluations))

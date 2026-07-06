@@ -10,6 +10,8 @@
 5. Run Phase 3 in `PHASE3_MODE=test` first to confirm mocks and paths.
 6. For live runs, execute the command manually in PowerShell after reviewing the
    budget guard and confirmation prompt.
+7. Use `--run-id` or `--run-dir` when you want immutable artifacts under
+   `runs/<run_id>/`; otherwise legacy `data/*.jsonl` paths are preserved.
 
 ## Required Artifacts
 
@@ -38,3 +40,6 @@ The run manifest records:
 
 Live API scripts must not be run by automation. CI and tests must use
 `PHASE3_MODE=test` and `DRY_RUN=true`.
+
+CI also runs the dependency lock checker and a tiny smoke-repro workflow that
+validates frozen-set checksums, stable hashes, and `run_manifest.json` shape.

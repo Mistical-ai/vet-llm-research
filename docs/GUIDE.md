@@ -116,10 +116,11 @@ The GitHub landing page. It explains the whole project at a high level and links
 A safe template showing every environment variable. It has placeholders for API keys and explains what each setting does.
 
 ```text
-requirements.txt
+requirements-lock.txt / requirements-dev-lock.txt
 ```
 
-Python package dependencies.
+Locked Python package dependencies used for local reproducibility and CI.
+`requirements.txt` remains a backward-compatible alias for runtime installs.
 
 ```text
 pipeline.py
