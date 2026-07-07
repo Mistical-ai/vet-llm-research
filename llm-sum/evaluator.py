@@ -90,13 +90,50 @@ EVALUATOR_VERSION = os.getenv("EVALUATOR_VERSION", "evaluator-medhelm-v1.0")
 # Criterion weights mirror llm-sum/eval_config/medhelm_vet_summary.yaml. The
 # Python copy is deliberate: evaluator math stays unit-testable and never relies
 # on the judge to perform arithmetic correctly.
-MEDHELM_CRITERION_WEIGHTS = {
+_DEFAULT_MEDHELM_CRITERION_WEIGHTS = {
     "faithfulness": 1.5,
     "completeness": 1.0,
     "clinical_usefulness": 1.2,
     "clarity": 0.8,
     "safety": 1.3,
 }
+
+
+def _load_criterion_weights() -> dict[str, float]:
+    """Read JURY_CRITERION_WEIGHTS (a JSON object) if set, else the default.
+
+    Lets a researcher customise clinical-risk weighting without touching code.
+    Falls back to the documented defaults on missing/invalid JSON so a typo in
+    .env can't silently corrupt every score.
+    """
+    raw = os.getenv("JURY_CRITERION_WEIGHTS")
+    if not raw:
+        return dict(_DEFAULT_MEDHELM_CRITERION_WEIGHTS)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and set(parsed) == set(_DEFAULT_MEDHELM_CRITERION_WEIGHTS):
+            return {k: float(v) for k, v in parsed.items()}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    print("[phase3:evaluate] JURY_CRITERION_WEIGHTS is invalid or missing a criterion; "
+          "using default weights.")
+    return dict(_DEFAULT_MEDHELM_CRITERION_WEIGHTS)
+
+
+MEDHELM_CRITERION_WEIGHTS = _load_criterion_weights()
+
+# The MedHELM-style flat mean: every criterion counts equally. Reuses
+# calculate_jury_score()'s weighted-average formula with all weights set to 1,
+# rather than a second formula, so both modes share one tested code path.
+UNWEIGHTED_CRITERION_WEIGHTS = {k: 1.0 for k in MEDHELM_CRITERION_WEIGHTS}
+
+# Which aggregation becomes the primary `jury_score` field. Stock MedHELM uses
+# an unweighted mean, so that is the default here; "weighted" opts into this
+# project's clinical-risk-weighted formula instead. Both are always computed
+# and stored regardless of this setting — see docs/phase3/medhelm_evaluation.md.
+JURY_AGGREGATION_MODE = os.getenv("JURY_AGGREGATION_MODE", "unweighted").strip().lower()
+if JURY_AGGREGATION_MODE not in ("unweighted", "weighted"):
+    JURY_AGGREGATION_MODE = "unweighted"
 
 
 def _is_dry_run() -> bool:
@@ -191,11 +228,15 @@ def calculate_composite_score(scores: dict) -> float:
 
 def calculate_jury_score(criteria_scores: dict, *,
                          weights: dict[str, float] | None = None) -> float:
-    """Compute the MedHELM-style weighted jury score on a 1-5 scale.
+    """Compute a jury score on a 1-5 scale as a weighted average of criteria.
 
     The judge supplies criterion scores only. Python performs the weighted
     average because deterministic arithmetic is easier to audit, unit test, and
     explain in a methods section than asking every judge response to do math.
+
+    Pass ``weights=MEDHELM_CRITERION_WEIGHTS`` for this project's clinical-risk
+    weighting, or ``weights=UNWEIGHTED_CRITERION_WEIGHTS`` for stock MedHELM's
+    flat unweighted mean — both share this one formula and code path.
     """
     resolved_weights = weights or MEDHELM_CRITERION_WEIGHTS
     weighted_sum = 0.0
@@ -346,13 +387,18 @@ def parse_judge_response(raw_text: str) -> dict:
     if isinstance(obj, dict) and "criteria_scores" in obj:
         # --- MedHELM-style schema: criteria_scores -> deterministic jury_score ---
         criteria_scores = _normalize_criteria_scores(obj.get("criteria_scores"))
-        jury_score = calculate_jury_score(criteria_scores)
+        jury_score_weighted = calculate_jury_score(criteria_scores, weights=MEDHELM_CRITERION_WEIGHTS)
+        jury_score_unweighted = calculate_jury_score(criteria_scores, weights=UNWEIGHTED_CRITERION_WEIGHTS)
+        jury_score = jury_score_weighted if JURY_AGGREGATION_MODE == "weighted" else jury_score_unweighted
         halluc_block = obj.get("hallucination") or {}
         claims = list(halluc_block.get("claims") or [])
         confidence = _clamp(obj.get("confidence_score", 1), 1, 5)
         return {
             "criteria_scores": criteria_scores,
             "jury_score": jury_score,
+            "jury_score_weighted": jury_score_weighted,
+            "jury_score_unweighted": jury_score_unweighted,
+            "jury_aggregation_mode": JURY_AGGREGATION_MODE,
             "judge_count": 1,
             "valid_judge_count": 1,
             "judge_disagreement": 0.0,
@@ -383,6 +429,9 @@ def parse_judge_response(raw_text: str) -> dict:
         return {
             "criteria_scores": {},
             "jury_score": None,
+            "jury_score_weighted": None,
+            "jury_score_unweighted": None,
+            "jury_aggregation_mode": JURY_AGGREGATION_MODE,
             "judge_count": 1,
             "valid_judge_count": 1,
             "judge_disagreement": 0.0,
@@ -407,6 +456,8 @@ def parse_judge_response(raw_text: str) -> dict:
         confidence = _clamp(obj.get("confidence_score", 1), 1, 5)
         return {
             "criteria_scores": {}, "jury_score": None,
+            "jury_score_weighted": None, "jury_score_unweighted": None,
+            "jury_aggregation_mode": JURY_AGGREGATION_MODE,
             "judge_count": 1, "valid_judge_count": 1, "judge_disagreement": 0.0,
             "factual_accuracy": None, "completeness": None,
             "clinical_relevance": None, "organization": None,
@@ -438,6 +489,8 @@ def parse_judge_response(raw_text: str) -> dict:
         confidence = _clamp(fields.get("confidence_score", 1), 1, 5)
         return {
             "criteria_scores": {}, "jury_score": None,
+            "jury_score_weighted": None, "jury_score_unweighted": None,
+            "jury_aggregation_mode": JURY_AGGREGATION_MODE,
             "judge_count": 1, "valid_judge_count": 1, "judge_disagreement": 0.0,
             "factual_accuracy":   _clamp(fields.get("factual_accuracy",  1), 1, 3),
             "completeness":       _clamp(fields.get("completeness",       1), 1, 3),
@@ -464,6 +517,8 @@ def parse_judge_response(raw_text: str) -> dict:
         confidence = _clamp(fields.get("confidence_score", 1), 1, 5)
         return {
             "criteria_scores": {}, "jury_score": None,
+            "jury_score_weighted": None, "jury_score_unweighted": None,
+            "jury_aggregation_mode": JURY_AGGREGATION_MODE,
             "judge_count": 1, "valid_judge_count": 1, "judge_disagreement": 0.0,
             "factual_accuracy": None, "completeness": None,
             "clinical_relevance": None, "organization": None,
@@ -482,6 +537,9 @@ def parse_judge_response(raw_text: str) -> dict:
     return {
         "criteria_scores": {},
         "jury_score": None,
+        "jury_score_weighted": None,
+        "jury_score_unweighted": None,
+        "jury_aggregation_mode": JURY_AGGREGATION_MODE,
         "judge_count": 1,
         "valid_judge_count": 0,
         "judge_disagreement": None,
@@ -713,6 +771,11 @@ def build_evaluation_row(*, doi: str, summariser: str, judge: str,
         # new evaluation; quality_score below is only a compatibility alias.
         "criteria_scores":      parsed.get("criteria_scores", {}),
         "jury_score":           parsed.get("jury_score"),
+        # Always computed together so the two aggregation methods can be
+        # compared without re-running judges — see docs/phase3/medhelm_evaluation.md.
+        "jury_score_weighted":   parsed.get("jury_score_weighted"),
+        "jury_score_unweighted": parsed.get("jury_score_unweighted"),
+        "jury_aggregation_mode": parsed.get("jury_aggregation_mode", JURY_AGGREGATION_MODE),
         "judge_count":          parsed.get("judge_count", 1),
         "valid_judge_count":    parsed.get("valid_judge_count", 1),
         "judge_disagreement":   parsed.get("judge_disagreement", 0.0),

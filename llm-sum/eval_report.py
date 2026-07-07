@@ -54,6 +54,12 @@ def _score(row: dict[str, Any]) -> float | None:
     return None
 
 
+def _field_score(row: dict[str, Any], field: str) -> float | None:
+    """Read a specific numeric aggregation field (weighted or unweighted)."""
+    value = row.get(field)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def _major_hallucination(row: dict[str, Any]) -> bool:
     return any(
         claim.get("severity") == "major"
@@ -82,6 +88,12 @@ def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarize
     summary: list[dict[str, Any]] = []
     for group, items in sorted(groups.items()):
         scores = [score for row in items if (score := _score(row)) is not None]
+        weighted_scores = [
+            s for row in items if (s := _field_score(row, "jury_score_weighted")) is not None
+        ]
+        unweighted_scores = [
+            s for row in items if (s := _field_score(row, "jury_score_unweighted")) is not None
+        ]
         hallucination_rows = [row for row in items if int(row.get("hallucination_count") or 0) > 0]
         major_rows = [row for row in items if _major_hallucination(row)]
         low_confidence = [row for row in items if int(row.get("confidence_score") or 0) < 3]
@@ -96,6 +108,14 @@ def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarize
             "n_rows": len(items),
             "n_scored": len(scores),
             "mean_score": round(sum(scores) / len(scores), 3) if scores else None,
+            # Both aggregation methods, so weighted vs. unweighted can be
+            # compared in the same report without re-running judges.
+            "mean_score_weighted": (
+                round(sum(weighted_scores) / len(weighted_scores), 3) if weighted_scores else None
+            ),
+            "mean_score_unweighted": (
+                round(sum(unweighted_scores) / len(unweighted_scores), 3) if unweighted_scores else None
+            ),
             "hallucination_rate": round(len(hallucination_rows) / len(items), 3) if items else 0.0,
             "major_hallucination_rate": round(len(major_rows) / len(items), 3) if items else 0.0,
             "low_confidence_rate": round(len(low_confidence) / len(items), 3) if items else 0.0,
@@ -138,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         for row in rows:
             print(
                 f"{row['group']}: n={row['n_rows']} mean={row['mean_score']} "
+                f"(weighted={row['mean_score_weighted']} unweighted={row['mean_score_unweighted']}) "
                 f"halluc={row['hallucination_rate']} major={row['major_hallucination_rate']} "
                 f"parse_fail={row['parse_failure_rate']}"
             )

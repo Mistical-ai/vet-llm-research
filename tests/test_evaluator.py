@@ -20,7 +20,9 @@ import pytest
 import evaluator
 from evaluator import (
     BLIND_FORBIDDEN_TOKENS,
+    MEDHELM_CRITERION_WEIGHTS,
     SCORE_SENTINEL_MALFORMED,
+    UNWEIGHTED_CRITERION_WEIGHTS,
     build_judge_prompt,
     build_evaluation_row,
     aggregate_jury_scores,
@@ -204,9 +206,68 @@ def test_medhelm_schema_parses_criteria_scores() -> None:
     })
     parsed = parse_judge_response(raw)
     assert parsed["criteria_scores"]["faithfulness"]["score"] == 5
-    assert parsed["jury_score"] == calculate_jury_score(parsed["criteria_scores"])
+    expected_weighted = calculate_jury_score(
+        parsed["criteria_scores"], weights=MEDHELM_CRITERION_WEIGHTS
+    )
+    expected_unweighted = calculate_jury_score(
+        parsed["criteria_scores"], weights=UNWEIGHTED_CRITERION_WEIGHTS
+    )
+    assert parsed["jury_score_weighted"] == expected_weighted
+    assert parsed["jury_score_unweighted"] == expected_unweighted
+    assert parsed["jury_score_unweighted"] == round((5 + 4 + 5 + 4 + 5) / 5, 2)
+    # Default JURY_AGGREGATION_MODE is "unweighted" (stock MedHELM's flat mean).
+    assert evaluator.JURY_AGGREGATION_MODE == "unweighted"
+    assert parsed["jury_score"] == expected_unweighted
+    assert parsed["jury_aggregation_mode"] == "unweighted"
     assert parsed["quality_score"] == 9
     assert parsed["parse_method"] == "json"
+
+
+def test_jury_aggregation_mode_selects_primary_score(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JURY_AGGREGATION_MODE=weighted makes the weighted score primary."""
+    monkeypatch.setattr(evaluator, "JURY_AGGREGATION_MODE", "weighted")
+    raw = json.dumps({
+        "criteria_scores": {
+            "faithfulness": {"score": 5, "reasoning": "x"},
+            "completeness": {"score": 1, "reasoning": "x"},
+            "clinical_usefulness": {"score": 5, "reasoning": "x"},
+            "clarity": {"score": 1, "reasoning": "x"},
+            "safety": {"score": 5, "reasoning": "x"},
+        },
+        "hallucination": {"present": False, "count": 0, "claims": []},
+        "confidence_score": 5,
+        "reasoning": "Mixed scores.",
+    })
+    parsed = parse_judge_response(raw)
+    assert parsed["jury_aggregation_mode"] == "weighted"
+    assert parsed["jury_score"] == parsed["jury_score_weighted"]
+    assert parsed["jury_score"] != parsed["jury_score_unweighted"]
+
+
+def test_jury_criterion_weights_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid JURY_CRITERION_WEIGHTS JSON overrides the hardcoded defaults."""
+    import importlib
+
+    custom = {
+        "faithfulness": 2.0, "completeness": 2.0, "clinical_usefulness": 2.0,
+        "clarity": 2.0, "safety": 2.0,
+    }
+    monkeypatch.setenv("JURY_CRITERION_WEIGHTS", json.dumps(custom))
+    weights = evaluator._load_criterion_weights()
+    assert weights == custom
+
+
+def test_jury_criterion_weights_env_override_invalid_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid or incomplete JSON falls back to the documented defaults."""
+    monkeypatch.setenv("JURY_CRITERION_WEIGHTS", '{"faithfulness": 2.0}')
+    weights = evaluator._load_criterion_weights()
+    assert weights == evaluator._DEFAULT_MEDHELM_CRITERION_WEIGHTS
+
+    monkeypatch.setenv("JURY_CRITERION_WEIGHTS", "not json")
+    weights = evaluator._load_criterion_weights()
+    assert weights == evaluator._DEFAULT_MEDHELM_CRITERION_WEIGHTS
 
 
 def test_aggregate_jury_scores_tracks_disagreement() -> None:

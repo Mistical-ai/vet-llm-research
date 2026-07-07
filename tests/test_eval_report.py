@@ -8,6 +8,8 @@ def test_summarize_rows_by_summarizer() -> None:
         {
             "summarizer": "openai",
             "jury_score": 4.0,
+            "jury_score_weighted": 4.2,
+            "jury_score_unweighted": 4.0,
             "hallucination_count": 0,
             "confidence_score": 5,
             "parse_method": "json",
@@ -17,6 +19,8 @@ def test_summarize_rows_by_summarizer() -> None:
         {
             "summarizer": "openai",
             "jury_score": 2.0,
+            "jury_score_weighted": 1.8,
+            "jury_score_unweighted": 2.0,
             "hallucination_count": 1,
             "confidence_score": 2,
             "parse_method": "json",
@@ -27,6 +31,8 @@ def test_summarize_rows_by_summarizer() -> None:
     summary = summarize_rows(rows, group_field="summarizer")
     assert summary[0]["group"] == "openai"
     assert summary[0]["mean_score"] == 3.0
+    assert summary[0]["mean_score_weighted"] == 3.0
+    assert summary[0]["mean_score_unweighted"] == 3.0
     assert summary[0]["hallucination_rate"] == 0.5
     assert summary[0]["major_hallucination_rate"] == 0.5
     assert summary[0]["low_confidence_rate"] == 0.5

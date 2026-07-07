@@ -16,6 +16,15 @@ seed: 42
 score_range:
   min: 1
   max: 5
+# Two aggregation modes are always computed and stored per row
+# (jury_score_weighted, jury_score_unweighted); JURY_AGGREGATION_MODE in .env
+# picks which one is aliased as the primary jury_score. Weights below are
+# documentation only — evaluator.py's JURY_CRITERION_WEIGHTS (with an optional
+# JURY_CRITERION_WEIGHTS env override) is the value actually used at runtime.
+# See docs/phase3/medhelm_evaluation.md for the full comparison.
+aggregation:
+  default_mode: unweighted   # stock MedHELM's flat mean across criteria
+  alternate_mode: weighted   # this project's clinical-risk-weighted formula
 criteria:
   faithfulness:
     weight: 1.5
@@ -38,6 +47,7 @@ judges:
   reliability:
     - openai
     - anthropic
+    - gemini
 secondary_metrics:
   - compression_ratio
   - extractive_coverage
