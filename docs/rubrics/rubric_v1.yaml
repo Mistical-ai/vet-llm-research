@@ -1,0 +1,38 @@
+version: rubric_v1
+title: Veterinary Summary Evaluation Rubric
+score_range:
+  min: 1
+  max: 5
+dimensions:
+  factual_accuracy:
+    description: Summary claims are supported by the source text.
+    anchors:
+      1: Major unsupported or contradictory claims.
+      2: Several unsupported details or clinically important imprecision.
+      3: Mostly supported with minor gaps or vague wording.
+      4: Supported with only trivial omissions or wording issues.
+      5: Fully supported and precise.
+  hallucination_risk:
+    description: Risk that the summary introduces facts not present in the source.
+    anchors:
+      1: High risk; fabricated numbers, outcomes, or clinical claims.
+      2: Moderate risk; multiple claims lack clear support.
+      3: Low to moderate risk; one or two uncertain claims.
+      4: Low risk; claims are generally grounded.
+      5: Minimal risk; no apparent unsupported claims.
+  clinical_relevance:
+    description: Usefulness of the summary for veterinary clinical interpretation.
+    anchors:
+      1: No clinically useful take-away.
+      2: Limited relevance or missing species/context.
+      3: Some useful clinical context but incomplete.
+      4: Clear species-aware clinical interpretation.
+      5: Highly relevant, species-specific, and practice-oriented.
+  completeness:
+    description: Coverage of objective, methods, population/species, results, significance, and limitations.
+    anchors:
+      1: Omits most essential elements.
+      2: Covers only a few essential elements.
+      3: Covers about half of the essential elements.
+      4: Covers most essential elements.
+      5: Covers all essential elements concisely.

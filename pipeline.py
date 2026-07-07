@@ -54,8 +54,7 @@ This threshold is set at 200 (80% of 250) rather than 250 because:
   - A threshold of 250 would require perfect OA coverage, which is unrealistic.
 """
 
-import json
-import os
+import argparse
 import sys
 from pathlib import Path
 
@@ -65,8 +64,8 @@ from dotenv import load_dotenv
 # from src/collect.py, src/utils.py, etc. without an installed package.
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from collect import JOURNAL_TARGETS   # noqa: E402 (after sys.path insert)
-from file_paths import legacy_doi_filename, resolve_existing_pdf_path  # noqa: E402
+from file_paths import legacy_doi_filename  # noqa: E402
+from scenarios import PrimaryResearchCorpusScenario, ScenarioPaths  # noqa: E402
 from utils import log_error           # noqa: E402
 
 load_dotenv()
@@ -75,16 +74,19 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-MANIFEST_PATH        = Path("data") / "manifest.jsonl"
-MANUAL_MANIFEST_PATH = Path("data") / "manual_manifest.jsonl"
-RAW_DIR              = Path("data") / "raw"
+DEFAULT_PATHS = ScenarioPaths()
+DEFAULT_SCENARIO = PrimaryResearchCorpusScenario(DEFAULT_PATHS)
+
+MANIFEST_PATH        = DEFAULT_PATHS.manifest_path
+MANUAL_MANIFEST_PATH = DEFAULT_PATHS.manual_manifest_path
+RAW_DIR              = DEFAULT_PATHS.raw_dir
 
 # Total corpus target (5 journals × 50 papers each).
-CORPUS_TARGET: int = sum(JOURNAL_TARGETS.values())  # 250
+CORPUS_TARGET: int = DEFAULT_SCENARIO.corpus_target  # 250
 
 # Minimum OA-sourced PDFs for the run to be considered acceptable without
 # requiring extensive manual intervention.  See module docstring for rationale.
-OA_THRESHOLD: int = 200
+OA_THRESHOLD: int = DEFAULT_SCENARIO.oa_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +104,26 @@ def _doi_to_filename(doi: str) -> str:
 # Corpus loader: merge OA + manual manifests
 # ---------------------------------------------------------------------------
 
-def load_corpus() -> dict:
+def _warn_invalid_manual(invalid_manual: list[dict]) -> None:
+    """Print the existing manual-manifest warning after scenario validation."""
+    if not invalid_manual:
+        return
+
+    print(
+        f"\n[pipeline] WARNING: {len(invalid_manual)} manual manifest "
+        f"entries have no PDF in data/raw/:"
+    )
+    for item in invalid_manual[:5]:
+        print(f"  {item['doi']}: {item['reason']}")
+    if len(invalid_manual) > 5:
+        print(f"  ... and {len(invalid_manual) - 5} more")
+    print(
+        "  Add entries to data/manual_manifest.jsonl only AFTER placing "
+        "PDFs in data/raw/."
+    )
+
+
+def load_corpus(scenario: PrimaryResearchCorpusScenario | None = None) -> dict:
     """
     Load and merge the OA manifest and optional manual manifest into a single
     deduplicated view of the corpus.
@@ -133,129 +154,20 @@ def load_corpus() -> dict:
         manual_count   : int        — Valid records from data/manual_manifest.jsonl.
         invalid_manual : list[dict] — Manual entries without confirmed PDFs.
     """
-    records: list[dict] = []
-    seen_dois: set[str] = set()
-
-    # --- Load OA manifest ---
-    oa_count = 0
-    if MANIFEST_PATH.exists():
-        with open(MANIFEST_PATH, encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    doi    = record.get("doi", "").strip()
-                    if doi and doi not in seen_dois:
-                        seen_dois.add(doi)
-                        record["_source"] = "oa"
-                        records.append(record)
-                        oa_count += 1
-                except json.JSONDecodeError:
-                    log_error("N/A", "pipeline", f"Malformed OA manifest line {line_num}")
-    else:
-        print(f"[pipeline] OA manifest not found at {MANIFEST_PATH}. Run collect.py first.")
-
-    # --- Load manual manifest (optional) ---
-    manual_count   = 0
-    invalid_manual: list[dict] = []
-
-    if MANUAL_MANIFEST_PATH.exists():
-        with open(MANUAL_MANIFEST_PATH, encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    doi    = record.get("doi", "").strip()
-                    if not doi:
-                        log_error("N/A", "pipeline", f"Manual manifest line {line_num}: missing doi")
-                        continue
-
-                    # VALIDATION: the PDF must exist before this DOI counts.
-                    # WHY VALIDATE HERE?
-                    #   data/manual_manifest.jsonl is edited by hand and may
-                    #   contain entries added before the PDF was copied, or with
-                    #   a typo in the DOI.  Counting an entry without a PDF would
-                    #   silently inflate the corpus size metric.
-                    pdf_path = resolve_existing_pdf_path(RAW_DIR, record)
-                    if pdf_path is None:
-                        invalid_manual.append({
-                            "doi":    doi,
-                            "title":  record.get("title", ""),
-                            "reason": "PDF not found in data/raw/",
-                        })
-                        continue
-
-                    if doi in seen_dois:
-                        # OA record already loaded; skip duplicate.
-                        continue
-
-                    seen_dois.add(doi)
-                    record["_source"] = "manual"
-                    records.append(record)
-                    manual_count += 1
-
-                except json.JSONDecodeError:
-                    log_error("N/A", "pipeline", f"Malformed manual manifest line {line_num}")
-
-        if invalid_manual:
-            print(
-                f"\n[pipeline] WARNING: {len(invalid_manual)} manual manifest "
-                f"entries have no PDF in data/raw/:"
-            )
-            for item in invalid_manual[:5]:
-                print(f"  {item['doi']}: {item['reason']}")
-            if len(invalid_manual) > 5:
-                print(f"  ... and {len(invalid_manual) - 5} more")
-            print(
-                "  Add entries to data/manual_manifest.jsonl only AFTER placing "
-                "PDFs in data/raw/."
-            )
-
-    # --- Determine which DOIs have PDFs on disk ---
-    # WHY SEPARATE PRIMARY AND SECONDARY?
-    #   Files starting with "2_" are secondary research (systematic reviews,
-    #   meta-analyses) tagged by download.py or audit_article_types.py.
-    #   They count toward the total PDF count but NOT toward the per-journal
-    #   quota of 50 primary research papers.  Keeping them separate lets the
-    #   status report show exactly how many primary papers still need to be found.
-    downloaded:            list[str] = []   # All confirmed PDFs (primary + secondary)
-    downloaded_primary:    list[str] = []   # PDFs whose filename does NOT start with "2_"
-    downloaded_secondary:  list[str] = []   # PDFs whose filename starts with "2_"
-    missing_pdfs:          list[str] = []
-
-    for record in records:
-        doi      = record["doi"]
-        pdf_path = resolve_existing_pdf_path(RAW_DIR, record)
-        if pdf_path is None:
-            missing_pdfs.append(doi)
-        else:
-            downloaded.append(doi)
-            if pdf_path.name.startswith("2_"):
-                downloaded_secondary.append(doi)
-            else:
-                downloaded_primary.append(doi)
-
-    return {
-        "records":               records,
-        "downloaded":            downloaded,
-        "downloaded_primary":    downloaded_primary,
-        "downloaded_secondary":  downloaded_secondary,
-        "missing_pdfs":          missing_pdfs,
-        "oa_count":              oa_count,
-        "manual_count":          manual_count,
-        "invalid_manual":        invalid_manual,
-    }
+    active_scenario = scenario or DEFAULT_SCENARIO
+    corpus = active_scenario.load_corpus(error_logger=log_error)
+    _warn_invalid_manual(corpus["invalid_manual"])
+    return corpus
 
 
 # ---------------------------------------------------------------------------
 # Status reporter
 # ---------------------------------------------------------------------------
 
-def report_corpus_status(corpus: dict) -> None:
+def report_corpus_status(
+    corpus: dict,
+    scenario: PrimaryResearchCorpusScenario | None = None,
+) -> None:
     """
     Print a structured summary of the current corpus state.
 
@@ -273,53 +185,31 @@ def report_corpus_status(corpus: dict) -> None:
     ----------
     corpus : dict — Output of load_corpus().
     """
-    records             = corpus["records"]
-    downloaded          = corpus["downloaded"]
-    downloaded_primary  = corpus["downloaded_primary"]
-    downloaded_secondary = corpus["downloaded_secondary"]
-    missing_pdfs        = corpus["missing_pdfs"]
-    oa_count            = corpus["oa_count"]
-    manual_count        = corpus["manual_count"]
-
-    # The quota is measured against PRIMARY papers only.
-    n_primary    = len(downloaded_primary)
-    n_secondary  = len(downloaded_secondary)
-    n_total      = len(downloaded)
-    total_missing = max(0, CORPUS_TARGET - n_primary)
+    active_scenario = scenario or DEFAULT_SCENARIO
+    report = active_scenario.build_status_report(corpus)
 
     print("\n" + "=" * 68)
     print("  CORPUS STATUS")
     print("=" * 68)
-    print(f"  Manifest entries (OA):             {oa_count:>5}")
-    print(f"  Manifest entries (manual):         {manual_count:>5}")
-    print(f"  Total unique DOIs:                 {len(records):>5}")
-    print(f"  PDFs confirmed — primary:          {n_primary:>5}  (count toward quota)")
-    print(f"  PDFs confirmed — secondary (2_):   {n_secondary:>5}  (reviews; not in quota)")
-    print(f"  PDFs confirmed — total:            {n_total:>5}")
-    print(f"  PDFs still missing:                {len(missing_pdfs):>5}")
-    print(f"  Corpus target (primary only):      {CORPUS_TARGET:>5}")
-    print(f"  Primary quota progress:            {n_primary:>5}  ({n_primary}/{CORPUS_TARGET})")
+    print(f"  Manifest entries (OA):             {report.oa_count:>5}")
+    print(f"  Manifest entries (manual):         {report.manual_count:>5}")
+    print(f"  Total unique DOIs:                 {len(report.records):>5}")
+    print(f"  PDFs confirmed — primary:          {report.n_primary:>5}  (count toward quota)")
+    print(f"  PDFs confirmed — secondary (2_):   {report.n_secondary:>5}  (reviews; not in quota)")
+    print(f"  PDFs confirmed — total:            {report.n_total:>5}")
+    print(f"  PDFs still missing:                {len(report.missing_pdfs):>5}")
+    print(f"  Corpus target (primary only):      {active_scenario.corpus_target:>5}")
+    print(
+        f"  Primary quota progress:            {report.n_primary:>5}  "
+        f"({report.n_primary}/{active_scenario.corpus_target})"
+    )
     print()
 
     # --- Per-journal breakdown ---
-    # Count primary and secondary PDFs separately for each journal.
-    journal_counts: dict[str, dict] = {}
-    for record in records:
-        j = record.get("journal", "Unknown")
-        if j not in journal_counts:
-            journal_counts[j] = {"primary": 0, "secondary": 0, "source": set()}
-        pdf_path = resolve_existing_pdf_path(RAW_DIR, record)
-        if pdf_path is not None:
-            if pdf_path.name.startswith("2_"):
-                journal_counts[j]["secondary"] += 1
-            else:
-                journal_counts[j]["primary"] += 1
-        journal_counts[j]["source"].add(record.get("_source", "oa"))
-
     print(f"  {'Journal':<25} {'Target':>6}  {'Primary':>8}  {'Secondary':>10}  {'Status'}")
     print("  " + "-" * 70)
-    for journal, target in JOURNAL_TARGETS.items():
-        counts    = journal_counts.get(journal, {"primary": 0, "secondary": 0})
+    for journal, target in active_scenario.journal_targets.items():
+        counts    = report.journal_counts.get(journal, {"primary": 0, "secondary": 0})
         primary   = counts["primary"]
         secondary = counts["secondary"]
         if primary >= target:
@@ -333,13 +223,17 @@ def report_corpus_status(corpus: dict) -> None:
     print("=" * 68)
 
     # --- Overall assessment (based on primary count only) ---
-    if n_primary >= CORPUS_TARGET:
-        print(f"\n[pipeline] Corpus complete: {n_primary}/{CORPUS_TARGET} primary PDFs acquired.")
-
-    elif n_primary >= OA_THRESHOLD:
-        remaining = CORPUS_TARGET - n_primary
+    if report.n_primary >= active_scenario.corpus_target:
         print(
-            f"\n[pipeline] OA corpus acceptable: {n_primary} >= {OA_THRESHOLD} threshold.\n"
+            f"\n[pipeline] Corpus complete: "
+            f"{report.n_primary}/{active_scenario.corpus_target} primary PDFs acquired."
+        )
+
+    elif report.n_primary >= active_scenario.oa_threshold:
+        remaining = active_scenario.corpus_target - report.n_primary
+        print(
+            f"\n[pipeline] OA corpus acceptable: "
+            f"{report.n_primary} >= {active_scenario.oa_threshold} threshold.\n"
             f"[pipeline] {remaining} primary papers still needed (250 target).\n"
             f"[pipeline] Manual supplementation steps:\n"
             f"  1. Run: python src/supplement.py  → generates data/missing_papers.csv\n"
@@ -350,7 +244,8 @@ def report_corpus_status(corpus: dict) -> None:
 
     else:
         print(
-            f"\n[pipeline] WARNING: Only {n_primary}/{OA_THRESHOLD} minimum primary PDFs acquired.\n"
+            f"\n[pipeline] WARNING: Only "
+            f"{report.n_primary}/{active_scenario.oa_threshold} minimum primary PDFs acquired.\n"
             f"[pipeline] Possible causes:\n"
             f"  - Network errors during download.py run\n"
             f"  - Low OA availability for the target journals in 2023-2026\n"
@@ -363,10 +258,58 @@ def report_corpus_status(corpus: dict) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def resolve_pipeline_scenario(name: str) -> PrimaryResearchCorpusScenario:
+    """Resolve the small set of scenarios that pipeline.py can run today."""
+    if name == PrimaryResearchCorpusScenario.name:
+        return PrimaryResearchCorpusScenario()
+    raise ValueError(
+        f"Unknown scenario {name!r}. "
+        f"Supported scenarios: {PrimaryResearchCorpusScenario.name}"
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI flags while keeping the default command unchanged."""
+    parser = argparse.ArgumentParser(description="Report veterinary corpus health.")
+    parser.add_argument(
+        "--scenario",
+        default=PrimaryResearchCorpusScenario.name,
+        choices=[PrimaryResearchCorpusScenario.name],
+        help="Scenario to report; defaults to the current primary research corpus.",
+    )
+    parser.add_argument(
+        "--use-rubric",
+        action="store_true",
+        help=(
+            "Write lightweight rubric scores to data/rubric_scores.jsonl "
+            "without changing corpus status output."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the corpus status CLI and return a shell-friendly exit code."""
+    args = build_arg_parser().parse_args(argv)
+    scenario = resolve_pipeline_scenario(args.scenario)
+
     print("[pipeline] Loading corpus (OA manifest + manual manifest)...")
-    corpus = load_corpus()
-    report_corpus_status(corpus)
+    corpus = load_corpus(scenario)
+    report_corpus_status(corpus, scenario)
+
+    if args.use_rubric:
+        # Import lazily so default pipeline.py runs remain a corpus scoreboard,
+        # and the rubric writer cannot affect normal exit-code behavior.
+        from evaluation.rubric_scoring import write_rubric_scores
+
+        output_path = Path("data") / "rubric_scores.jsonl"
+        written = write_rubric_scores(
+            summaries_path=Path("data") / "summaries.jsonl",
+            manifest_records=corpus["records"],
+            rubric_path=Path("docs") / "rubrics" / "rubric_v1.yaml",
+            output_path=output_path,
+        )
+        print(f"[pipeline] Rubric scores written: {written} row(s) -> {output_path}")
 
     # Exit with code 1 if primary-research PDFs are below the minimum threshold.
     # WHY sys.exit(1)?
@@ -376,5 +319,10 @@ if __name__ == "__main__":
     #   Secondary PDFs (reviews) are backup material — the corpus health is
     #   determined by how many primary research articles we have.
     n_primary = len(corpus["downloaded_primary"])
-    if n_primary < OA_THRESHOLD:
-        sys.exit(1)
+    if n_primary < scenario.oa_threshold:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
