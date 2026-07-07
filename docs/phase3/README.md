@@ -253,9 +253,11 @@ If you want the summaries to follow your own human-written style, paste your sam
 python llm-sum/run_phase3.py evaluate
 ```
 
-For each summary, a judge model scores quality (1–10), counts hallucinations, and flags low-confidence cases for human review — **without being told which model wrote the summary**.
+For each summary, a judge model scores quality, counts hallucinations, and flags low-confidence cases for human review — **without being told which model wrote the summary**.
 
-**Full plain-English guide:** [How the Judge Works & the Vet-Score v2.0 Rubric](judge_and_rubric.md) — step-by-step flow, the four scoring dimensions, hallucination types, and how the 1–10 score is calculated.
+**Full plain-English guide (current default, MedHELM-style rubric):** [medhelm_evaluation.md](medhelm_evaluation.md) — the five scoring criteria, hallucination types, and both the weighted and unweighted `jury_score` formulas.
+
+**Legacy rubric reference:** [How the Judge Worked Under Vet-Score v2.0](judge_and_rubric.md) — kept for researchers running an explicit `judge_v2.txt` sensitivity comparison; not the current default.
 
 *Expect:* one line per (paper, summariser, judge) with a score and how it was parsed (`json` / `regex` / `sentinel`).
 
@@ -346,7 +348,7 @@ Each script has its own detailed guide (same layout every time: what it does / w
 | `prepare_texts.py` | PDFs → cleaned-text cache | [prepare_texts.md](prepare_texts.md) |
 | `verify_extraction.py` | Audit extraction quality (PASS/WARN/FAIL) | [verify_extraction.md](verify_extraction.md) |
 | `summarizer.py` | Run the 3 summarisers (real-time or batch) | [summarizer.md](summarizer.md) |
-| `evaluator.py` | Blind judge scoring | [evaluator.md](evaluator.md) · [judge & rubric (simple)](judge_and_rubric.md) |
+| `evaluator.py` | Blind judge scoring | [evaluator.md](evaluator.md) · [medhelm_evaluation.md](medhelm_evaluation.md) (current rubric) · [judge & rubric (legacy v2.0)](judge_and_rubric.md) |
 | `check_batch_status.py` | Collect finished batch jobs | [check_batch_status.md](check_batch_status.md) |
 | `cost_estimator.py` | Forecast cost offline (no API) | [cost_estimator.md](cost_estimator.md) |
 | `run_phase3.py` | Orchestrator wrapping all steps | [run_phase3.md](run_phase3.md) |

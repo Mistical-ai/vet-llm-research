@@ -1,6 +1,14 @@
-# How the Judge Works (Plain English)
+# How the Judge Works (Plain English) — Legacy Vet-Score v2.0 Rubric
 
-This page explains **how summaries get scored** in Phase 3. No code knowledge required.
+> **This page describes the legacy Vet-Score v2.0 rubric (`judge_v2.txt`),
+> which is no longer the default.** The current default rubric is the
+> MedHELM-style rubric (five criteria, 1–5 scale, weighted or unweighted
+> `jury_score`) documented in
+> [medhelm_evaluation.md](medhelm_evaluation.md). This page is kept for
+> researchers running an explicit `judge_v2.txt` sensitivity comparison.
+
+This page explains **how summaries get scored** under the older Vet-Score
+v2.0 rubric in Phase 3. No code knowledge required.
 
 If you want CLI details and file paths, see [evaluator.md](evaluator.md).
 
@@ -47,9 +55,11 @@ This is required for a fair model comparison.
 
 ---
 
-## The rubric: Vet-Score v2.0
+## The rubric: Vet-Score v2.0 (legacy)
 
-The judge uses a **veterinary-specific checklist** defined in `llm-sum/prompts/judge_v2.txt`. It is **not** a vague “rate 1–10 from the gut.”
+The judge uses a **veterinary-specific checklist** defined in `llm-sum/prompts/judge_v2.txt`. It is **not** a vague “rate 1–10 from the gut.” This
+is the *legacy* rubric — the current default is the MedHELM-style rubric in
+[medhelm_evaluation.md](medhelm_evaluation.md).
 
 The judge scores **four dimensions**, each from **1 (poor)** to **3 (excellent)**:
 
@@ -208,6 +218,11 @@ Full **batch** runs evaluate everything.
 
 ## How to run evaluation
 
+Note: these commands run whichever rubric `JUDGE_PROMPT_FILE` currently
+points to — MedHELM by default, not the v2 rubric described on this page.
+Set `JUDGE_PROMPT_FILE=llm-sum/prompts/judge_v2.txt` in `.env` first if you
+specifically want to reproduce the v2 rubric behaviour described above.
+
 **Free mock (no API cost):**
 
 ```powershell
@@ -228,20 +243,30 @@ python llm-sum/run_phase3.py status
 
 ---
 
-## Quick reference: old vs new rubric
+## Quick reference: three rubric generations
 
-| | **judge_v1** (old) | **judge_v2** (current) |
-|--|-------------------|------------------------|
-| Prompt file | `judge_v1.txt` | `judge_v2.txt` |
-| Scoring | Single 1–10 from judge | Four 1–3 dimensions + computed 1–10 |
-| Hallucinations | Count + category list | Count + quoted claims with severity |
-| Domain focus | Generic | Veterinary (species, clinical checklist) |
-| Env setting | `JUDGE_PROMPT_FILE=.../judge_v1.txt` | `JUDGE_PROMPT_FILE=.../judge_v2.txt` (default) |
+| | **judge_v1** (oldest) | **judge_v2** (legacy, this page) | **judge_medhelm_v1** (current default) |
+|--|-------------------|------------------------|------------------------|
+| Prompt file | `judge_v1.txt` | `judge_v2.txt` | `judge_medhelm_v1.txt` |
+| Scoring | Single 1–10 from judge | Four 1–3 dimensions + computed 1–10 | Five 1–5 criteria + weighted **and** unweighted `jury_score` |
+| Hallucinations | Count + category list | Count + quoted claims with severity | Count + quoted claims with severity |
+| Domain focus | Generic | Veterinary (species, clinical checklist) | Veterinary (faithfulness, completeness, clinical usefulness, clarity, safety) |
+| Env setting | `JUDGE_PROMPT_FILE=.../judge_v1.txt` | `JUDGE_PROMPT_FILE=.../judge_v2.txt` | `JUDGE_PROMPT_FILE=.../judge_medhelm_v1.txt` (default) |
+| Documented in | this page | this page | [medhelm_evaluation.md](medhelm_evaluation.md) |
 
-Do **not** compare v1 and v2 scores directly in analysis — they use different rubrics.
+Do **not** compare scores across rubric versions directly in analysis — each
+uses a different scale and formula. See
+[medhelm_evaluation.md](medhelm_evaluation.md) for how the current default
+rubric's own two aggregation modes (weighted vs. unweighted) compare to
+*each other*.
 
 ---
 
-## One paragraph for a meeting or report
+## One paragraph for a meeting or report (Vet-Score v2.0, legacy)
 
 > We evaluate each LLM summary with a blind judge that sees only the original article and the summary text, not the model name. The judge uses a veterinary rubric (factual accuracy with species checks, completeness of six standard sections, clinical relevance, and organization), detects hallucinations with quoted evidence, and outputs structured scores. Python combines the four dimension scores into a 1–10 quality score with factual accuracy weighted highest. Low-confidence, malformed, or clinically dangerous hallucinations are flagged for human review in a later phase.
+
+This paragraph describes the legacy Vet-Score v2.0 rubric specifically. For
+the current default (MedHELM-style, five criteria, weighted and unweighted
+`jury_score`), see the equivalent summary in
+[medhelm_evaluation.md](medhelm_evaluation.md).

@@ -163,7 +163,7 @@ The **judge LLM does not calculate the final score.** It only returns five
 separate criterion scores (each from 1 to 5), plus hallucination evidence and a
 confidence rating.
 
-**Python calculates `jury_score`** after the judge responds. That way:
+**Python calculates the jury score** after the judge responds. That way:
 
 - The LLM never has to do arithmetic (LLMs sometimes make math mistakes).
 - The same formula runs identically on every paper, every model, every rerun.
@@ -171,6 +171,22 @@ confidence rating.
 
 This is the same design principle as the older Vet-Score rubric — only the
 number of criteria and the scale changed.
+
+### Two aggregation modes, always both computed
+
+Python actually computes **two** scores from the same five criterion scores
+every time, and stores both on every row:
+
+- `jury_score_unweighted` — a flat mean across all five criteria. This is
+  stock MedHELM's method (`LLMJuryMetric` in the Stanford HELM codebase
+  averages every judge×criterion score with no weighting).
+- `jury_score_weighted` — this project's clinical-risk-weighted mean (below).
+
+`jury_score` is just an alias for whichever one is primary, controlled by
+`JURY_AGGREGATION_MODE` in `.env` (default: `unweighted`). Because both are
+always stored, switching `JURY_AGGREGATION_MODE` — or just reading the other
+field directly — never requires re-running judges. See
+["Weighted vs. Unweighted"](#weighted-vs-unweighted) below for when to use each.
 
 ### What is a weighted average?
 
@@ -275,6 +291,66 @@ The weights reflect clinical risk:
 - Clarity matters, but it is weighted lower because style should not outweigh
   correctness.
 
+## Weighted vs. Unweighted
+
+Both scores are computed from the same `criteria_scores` and stored on every
+row. Use whichever fits the question you are asking.
+
+### The two formulas, worked side by side
+
+Using the same example scores as above (faithfulness 4, safety 5, clinical
+usefulness 3, completeness 4, clarity 4):
+
+| Aggregation | Formula | Result |
+|-------------|---------|--------|
+| Unweighted (`jury_score_unweighted`) | `(4 + 5 + 3 + 4 + 4) / 5` | **4.00** |
+| Weighted (`jury_score_weighted`) | `(4×1.5 + 5×1.3 + 3×1.2 + 4×1.0 + 4×0.8) / 5.8` | **4.02** |
+
+The two scores are close here because the example scores are all similar. They
+diverge more when a low score lands on a high-weight criterion — for example,
+a summary that is perfectly clear (clarity 5) but clinically unsafe (safety 1)
+scores much lower under the weighted formula than the unweighted one, because
+safety counts for more than clarity.
+
+### Pros and cons
+
+| | Unweighted (default) | Weighted |
+|---|---|---|
+| **Fidelity to stock MedHELM** | Exact match — the same flat mean `LLMJuryMetric` computes. | A deliberate deviation; not directly comparable to published MedHELM numbers. |
+| **Simplicity** | Every criterion counts equally; nothing to justify or tune. | Requires justifying *why* faithfulness and safety outweigh clarity (see "Why These Weights" above). |
+| **Clinical risk sensitivity** | Treats a wrong fact and a clunky sentence as equally damaging. | Penalizes clinically dangerous failures (wrong facts, misleading safety claims) more than stylistic ones — arguably more meaningful for a veterinary audience. |
+| **Use when...** | You want a number you can compare against MedHELM literature, or you want the simplest possible defensible default. | You want the score to reflect this project's clinical-risk judgment, e.g., for the paper's primary results. |
+
+### How to switch
+
+Set in `.env`:
+
+```
+JURY_AGGREGATION_MODE=unweighted   # default; stock MedHELM's flat mean
+JURY_AGGREGATION_MODE=weighted     # this project's clinical-risk-weighted mean
+```
+
+This only changes which field `jury_score` aliases — it does not require
+re-evaluating anything, because `jury_score_weighted` and
+`jury_score_unweighted` are both already in `data/evaluations.jsonl`. Running
+`python llm-sum/run_phase3.py eval-report` always prints `mean_score`,
+`mean_score_weighted`, and `mean_score_unweighted` together per stratum, so you
+can compare the two methods directly without touching `.env` at all.
+
+### How to customize the weights
+
+The weighted formula's criterion weights can be overridden without touching
+code, via `JURY_CRITERION_WEIGHTS` in `.env` (a JSON object naming all five
+criteria):
+
+```
+JURY_CRITERION_WEIGHTS={"faithfulness":1.5,"completeness":1.0,"clinical_usefulness":1.2,"clarity":0.8,"safety":1.3}
+```
+
+An invalid value or a value missing one of the five criteria is ignored and
+the documented defaults are used instead — a typo in `.env` cannot silently
+corrupt every score.
+
 ## Why Blind Judging Matters
 
 The judge sees only:
@@ -318,9 +394,18 @@ trustworthy:
   aggregated.
 - `valid_judge_count`: how many judges produced usable scores.
 
-Default evaluation uses one judge to control cost. Reliability mode can use more
-than one judge, for example `JUDGE_MODELS=openai,anthropic`, but that increases
-paid judge calls.
+Default evaluation uses one judge to control cost. `JUDGE_MODELS` supports a
+1 → 2 → 3 judge escalation path, each step a one-line `.env` change with no
+code changes needed:
+
+- `JUDGE_MODELS=openai` — default, cheapest, one judge.
+- `JUDGE_MODELS=openai,anthropic` — two judges, enables `judge_disagreement`.
+- `JUDGE_MODELS=openai,anthropic,gemini` — three judges, matching stock
+  MedHELM's default jury panel size (GPT-4o, Llama-3.3-70B, Claude-3.7-Sonnet
+  in the Stanford implementation; this project uses its three existing
+  provider integrations instead).
+
+Each step roughly multiplies judge-call cost by the number of judges.
 
 ## Output Fields
 
@@ -333,7 +418,9 @@ Important fields:
 - `benchmark_name`: the benchmark recipe name.
 - `rubric_version`: the rubric version that produced the score.
 - `criteria_scores`: each rubric criterion score and short reasoning.
-- `jury_score`: the primary MedHELM-style score.
+- `jury_score`: the primary score (aliases weighted or unweighted per `JURY_AGGREGATION_MODE`).
+- `jury_score_weighted` / `jury_score_unweighted`: both aggregation methods, always present.
+- `jury_aggregation_mode`: which one was primary for this row (`weighted` or `unweighted`).
 - `quality_score`: derived legacy 1 to 10 score.
 - `hallucination_claims`: quoted unsupported claims.
 - `automatic_metrics`: local secondary metrics.
@@ -347,8 +434,11 @@ Below is one **pretty-printed** row showing what you would see after evaluating
 one paper-summary pair. In the real file it is stored as a **single line** of
 JSON (no line breaks inside the object).
 
-This example uses the same criterion scores as the worked example above, so
-`jury_score = 4.02` and `quality_score = 9`.
+This example uses the same criterion scores as the worked example above. With
+the default `JURY_AGGREGATION_MODE=unweighted`, `jury_score = 4.0` (equal to
+`jury_score_unweighted`) and `quality_score = 8`. The weighted alternative
+(`jury_score_weighted = 4.02`) is stored on the row too, but is not primary
+unless `JURY_AGGREGATION_MODE=weighted`.
 
 ```json
 {
@@ -383,7 +473,10 @@ This example uses the same criterion scores as the worked example above, so
       "reasoning": "No misleading clinical interpretation detected."
     }
   },
-  "jury_score": 4.02,
+  "jury_score": 4.0,
+  "jury_score_weighted": 4.02,
+  "jury_score_unweighted": 4.0,
+  "jury_aggregation_mode": "unweighted",
   "judge_count": 1,
   "valid_judge_count": 1,
   "judge_disagreement": 0.0,
@@ -415,7 +508,7 @@ This example uses the same criterion scores as the worked example above, so
   "completeness": 4,
   "clinical_relevance": 3,
   "organization": 4,
-  "composite_score": 4.02,
+  "composite_score": 4.0,
   "hallucination_present": true,
   "hallucination_claims": [
     {
@@ -425,7 +518,7 @@ This example uses the same criterion scores as the worked example above, so
       "severity": "minor"
     }
   ],
-  "quality_score": 9,
+  "quality_score": 8,
   "hallucination_count": 1,
   "hallucination_categories": ["unsupported_inference"],
   "confidence_score": 4,
@@ -446,8 +539,9 @@ This example uses the same criterion scores as the worked example above, so
 | `doi` + `summarizer` | Which paper and which model's summary was judged |
 | `judge` | Which provider acted as the blind judge (separate from the summarizer) |
 | `criteria_scores` | The five rubric scores the judge returned — Python did not change these |
-| `jury_score` | **Primary score** — Python's weighted average of the five criteria (4.02 here) |
-| `quality_score` | Legacy 1–10 alias derived from `jury_score` (9 here) |
+| `jury_score` | **Primary score** — aliases `jury_score_unweighted` or `jury_score_weighted` depending on `JURY_AGGREGATION_MODE` (4.0 here, unweighted by default) |
+| `jury_score_weighted` / `jury_score_unweighted` | Both aggregation methods, always stored (4.02 / 4.0 here) — see ["Weighted vs. Unweighted"](#weighted-vs-unweighted) |
+| `quality_score` | Legacy 1–10 alias derived from the primary `jury_score` (8 here) |
 | `hallucination_claims` | Quoted evidence when the summary says something the paper does not support |
 | `requires_human_review` | `false` here because confidence is high and the hallucination is minor |
 | `automatic_metrics` | Secondary local checks — useful, but not the main clinical score |
@@ -461,7 +555,7 @@ paper (OpenAI, Anthropic, Gemini), you might have three lines like:
 
 ```text
 {"doi":"10.1111/jvim.16872","summarizer":"openai","jury_score":3.85,...}
-{"doi":"10.1111/jvim.16872","summarizer":"anthropic","jury_score":4.02,...}
+{"doi":"10.1111/jvim.16872","summarizer":"anthropic","jury_score":4.0,...}
 {"doi":"10.1111/jvim.16872","summarizer":"gemini","jury_score":3.67,...}
 ```
 
@@ -481,17 +575,18 @@ Example console output:
 
 ```text
 [by_summarizer]
-anthropic: n=15 mean=4.02 halluc=0.067 major=0.0 parse_fail=0.0
-gemini: n=15 mean=3.71 halluc=0.133 major=0.067 parse_fail=0.0
-openai: n=15 mean=3.89 halluc=0.067 major=0.0 parse_fail=0.0
+anthropic: n=15 mean=4.0 (weighted=4.02 unweighted=4.0) halluc=0.067 major=0.0 parse_fail=0.0
+gemini: n=15 mean=3.71 (weighted=3.74 unweighted=3.71) halluc=0.133 major=0.067 parse_fail=0.0
+openai: n=15 mean=3.89 (weighted=3.92 unweighted=3.89) halluc=0.067 major=0.0 parse_fail=0.0
 
 [by_species]
-Canine: n=30 mean=3.95 halluc=0.1 major=0.033 parse_fail=0.0
-Feline: n=15 mean=3.82 halluc=0.067 major=0.0 parse_fail=0.0
+Canine: n=30 mean=3.95 (weighted=3.97 unweighted=3.95) halluc=0.1 major=0.033 parse_fail=0.0
+Feline: n=15 mean=3.82 (weighted=3.85 unweighted=3.82) halluc=0.067 major=0.0 parse_fail=0.0
 ```
 
-This shows mean `jury_score` and reliability rates broken down by model and
-species — the MedHELM-style stratified view of your results.
+This shows the primary mean `jury_score`, both aggregation methods side by
+side, and reliability rates broken down by model and species — the
+MedHELM-style stratified view of your results.
 
 ## Safe Mock Run
 
