@@ -1,3 +1,7 @@
+# ── Offline rubric v1 (auxiliary; NOT the Phase 3 live judge rubric) ──────────
+# Heuristic scorer in src/evaluation/rubric_scoring.py reads this file.
+# Phase 3's authoritative rubric is judge_medhelm_v1.txt + vet_medhelm_score_v1.0.
+# See docs/phase4/README.md for when to use each track.
 version: rubric_v1
 title: Veterinary Summary Evaluation Rubric
 score_range:

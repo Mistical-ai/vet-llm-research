@@ -39,6 +39,7 @@ If you need a plain-English explanation of the project structure and methods, re
 
 ```text
 docs/GUIDE.md
+docs/phase4/README.md    scenarios, offline rubric, run manifests
 ```
 
 It explains the structure, methods, provider clients, safety controls, PDF-vs-JSONL comparison, and where outputs are stored.
@@ -262,6 +263,33 @@ For each summary, a judge model scores quality, counts hallucinations, and flags
 *Expect:* one line per (paper, summariser, judge) with a score and how it was parsed (`json` / `regex` / `sentinel`).
 
 *Why "blind":* an LLM asked to grade a summary it knows it wrote will inflate the score. Hiding the author is what makes the model comparison scientifically trustworthy — it's non-negotiable for the manuscript.
+
+#### Run Manifest
+
+**Purpose:** every `evaluate` run automatically writes a provenance record *before* any judge is called, and patches it with a terminal status once scoring finishes. If two runs ever produce different `jury_score` numbers, diff their manifests instead of trusting memory — code version, prompt file, dataset content, and model versions are all recorded.
+
+**File location:** `data/processed/run_manifest_<run_id>.json` (gitignored, like the rest of `data/`).
+
+**Example fields:**
+
+```json
+{
+  "run_id": "run_20260707T203117Z",
+  "status": "completed",
+  "git_commit_sha": "e66abc1a1888ef6d715c6a8a85d48ab1dcb02ef9",
+  "branch": "medhelmv1",
+  "dataset_hash_sha256": "…",
+  "selected_instance_ids": ["10.1111/jvim.16872", "…"],
+  "judges": ["openai"],
+  "model_ids": {"openai": "gpt-5.4"},
+  "resolved_model_versions": {"openai": "gpt-5.4-0325-preview"},
+  "prompt_template_id": "judge_medhelm_v1.txt",
+  "prompt_sha256": "…",
+  "evaluation_config": {"rubric_version": "vet_medhelm_score_v1.0", "jury_aggregation_mode": "unweighted"}
+}
+```
+
+**Why this improves reproducibility:** `model_ids`/`resolved_model_versions` are dicts keyed by provider — with the default `JUDGE_MODELS=openai` they hold one entry, and scale to more without any manifest code changes if you switch to a multi-judge panel. `status` is always a terminal `completed`/`failed` value (set in a `finally` block), even if the run crashes mid-evaluation, so a manifest never silently looks "in progress" forever.
 
 ### Step 4 — `status` (always free)
 

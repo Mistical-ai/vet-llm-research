@@ -78,6 +78,26 @@ RATE_LIMITS: dict[str, float] = {
 ERROR_LOG_PATH: Path = Path("data") / "error_log.jsonl"
 
 
+def processed_dir_path() -> Path:
+    """Return ``data/<PROCESSED_DIR_NAME>`` so every stage reads the same cache.
+
+    Phase 3 bootstrap, scenario paths, and offline rubric grounding all call
+    this helper instead of hardcoding ``data/processed``.  That way a single
+    ``PROCESSED_DIR_NAME=processedv2`` line in ``.env`` switches extraction,
+    summarization, evaluation, and ``pipeline.py --use-rubric`` together.
+    """
+    return Path("data") / os.getenv("PROCESSED_DIR_NAME", "processed")
+
+
+def env_path(var_name: str, default: str) -> Path:
+    """Read a repo-relative path from the environment with a stable fallback.
+
+    Used for optional artifacts (offline rubric file, rubric output JSONL) so
+    researchers can relocate outputs in ``.env`` without editing Python.
+    """
+    return Path(os.getenv(var_name, default))
+
+
 # ---------------------------------------------------------------------------
 # BudgetGuard
 # ---------------------------------------------------------------------------

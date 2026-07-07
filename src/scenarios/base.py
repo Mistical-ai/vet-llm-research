@@ -12,20 +12,30 @@ without introducing HELM as a dependency.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from utils import env_path, processed_dir_path
 
 
 @dataclass(frozen=True)
 class ScenarioPaths:
-    """Filesystem inputs used by lightweight scenarios."""
+    """Filesystem inputs used by lightweight scenarios.
+
+    ``processed_dir`` and ``summaries_path`` follow ``.env`` so researchers can
+    switch text caches or summary locations without editing scenario code.
+    Manifest and raw PDF paths stay at the conventional ``data/`` locations.
+    """
 
     manifest_path: Path = Path("data") / "manifest.jsonl"
     manual_manifest_path: Path = Path("data") / "manual_manifest.jsonl"
     raw_dir: Path = Path("data") / "raw"
-    processed_dir: Path = Path("data") / "processed"
-    summaries_path: Path = Path("data") / "summaries.jsonl"
+    # Follow PROCESSED_DIR_NAME so pipeline scenarios match Phase 3 text cache.
+    processed_dir: Path = field(default_factory=processed_dir_path)
+    summaries_path: Path = field(
+        default_factory=lambda: env_path("SUMMARIES_JSONL_PATH", "data/summaries.jsonl")
+    )
 
 
 class Scenario(ABC):

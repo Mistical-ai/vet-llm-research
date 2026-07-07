@@ -125,7 +125,31 @@ Python package dependencies.
 pipeline.py
 ```
 
-A status/scoreboard script for the corpus acquisition phase.
+Corpus scoreboard: merges OA and manual manifests, reports primary vs secondary
+PDF counts per journal, and exits non-zero when the corpus is critically short.
+Optional ``--use-rubric`` writes free heuristic scores to ``data/rubric_scores.jsonl``.
+Scenario policy lives in ``src/scenarios/`` — see ``docs/phase4/README.md``.
+
+```text
+src/scenarios/
+```
+
+Named, reproducible pipeline views (MedHELM-inspired, no HELM dependency):
+
+```text
+src/scenarios/corpus_status.py     primary_research_corpus — used by pipeline.py
+src/scenarios/summarization_quality.py   wraps Phase 3 eval instances (future CLI)
+```
+
+```text
+src/evaluation/
+```
+
+Auxiliary offline scoring (not the live Phase 3 judge):
+
+```text
+src/evaluation/rubric_scoring.py   heuristic rubric_v1 scorer for --use-rubric
+```
 
 ### `src/`
 

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from file_paths import descriptive_stem, doi_to_slug
+from utils import env_path, processed_dir_path
 
 
 DIMENSIONS = (
@@ -36,10 +37,12 @@ DIMENSIONS = (
 
 RUBRIC_MIN_SCORE = 1
 RUBRIC_MAX_SCORE = 5
-DEFAULT_RUBRIC_PATH = Path("docs") / "rubrics" / "rubric_v1.yaml"
-DEFAULT_OUTPUT_PATH = Path("data") / "rubric_scores.jsonl"
-DEFAULT_SUMMARIES_PATH = Path("data") / "summaries.jsonl"
-DEFAULT_PROCESSED_DIR = Path("data") / "processed"
+# Resolved from .env at import time (after utils.load_dotenv). Override per-call
+# in tests; change .env for local runs — see docs/phase4/README.md.
+DEFAULT_RUBRIC_PATH = env_path("OFFLINE_RUBRIC_PATH", "docs/rubrics/rubric_v1.yaml")
+DEFAULT_OUTPUT_PATH = env_path("RUBRIC_SCORES_PATH", "data/rubric_scores.jsonl")
+DEFAULT_SUMMARIES_PATH = env_path("SUMMARIES_JSONL_PATH", "data/summaries.jsonl")
+DEFAULT_PROCESSED_DIR = processed_dir_path()
 
 SPECIES_TERMS = {
     "dog", "dogs", "canine", "cat", "cats", "feline", "horse", "horses",

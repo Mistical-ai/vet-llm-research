@@ -30,8 +30,17 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from models_config import all_providers  # noqa: E402
+from models_config import all_providers, get_model_spec  # noqa: E402
 from phase3_mode import resolve_mode, VALID_MODES  # noqa: E402
+from run_manifest import (  # noqa: E402
+    build_run_manifest,
+    create_run_id,
+    finalize_run_manifest,
+    resolve_model_versions,
+    sha256_file,
+    sha256_file_or_empty,
+    write_run_manifest,
+)
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
@@ -347,78 +356,163 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         if args.judges else None
     )
 
-    # test mode: simple delegation, no journal stratification (mock, $0)
+    import evaluator
+    from eval_instances import iter_evaluation_instances
+
+    active_judges = judges or evaluator.JUDGE_MODELS
+    model_ids = {j: get_model_spec(j).model_id for j in active_judges}
+
+    journal_map: dict[str, list] = {}
+
     if profile.name == "test" or profile.dry_run:
-        from evaluator import main as evaluate_main
-        delegate = ["--mode", profile.name]
-        if args.limit is not None:
-            delegate += ["--limit", str(args.limit)]
-        if args.force:
-            delegate.append("--force")
-        if args.no_resume:
-            delegate.append("--no-resume")
-        if args.judges:
-            delegate += ["--judges", args.judges]
-        return evaluate_main(delegate)
+        # test mode: no journal stratification (mock, $0)
+        doi_filter = None
+        paper_limit = args.limit if args.limit is not None else profile.paper_limit
+        slice_config = {"type": "full_corpus_or_limit", "paper_limit": paper_limit}
+    else:
+        # single / dev / batch modes: journal-stratified sampling
+        by_journal = _load_summaries_by_journal(SUMMARIES_PATH, MANIFEST_PATH)
 
-    # single / dev / batch modes: journal-stratified sampling
-    from evaluator import run_evaluation, confirm_real_judge
+        # Warn about and log unmapped DOIs
+        unknown_entries = by_journal.pop("unknown", [])
+        if unknown_entries:
+            unknown_dois = [str(e.get("doi", "?")) for e in unknown_entries]
+            msg_lines = [
+                f"[phase3:evaluate] WARNING: {len(unknown_dois)} summaries could not be "
+                "mapped to a journal and will be excluded from stratified sampling.",
+                "  DOIs without a journal mapping in manifest.jsonl:",
+            ] + [f"    {d}" for d in unknown_dois] + [
+                "  Add the journal field to manifest.jsonl to include these articles.",
+            ]
+            for line in msg_lines:
+                print(line)
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = LOGS_DIR / "eval_journal_mapping.log"
+            ts = datetime.now(timezone.utc).isoformat()
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n[{ts}]\n" + "\n".join(msg_lines) + "\n")
 
-    by_journal = _load_summaries_by_journal(SUMMARIES_PATH, MANIFEST_PATH)
+        if not by_journal:
+            print("[phase3:evaluate] No journal-mapped summaries found. "
+                  "Run 'extract' and 'summarize' first, or check manifest.jsonl.")
+            return 1
 
-    # Warn about and log unmapped DOIs
-    unknown_entries = by_journal.pop("unknown", [])
-    if unknown_entries:
-        unknown_dois = [str(e.get("doi", "?")) for e in unknown_entries]
-        msg_lines = [
-            f"[phase3:evaluate] WARNING: {len(unknown_dois)} summaries could not be "
-            "mapped to a journal and will be excluded from stratified sampling.",
-            "  DOIs without a journal mapping in manifest.jsonl:",
-        ] + [f"    {d}" for d in unknown_dois] + [
-            "  Add the journal field to manifest.jsonl to include these articles.",
-        ]
-        for line in msg_lines:
-            print(line)
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = LOGS_DIR / "eval_journal_mapping.log"
-        ts = datetime.now(timezone.utc).isoformat()
-        with open(log_path, "a", encoding="utf-8") as lf:
-            lf.write(f"\n[{ts}]\n" + "\n".join(msg_lines) + "\n")
+        per_journal = (
+            args.limit
+            if args.limit is not None
+            else (1 if profile.name == "single" else (profile.paper_limit or 1))
+        )
+        seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
+        doi_filter, journal_map = _sample_by_journal(by_journal, per_journal, seed=seed)
+        paper_limit = None
+        slice_config = {
+            "type": "journal_stratified",
+            "per_journal": per_journal,
+            "seed": seed,
+            "journal_counts": {j: len(v) for j, v in journal_map.items()},
+        }
 
-    if not by_journal:
-        print("[phase3:evaluate] No journal-mapped summaries found. "
-              "Run 'extract' and 'summarize' first, or check manifest.jsonl.")
-        return 1
+        # Pre-evaluation summary (anonymized — journal names only, no DOIs, no model names)
+        print("\n[phase3:evaluate] Journal-stratified sampling plan:")
+        print(f"  {'Journal':<20}  Articles selected")
+        print("  " + "-" * 38)
+        for journal in sorted(journal_map):
+            print(f"  {journal:<20}  {len(journal_map[journal])}")
+        print(f"  {'TOTAL':<20}  {len(doi_filter)}")
+        print(f"  (seed={seed}, per_journal={per_journal})\n")
 
-    per_journal = (
-        args.limit
-        if args.limit is not None
-        else (1 if profile.name == "single" else (profile.paper_limit or 1))
+    # --- Build and write the run manifest before any judge is called ---
+    selected_instance_ids = sorted({
+        inst.doi for inst in iter_evaluation_instances(
+            summaries_path=evaluator.SUMMARIES_PATH,
+            doi_filter=doi_filter,
+            paper_limit=paper_limit,
+        )
+    })
+
+    if not evaluator.SUMMARIES_PATH.exists():
+        print(f"[phase3:evaluate] WARNING: {evaluator.SUMMARIES_PATH} does not exist "
+              "yet; recording an empty-file hash in the run manifest.")
+
+    prompt_file = evaluator.JUDGE_PROMPT_FILE
+    prompt_path = prompt_file if prompt_file.is_absolute() else REPO_ROOT / prompt_file
+    evaluation_config = {
+        "rubric_version": evaluator.RUBRIC_VERSION,
+        "evaluator_version": evaluator.EVALUATOR_VERSION,
+        "benchmark_name": evaluator.BENCHMARK_NAME,
+        "jury_aggregation_mode": evaluator.JURY_AGGREGATION_MODE,
+        "mode": profile.name,
+        "slice_config": slice_config,
+    }
+    manifest = build_run_manifest(
+        run_id=create_run_id(),
+        dataset_path=str(evaluator.SUMMARIES_PATH),
+        dataset_hash_sha256=sha256_file_or_empty(evaluator.SUMMARIES_PATH),
+        judges=active_judges,
+        model_ids=model_ids,
+        prompt_template_id=prompt_path.name,
+        prompt_path=str(prompt_path),
+        prompt_sha256=sha256_file(prompt_path),
+        temperature=evaluator.TEMPERATURE,
+        max_output_tokens=evaluator.MAX_OUTPUT_TOKENS,
+        seed=evaluator.SEED,
+        evaluation_config=evaluation_config,
+        selected_instance_ids=selected_instance_ids,
     )
-    seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
-    doi_filter, journal_map = _sample_by_journal(by_journal, per_journal, seed=seed)
+    manifest_path = PROCESSED_DIR / f"run_manifest_{manifest.run_id}.json"
+    write_run_manifest(manifest, manifest_path)
 
-    # Pre-evaluation summary (anonymized — journal names only, no DOIs, no model names)
-    print("\n[phase3:evaluate] Journal-stratified sampling plan:")
-    print(f"  {'Journal':<20}  Articles selected")
-    print("  " + "-" * 38)
-    for journal in sorted(journal_map):
-        print(f"  {journal:<20}  {len(journal_map[journal])}")
-    print(f"  {'TOTAL':<20}  {len(doi_filter)}")
-    print(f"  (seed={seed}, per_journal={per_journal})\n")
+    status = "started"
+    result = 1
+    try:
+        if profile.name == "test" or profile.dry_run:
+            from evaluator import confirm_real_judge, run_evaluation
+            from utils import require_positive_budget_for_real_run
 
-    if not confirm_real_judge(profile, force=args.force):
-        return 1
+            if not confirm_real_judge(profile, force=args.force):
+                status = "failed"
+                result = 1
+            else:
+                require_positive_budget_for_real_run(
+                    dry_run=profile.dry_run, context="Phase 3 evaluation",
+                )
+                counts = run_evaluation(
+                    judges=judges,
+                    resume=not args.no_resume,
+                    paper_limit=paper_limit,
+                    doi_filter=None,
+                )
+                status = "completed" if counts.get("failed", 0) == 0 else "failed"
+                result = 0 if status == "completed" else 1
+        else:
+            from evaluator import confirm_real_judge, run_evaluation
 
-    run_evaluation(
-        judges=judges,
-        resume=not args.no_resume,
-        paper_limit=None,
-        doi_filter=doi_filter,
-    )
+            if not confirm_real_judge(profile, force=args.force):
+                status = "failed"
+                result = 1
+            else:
+                counts = run_evaluation(
+                    judges=judges,
+                    resume=not args.no_resume,
+                    paper_limit=None,
+                    doi_filter=doi_filter,
+                )
+                status = "completed" if counts.get("failed", 0) == 0 else "failed"
+                _print_reveal_table(doi_filter, journal_map)
+                result = 0 if status == "completed" else 1
+        return result
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        from eval_report import iter_evaluation_rows
 
-    _print_reveal_table(doi_filter, journal_map)
-    return 0
+        resolved_versions = resolve_model_versions(
+            active_judges, model_ids, list(iter_evaluation_rows()),
+        )
+        finalize_run_manifest(
+            manifest_path, resolved_model_versions=resolved_versions, status=status,
+        )
 
 
 # ---------------------------------------------------------------------------

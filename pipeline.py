@@ -19,6 +19,14 @@ This separation-of-concerns means each stage can be run independently,
 re-run after a crash, or replaced with a different implementation without
 touching the others.
 
+SCENARIO LAYER (Phase 4)
+-------------------------
+Corpus policy (primary vs secondary PDFs, journal quotas, OA threshold) lives
+in ``src/scenarios/`` so this file stays a thin CLI.  The default scenario is
+``primary_research_corpus``.  Optional ``--use-rubric`` writes heuristic
+offline scores to ``data/rubric_scores.jsonl`` — see ``docs/phase4/README.md``.
+Phase 3's blind MedHELM judge in ``llm-sum/evaluator.py`` remains authoritative.
+
 TWO-SOURCE CORPUS MODEL
 ------------------------
 The final corpus is the union of:
@@ -66,7 +74,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from file_paths import legacy_doi_filename  # noqa: E402
 from scenarios import PrimaryResearchCorpusScenario, ScenarioPaths  # noqa: E402
-from utils import log_error           # noqa: E402
+from utils import env_path, log_error  # noqa: E402
 
 load_dotenv()
 
@@ -302,11 +310,11 @@ def main(argv: list[str] | None = None) -> int:
         # and the rubric writer cannot affect normal exit-code behavior.
         from evaluation.rubric_scoring import write_rubric_scores
 
-        output_path = Path("data") / "rubric_scores.jsonl"
+        output_path = env_path("RUBRIC_SCORES_PATH", "data/rubric_scores.jsonl")
         written = write_rubric_scores(
-            summaries_path=Path("data") / "summaries.jsonl",
+            summaries_path=env_path("SUMMARIES_JSONL_PATH", "data/summaries.jsonl"),
             manifest_records=corpus["records"],
-            rubric_path=Path("docs") / "rubrics" / "rubric_v1.yaml",
+            rubric_path=env_path("OFFLINE_RUBRIC_PATH", "docs/rubrics/rubric_v1.yaml"),
             output_path=output_path,
         )
         print(f"[pipeline] Rubric scores written: {written} row(s) -> {output_path}")
