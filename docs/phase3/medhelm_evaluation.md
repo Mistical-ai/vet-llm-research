@@ -38,7 +38,7 @@ Not borrowed:
 This keeps the pipeline lightweight and auditable while still following the
 stronger evaluation logic.
 
-## Beginner Mental Model
+## Simplified Explanation
 
 - An instance is one paper-summary pair.
 - A judge is a separate LLM that evaluates the summary.

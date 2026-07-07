@@ -127,14 +127,22 @@ pipeline.py
 
 Corpus scoreboard: merges OA and manual manifests, reports primary vs secondary
 PDF counts per journal, and exits non-zero when the corpus is critically short.
-Optional ``--use-rubric`` writes free heuristic scores to ``data/rubric_scores.jsonl``.
-Scenario policy lives in ``src/scenarios/`` — see ``docs/phase4/README.md``.
+
+Optional ``--use-rubric`` runs one extra step: a free, instant, non-AI
+sanity-check score (word-overlap and keyword checks, no LLM call, no cost)
+written to ``data/rubric_scores.jsonl``. It exists so you can catch obviously
+broken summaries before paying for the real LLM judge in Phase 3. It is never
+a substitute for that real judge.
 
 ```text
 src/scenarios/
 ```
 
-Named, reproducible pipeline views (MedHELM-inspired, no HELM dependency):
+A **scenario** is just a name for a fixed, reusable way of selecting and
+describing a set of papers — for example, "the primary-research corpus" always
+means the same filtering rules, so no script has to redefine them. This is a
+small idea borrowed from MedHELM (a medical-LLM evaluation framework), not a
+dependency on it — see ``docs/phase4/README.md`` for the full explanation:
 
 ```text
 src/scenarios/corpus_status.py     primary_research_corpus — used by pipeline.py
@@ -145,7 +153,8 @@ src/scenarios/summarization_quality.py   wraps Phase 3 eval instances (future CL
 src/evaluation/
 ```
 
-Auxiliary offline scoring (not the live Phase 3 judge):
+Auxiliary offline scoring — the free, non-AI sanity check described above, not
+the live Phase 3 judge:
 
 ```text
 src/evaluation/rubric_scoring.py   heuristic rubric_v1 scorer for --use-rubric

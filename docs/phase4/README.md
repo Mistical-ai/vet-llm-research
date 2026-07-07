@@ -1,35 +1,67 @@
 # Phase 4 — Scenarios, offline rubric, and run provenance
 
-This guide explains the MedHELM-inspired additions on the `medhelmv1` branch:
-named **scenarios**, an optional **offline rubric** for free sanity checks, and
-**run manifests** that record what produced each evaluation row.
+## What this document is about, in plain language
+
+Phase 3 already does the real work: three LLMs summarize each paper, and a
+blind judge scores the summaries. Phase 4 adds three small, optional helpers
+around that core pipeline, each solving one specific annoyance:
+
+1. **"I keep re-typing the same filter rules for which papers count."**
+   → A **scenario** is just a name for a fixed, reusable way of selecting and
+   describing a set of papers (e.g. "the primary-research corpus"), so you
+   never have to remember the exact filter logic again — you just say the name.
+2. **"I don't want to pay a judge just to sanity-check that summaries look
+   roughly reasonable."**
+   → The **offline rubric** is a free, instant, non-AI scoring pass (simple
+   word-overlap and keyword checks) you can run before spending money on the
+   real judge, purely as a smoke test.
+3. **"Two runs gave different scores — what changed?"**
+   → A **run manifest** is a small file written automatically before every
+   evaluation run, recording exactly what code, prompt, dataset, and model
+   versions produced it — so you can diff two manifests instead of guessing.
+
+These three ideas are loosely inspired by **MedHELM**, a medical-LLM
+evaluation framework from Stanford. We are not using MedHELM's code — we
+borrowed a few of its *habits* (name your benchmark, version your rubric,
+record your provenance) and rebuilt them in a few small files that fit this
+project, instead of adopting the whole framework.
 
 > **Golden rule:** Phase 3's blind judge (`llm-sum/evaluator.py` →
-> `data/evaluations.jsonl`) is the **authoritative** study endpoint. Everything
-> in this document is auxiliary unless your methods section says otherwise.
+> `data/evaluations.jsonl`) is still the **one and only authoritative score**
+> for this study. Everything on this page is an optional helper around that —
+> none of it replaces or outranks the real judge's output.
 
 ---
 
-## 1. Why these pieces exist
+## 1. Why these pieces exist (the technical summary)
 
-MedHELM-style benchmarks share three habits this project adopted in a minimal form:
+If the plain-language introduction above already made sense, here is the same
+information as a quick-reference table:
 
-| MedHELM idea | What we built | Where it lives |
+| MedHELM habit | What we built | Where it lives |
 |--------------|---------------|----------------|
-| Named scenario with fixed inputs | `PrimaryResearchCorpusScenario`, `VeterinarySummaryQualityScenario` | `src/scenarios/` |
-| Versioned rubric + structured scores | `rubric_v1.yaml` + heuristic scorer | `docs/rubrics/`, `src/evaluation/` |
-| Run provenance (code, data, prompts) | `RunManifest` written before judges run | `llm-sum/run_manifest.py` |
+| Give each reproducible paper-selection a fixed, named recipe | `PrimaryResearchCorpusScenario`, `VeterinarySummaryQualityScenario` | `src/scenarios/` |
+| Version the scoring rubric and keep scores structured | `rubric_v1.yaml` + a free heuristic scorer | `docs/rubrics/`, `src/evaluation/` |
+| Record exactly what produced each run's numbers | `RunManifest`, written before judges run | `llm-sum/run_manifest.py` |
 
-**What we deliberately did *not* import:** the HELM Python framework, PyYAML as a
+**What we deliberately did *not* import:** the full HELM Python framework, PyYAML as a
 new dependency, or a scenario registry that auto-discovers plugins. The goal is
-auditability without turning a research pipeline into a framework migration.
+auditability without turning a research pipeline into a framework migration —
+three small, readable files beat one big dependency.
 
 ---
 
 ## 2. Scenarios (`src/scenarios/`)
 
-A **scenario** is a reproducible view of the pipeline: stable name, input paths,
-and selection rules.  The base contract is small on purpose:
+**In plain terms:** every scenario is just a Python object that answers three
+questions the same way every time: "what is this set of papers called?",
+"where do its input files live?", and "which rows belong to it?" Give it a
+name once, and every script that asks for that name gets the identical
+selection logic — no copy-pasted filtering code scattered across files.
+
+Every scenario follows the same small shared template (a "base class" — think
+of it as a checklist every scenario must fill in, so any code that uses
+scenarios can treat them all the same way):
 
 ```text
 Scenario
@@ -80,6 +112,13 @@ Manifest and raw PDF paths stay at `data/manifest.jsonl` and `data/raw/` for now
 ---
 
 ## 3. Offline rubric (`--use-rubric`)
+
+**In plain terms:** this is a free, instant sanity check — plain Python code
+counting overlapping words and keywords, with no AI model and no cost — that
+answers "do these summaries look roughly in the right ballpark?" before you
+spend real money asking an LLM judge for a real score. Because it uses fixed
+rules instead of an LLM's judgment, we call it a **heuristic** scorer (a
+"rule of thumb" scorer) rather than a "judge."
 
 ### When to use it
 
@@ -168,6 +207,14 @@ unit tests isolated and avoids circular imports).
 ---
 
 ## 5. Jury score aggregation (Phase 3, documented here for comparison)
+
+**In plain terms:** the judge scores a summary on five separate criteria
+(like faithfulness, clarity, safety). Someone still has to combine those five
+numbers into one final score — that combining step is "aggregation," and this
+project computes it two different ways every time, so you can compare them.
+**For a quick rundown of criteria/judges/jury_score, see the
+[simplified explanation](../phase3/medhelm_evaluation.md#simplified-explanation)
+in medhelm_evaluation.md.**
 
 Phase 3 always stores **both**:
 

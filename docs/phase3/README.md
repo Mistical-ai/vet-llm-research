@@ -39,7 +39,9 @@ If you need a plain-English explanation of the project structure and methods, re
 
 ```text
 docs/GUIDE.md
-docs/phase4/README.md    scenarios, offline rubric, run manifests
+docs/phase4/README.md    optional extras: reusable paper-selection presets,
+                          a free pre-judge sanity check, and provenance
+                          records for each evaluation run
 ```
 
 It explains the structure, methods, provider clients, safety controls, PDF-vs-JSONL comparison, and where outputs are stored.
@@ -256,7 +258,7 @@ python llm-sum/run_phase3.py evaluate
 
 For each summary, a judge model scores quality, counts hallucinations, and flags low-confidence cases for human review — **without being told which model wrote the summary**.
 
-**Full plain-English guide (current default, MedHELM-style rubric):** [medhelm_evaluation.md](medhelm_evaluation.md) — the five scoring criteria, hallucination types, and both the weighted and unweighted `jury_score` formulas.
+**Full plain-English guide (current default, MedHELM-style rubric):** [medhelm_evaluation.md](medhelm_evaluation.md) — the five scoring criteria, hallucination types, and both the weighted and unweighted `jury_score` formulas. ("MedHELM-style" just means the rubric borrows ideas from a well-known medical-LLM scoring framework — see that guide's [simplified explanation](medhelm_evaluation.md#simplified-explanation) for a quick rundown of terms like "criteria" and "jury score".)
 
 **Legacy rubric reference:** [How the Judge Worked Under Vet-Score v2.0](judge_and_rubric.md) — kept for researchers running an explicit `judge_v2.txt` sensitivity comparison; not the current default.
 
