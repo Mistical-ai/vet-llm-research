@@ -1,6 +1,6 @@
 # Veterinary LLM Research Pipeline
 
-**Goal:** Collect 250 veterinary journal papers (50 from each of 5 journals, 2023–2026), download open-access PDFs, clean the text, and prepare for LLM summarization and evaluation.
+**Goal:** Build a reproducible research pipeline that (1) collects 250 veterinary journal papers, (2) downloads and validates open-access PDFs, (3) summarizes them with three LLMs under controlled conditions, (4) scores every summary with a blind LLM jury, (5) validates those scores against human experts, and (6) produces publication-ready tables and figures.
 
 **Project context:** OVC Pet Trust Summer Studentship, 2026.
 
@@ -9,31 +9,31 @@
 ## Table of Contents
 
 1. [How the pipeline works (plain English)](#how-the-pipeline-works-plain-english)
-2. [Project guide](#project-guide)
-3. [First-time setup](#first-time-setup)
-4. [The 4 commands you need to know](#the-4-commands-you-need-to-know)
-5. [Step-by-step guide](#step-by-step-guide)
-   - [Step 1 — Build the paper list](#step-1--build-the-paper-list)
-   - [Step 2 — Auto-download open-access PDFs](#step-2--auto-download-open-access-pdfs)
-   - [Step 3 — Check your progress](#step-3--check-your-progress)
-   - [Step 4 — Find out what's still missing](#step-4--find-out-whats-still-missing)
-   - [Step 5 — Add papers manually](#step-5--add-papers-manually)
-   - [Step 6 — Repeat until done](#step-6--repeat-until-done)
-6. [Understanding the folders](#understanding-the-folders)
-7. [Troubleshooting failed PDFs](#troubleshooting-failed-pdfs)
-8. [Optional / advanced commands](#optional--advanced-commands)
-9. [Corpus design](#corpus-design)
-10. [All environment variables (.env)](#all-environment-variables-env)
-11. [Design decisions](#design-decisions)
-12. [Glossary](#glossary)
+2. [Project phases at a glance](#project-phases-at-a-glance)
+3. [Project guide](#project-guide)
+4. [First-time setup](#first-time-setup)
+5. [The commands you need to know](#the-commands-you-need-to-know)
+6. [Phase 2 — Build the corpus](#phase-2--build-the-corpus)
+7. [Phase 3 — Summarize and evaluate](#phase-3--summarize-and-evaluate)
+8. [Phase 4 — Scenarios and provenance](#phase-4--scenarios-and-provenance)
+9. [Phase 5 — Human validation](#phase-5--human-validation)
+10. [Phase 6 — Publication reporting](#phase-6--publication-reporting)
+11. [Understanding the folders](#understanding-the-folders)
+12. [Troubleshooting](#troubleshooting)
+13. [Optional / advanced commands](#optional--advanced-commands)
+14. [Corpus design](#corpus-design)
+15. [Key environment variables (.env)](#key-environment-variables-env)
+16. [Design decisions](#design-decisions)
+17. [Glossary](#glossary)
 
 ---
 
 ## How the pipeline works (plain English)
 
-Think of the pipeline as a **post-office assembly line** with three main stations:
+Think of the project as an **assembly line** with six stations. Each station writes files to disk before the next one starts, so you never lose progress if something fails.
 
 ```
+PHASE 2 — CORPUS
 [CrossRef API]              [Open-access sources]          [Your computer]
       ↓                             ↓                              ↓
   collect.py          →        download.py           →         data/raw/
@@ -42,45 +42,55 @@ Think of the pipeline as a **post-office assembly line** with three main station
  manifest.jsonl               pipeline.py
  (catalogue of                (scoreboard:
   known papers)               how close to 250?)
-```
 
 When automatic download isn't enough (many papers are paywalled), you download them yourself from the library and run:
 
-```
 data/incoming_manuals/    →    auto_ingest_workflow.py    →    data/raw/
 (you drop PDFs here)           (matches, renames, moves)       (accepted PDFs)
+
+
+PHASE 3 — SUMMARIZE & EVALUATE
+data/raw/*.pdf    →    extract    →    data/raw_text/ + data/processed/
+                              ↓
+                         summarize    →    data/summaries.jsonl
+                              ↓
+                         evaluate     →    data/evaluations.jsonl
+                              ↓
+                         eval-report  →    data/results/
+
+
+PHASE 4 — SCENARIOS (optional helpers around Phase 3)
+pipeline.py --scenario    →    reusable paper-selection rules
+pipeline.py --use-rubric  →    free offline sanity check (not the real judge)
+run_manifest              →    provenance record for every evaluation run
+
+
+PHASE 5 — HUMAN VALIDATION
+export-human-review   →   (vets fill blind CSVs)   →   ingest-human-review
+                                                              ↓
+                                                    data/human_reviews.jsonl
+
+
+PHASE 6 — PUBLICATION
+eval-report --publication   →   tables + stats (JSON, Markdown, CSV)
+report-figures              →   charts + leaderboard (PNG/SVG)
 ```
 
-The workflow script is smart: before trying to match each PDF, it looks up the paper's DOI in CrossRef and adds it to the catalogue automatically. This means PDFs that used to get stuck in a `failed/` folder will now be matched and accepted.
+**Golden rule for scores:** Phase 3's blind LLM jury (`llm-sum/evaluator.py` → `data/evaluations.jsonl`) is the **authoritative score** for this study. Everything in Phases 4–6 is a helper around that — none of it replaces or outranks the real judge.
 
-### Phase 3 (LLM summarisation & evaluation)
+---
 
-Once `data/raw/` is full, Phase 3 turns the PDFs into LLM summaries and judge scores. Extraction is column-aware for two-column journals such as JVIM and VRU, writes raw extracted text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with publisher noise and references removed.
+## Project phases at a glance
 
-**Primary command right now — six summaries from one matched article (PDF + processed JSONL):**
+| Phase | What it does | Main command | Key output |
+|-------|-------------|--------------|------------|
+| **2 — Corpus** | Collect metadata, download OA PDFs, fill gaps manually | `python pipeline.py` | `data/raw/*.pdf` (250 target) |
+| **3 — Summarize & evaluate** | Extract text, run 3 LLMs, blind-judge every summary | `python llm-sum/run_phase3.py evaluate` | `data/evaluations.jsonl` |
+| **4 — Scenarios** | Named paper-selection rules, offline rubric, run manifests | `python pipeline.py --list-scenarios` | `data/rubric_scores.jsonl`, run manifests |
+| **5 — Human validation** | Export blind review packets, ingest vet scoresheets | `python llm-sum/run_phase3.py export-human-review` | `data/human_reviews.jsonl` |
+| **6 — Publication** | Bootstrap CIs, significance tests, figures | `python llm-sum/run_phase3.py eval-report --publication` | `data/results/publication_report_*` |
 
-```powershell
-python llm-sum/run_phase3.py summarize-all --mode single
-```
-
-Use the hyphenated subcommand `summarize-all` (not `summarize all`). The script finds one article stem that exists in both `data/raw/*.pdf` and `data/processed/*.jsonl`, then runs OpenAI, Anthropic, and Gemini on each source:
-
-| Source | Input folder | Summaries |
-|--------|--------------|-----------|
-| Raw PDF | `data/raw/` | 3 |
-| Processed JSONL | `data/processed/` | 3 |
-| **Total** | | **6** |
-
-Outputs land in readable text files (not `summaries.jsonl`):
-
-```text
-data/summaries_pdf/<matched-article-stem>.txt
-data/summaries_txt/<matched-article-stem>.txt
-```
-
-Same six-summary default in dev mode: `python llm-sum/run_phase3.py summarize-all --mode dev`. Free dry run: add `--mode test`.
-
-All Phase 3 code lives in [`llm-sum/`](llm-sum/) and is controlled by a single `PHASE3_MODE={test,single,dev,batch}` knob in `.env`. Full command reference: **[docs/phase3/run_phase3.md](docs/phase3/run_phase3.md)**. Beginner walkthrough: **[docs/phase3/README.md](docs/phase3/README.md)**.
+All Phase 3+ commands live in [`llm-sum/`](llm-sum/) and are controlled by one safety knob: `PHASE3_MODE={test,single,dev,batch}` in `.env`. The default is `test` (free mocks, no API calls).
 
 ---
 
@@ -90,16 +100,19 @@ If you need a simple explanation of the project structure and methods, start her
 
 **[docs/GUIDE.md](docs/GUIDE.md)**
 
-That guide explains:
+That guide explains how the folders connect, how data moves from PDF to summary to evaluation, why JSONL files are used, how OpenAI/Anthropic/Gemini are called, how the six-summary PDF-vs-JSONL comparison works, and how safety modes prevent accidental API spending.
 
-- how the folders connect,
-- how data moves from PDF to text to summary to evaluation,
-- why JSONL files are used,
-- how OpenAI, Anthropic, and Gemini are called,
-- how the six-summary PDF-vs-JSONL comparison works,
-- how the format guide summary is used without copying facts,
-- how safety modes prevent accidental API spending,
-- and how to describe the project in a meeting.
+**Phase-specific docs:**
+
+| Phase | Doc |
+|-------|-----|
+| 3 | [docs/phase3/README.md](docs/phase3/README.md) — beginner walkthrough |
+| 3 | [docs/phase3/run_phase3.md](docs/phase3/run_phase3.md) — full CLI reference |
+| 3 | [docs/phase3/medhelm_evaluation.md](docs/phase3/medhelm_evaluation.md) — authoritative rubric and jury math |
+| 4 | [docs/phase4/README.md](docs/phase4/README.md) — scenarios, offline rubric, run manifests |
+| 5 | [docs/phase5/human_validation.md](docs/phase5/human_validation.md) — blind human review workflow |
+| 6 | [docs/phase6/reporting.md](docs/phase6/reporting.md) — publication tables and figures |
+| Stats | [docs/statistics_explained.md](docs/statistics_explained.md) — Friedman, Wilcoxon, bootstrap CIs in plain English |
 
 ---
 
@@ -122,15 +135,21 @@ copy .env.template .env
 # Open .env in any text editor:
 #   - Set DRY_RUN=false  (use real network; keep =true just to practice)
 #   - Set UNPAYWALL_EMAIL=your.name@uoguelph.ca  (required for CrossRef)
+#   - Leave PHASE3_MODE=test until you are ready for paid API calls
 
 # 5. Verify everything loaded correctly (optional)
 python src/main.py
 # Expected output: "Pipeline Initialized." — if you see this, you're ready.
+
+# 6. Run the test suite (optional — all API calls are mocked)
+pytest tests/ -q
 ```
 
 ---
 
-## The 4 commands you need to know
+## The commands you need to know
+
+### Phase 2 — Corpus
 
 | # | Command | What it does |
 |---|---------|-------------|
@@ -138,12 +157,32 @@ python src/main.py
 | 2 | `python src/download.py` | Auto-download open-access PDFs |
 | 3 | `python src/supplement.py` | See what's still missing |
 | 4 | `python src/auto_ingest_workflow.py` | Add manual PDFs to the corpus |
+| 5 | `python pipeline.py` | Scoreboard — how close to 250? |
 
-Run `python pipeline.py` at any time to see the scoreboard.
+### Phase 3–6 — Summarize, evaluate, report
+
+| # | Command | What it does |
+|---|---------|-------------|
+| 1 | `python llm-sum/run_phase3.py extract` | PDF → cleaned text in `data/processed/` |
+| 2 | `python llm-sum/run_phase3.py summarize` | Run OpenAI, Anthropic, Gemini on each paper |
+| 3 | `python llm-sum/run_phase3.py evaluate` | Blind LLM jury scores every summary |
+| 4 | `python llm-sum/run_phase3.py eval-report` | Stratified scoreboard + save to `data/results/` |
+| 5 | `python llm-sum/run_phase3.py eval-report --publication` | Paper-ready tables with stats (Phase 6) |
+| 6 | `python llm-sum/run_phase3.py report-figures` | Charts and leaderboard (Phase 6) |
+| 7 | `python llm-sum/run_phase3.py export-human-review` | Blind review packets for vets (Phase 5) |
+| 8 | `python llm-sum/run_phase3.py ingest-human-review` | Load filled vet scoresheets (Phase 5) |
+
+**Quick dev test (six summaries, one paper, PDF vs processed text):**
+
+```powershell
+python llm-sum/run_phase3.py summarize-all --mode single
+```
+
+Use the hyphenated subcommand `summarize-all` (not `summarize all`). Free dry run: add `--mode test`.
 
 ---
 
-## Step-by-step guide
+## Phase 2 — Build the corpus
 
 ### Step 1 — Build the paper list
 
@@ -151,28 +190,11 @@ Run `python pipeline.py` at any time to see the scoreboard.
 python src/collect.py
 ```
 
-**What it does:** Asks CrossRef (a public academic database) for papers from each of the 5 journals published between 2023 and 2026. Writes one line per paper to `data/manifest.jsonl` — this is your catalogue of known papers.
-
-**What you'll see:**
-```
-[collect] JVIM: querying years 2023, 2024, 2025, 2026 ...
-[collect] JVIM 2023: 487 candidates
-[collect] JAVMA: querying years ...
-...
-[collect] Collection complete. Manifest contains 8,432 new entries.
-```
+**What it does:** Asks CrossRef for papers from each of the 5 journals published between 2023 and 2026. Writes one line per paper to `data/manifest.jsonl`.
 
 **What you'll have after:** A `data/manifest.jsonl` file with thousands of candidate papers. No PDFs yet.
 
 **Important note:** Running `collect.py` again will **add** more entries — it never deletes. If you want to start fresh, delete `data/manifest.jsonl` first.
-
-**Settings you can change in `.env`:**
-| Variable | Default | What it does |
-|----------|---------|-------------|
-| `DRY_RUN` | `true` | Set to `false` for real network calls |
-| `COLLECT_CANDIDATES_PER_JOURNAL` | `2000` | How many candidates per journal to collect |
-| `COLLECT_YEARS` | `2023,2024,2025,2026` | Which years to include |
-| `UNPAYWALL_EMAIL` | *(required)* | Your email — needed for CrossRef polite-pool access |
 
 ---
 
@@ -182,39 +204,27 @@ python src/collect.py
 python src/download.py
 ```
 
-**What it does:** Goes through every paper in `data/manifest.jsonl`, tries up to 6 legal open-access sources for each one, validates each PDF (right format? enough text? proper structure?), and saves passing PDFs to `data/raw/`. Stops at 50 PDFs per journal.
+**What it does:** Goes through every paper in `data/manifest.jsonl`, tries up to 6 legal open-access sources for each one, validates each PDF, and saves passing PDFs to `data/raw/`. Stops at 50 PDFs per journal.
 
 **The 6 sources it tries (in order):**
-1. Unpaywall API (largest OA index)
-2. PubMed Central (NIH's free archive)
+1. Unpaywall API
+2. PubMed Central
 3. Semantic Scholar
 4. fulltext-article-downloader tool
 5. Publisher-direct URLs (Wiley, AVMA, SAGE)
-6. HTML scraping (follows the DOI link, looks for a PDF button)
+6. HTML scraping
 
 **The 5 validation checks every PDF must pass:**
-1. Starts with the `%PDF` magic bytes (confirms it's a real PDF, not a login page)
+1. Starts with `%PDF` magic bytes
 2. Has at least 3 pages
 3. Has extractable text (not a scanned image)
 4. Has at least 3 of: Introduction, Methods, Results, Discussion, Conclusion
 5. Has at least 3,000 words after removing the reference list
 
-**What you'll see:**
-```
-[download] JVIM: 10.1111/jvim.16872 → Unpaywall OK (direct PDF)
-[download] JVIM: 10.1111/jvim.16858 → Cloudflare blocked — try library
-[download] JVIM: 10.1111/jvim.16918 → PMC OK
-...
-[download] JVIM: 50/50 ✓  JAVMA: 32/50  Vet Surgery: 45/50  VRU: 41/50  JFMS: 28/50
-[download] Complete. data/missing_papers.csv updated.
-```
-
 **What you'll have after:**
 - `data/raw/` — PDFs that passed all checks
 - `data/error_log.jsonl` — details on every failed attempt
-- `data/missing_papers.csv` — list of papers still needed (if any journal is under 50)
-
-**If many papers fail with "Cloudflare blocked":** That's normal. Publisher websites block automated tools. Those papers need to be downloaded manually through the library (see Step 5).
+- `data/missing_papers.csv` — papers still needed (if any journal is under 50)
 
 ---
 
@@ -224,29 +234,11 @@ python src/download.py
 python pipeline.py
 ```
 
-**What it does:** Counts every PDF in `data/raw/`, cross-references with `data/manifest.jsonl` and `data/manual_manifest.jsonl`, and prints a scoreboard.
-
-**What you'll see:**
-```
-====================================================================
-  CORPUS STATUS
-====================================================================
-  PDFs confirmed — primary:          147  (count toward quota)
-  PDFs confirmed — secondary (2_):    12  (reviews; not in quota)
-
-  Journal                  Target  Primary  Secondary  Status
-  ——————————————————————————————————————————————————————————————
-  JVIM                        50      50         4     ✓ OK
-  JAVMA                       50      32         2     NEED 18 MORE PRIMARY
-  Veterinary Surgery          50      28         3     NEED 22 MORE PRIMARY
-  VRU                         50      21         2     NEED 29 MORE PRIMARY
-  JFMS                        50      16         1     NEED 34 MORE PRIMARY
-====================================================================
-```
+**What it does:** Counts every PDF in `data/raw/`, cross-references with the manifests, and prints a per-journal scoreboard.
 
 **Exit codes:**
-- Exit 0 (success) = 200 or more primary PDFs
-- Exit 1 (warning) = fewer than 200 primary PDFs — not a crash, just means you're not done yet
+- Exit 0 = 200 or more primary PDFs (acceptable to proceed)
+- Exit 1 = fewer than 200 primary PDFs — keep going, not a crash
 
 ---
 
@@ -256,127 +248,199 @@ python pipeline.py
 python src/supplement.py
 ```
 
-**What it does:** Compares the manifest to `data/raw/` and generates a fresh list of papers still needed for each journal. Rewrites `data/missing_papers.csv` with different suggestions each time (randomly shuffled so you get variety).
-
-**What you'll see:**
-```
-[supplement] Per-journal acquisition status:
-  Journal                    Have  Target  Missing
-  --------------------------------------------------
-  JVIM                         50      50        0
-  JAVMA                        32      50       18
-  Veterinary Surgery           28      50       22
-  ...
-
-  DOI     : 10.1177/1098612X231170159
-  Title   : Feline hypertrophic cardiomyopathy in 847 cats...
-  Journal : JFMS
-  -> Check University of Guelph library access (https://lib.uoguelph.ca)
-  -> Email corresponding author for preprint / accepted manuscript
-  ...
-[supplement] Missing papers report written: data/missing_papers.csv
-```
-
-**What you'll have after:** A fresh `data/missing_papers.csv` with actionable suggestions. Open it in Excel or any spreadsheet app.
-
-**Options:**
-```powershell
-python src/supplement.py           # different suggestions every run (recommended)
-python src/supplement.py --seed 42 # same suggestions every run (for reproducibility)
-```
+**What it does:** Compares the manifest to `data/raw/` and generates a fresh `data/missing_papers.csv` with actionable suggestions. Shuffles randomly each run so you get variety.
 
 ---
 
 ### Step 5 — Add papers manually
 
-When automatic download can't get a paper (usually because it's paywalled), you can download it yourself through the University of Guelph library and add it to the corpus.
+When automatic download can't get a paper (usually paywalled), download it through the UoG library and:
 
-#### The recommended way (one command does everything)
+1. Drop the PDF into `data/incoming_manuals/` (any filename is fine)
+2. Run:
 
-**1. Download the PDF** from the UoG library or by emailing the author.
-
-**2. Drop the PDF into `data/incoming_manuals/`** — any filename is fine.
-
-**3. Run:**
 ```powershell
 python src/auto_ingest_workflow.py
 ```
 
-**What it does automatically (in order):**
-
-| Step | What happens |
-|------|-------------|
-| 1. Retry failures | Any PDFs that failed on a previous run are automatically tried again |
-| 2. Stage new files | Moves PDFs from `data/incoming_manuals/` → `data/manual_inbox/` |
-| 3. Enrich manifest | Reads each PDF's DOI, looks it up in CrossRef, adds missing entries to `data/manifest.jsonl` |
-| 4. Ingest | Matches PDFs to manifest entries, renames them properly, moves to `data/raw/` |
-| 5. Update scoreboard | Runs `pipeline.py` to show updated counts |
-| 6. Refresh missing list | Runs `supplement.py` to update `data/missing_papers.csv` |
-| 7. Clean up | Archives any remaining failures to `data/manual_inbox/archive_failed/YYYY-MM-DD/` |
-
-**What you'll see:**
-```
-[2026-05-19T14:32:01Z] === auto_ingest_workflow start ===
-[2026-05-19T14:32:01Z] retry_failed: returned 3 PDF(s) to inbox for retry.
-[2026-05-19T14:32:01Z] stage_incoming: moved paper1.pdf → manual_inbox/paper1.pdf
-[2026-05-19T14:32:02Z] enrich_manifest: starting pre-ingest CrossRef enrichment…
-[enrich] (1/4) paper1.pdf
-[enrich]   DOI found via filename: 10.1177/1098612x231170159
-[enrich]   Querying CrossRef for 10.1177/1098612x231170159 …
-[enrich]   Appended: 10.1177/1098612x231170159 | JFMS | 2023
-...
-[manual_ingest] IMPORTED paper1.pdf → JFMS__Feline HCM__10_1177_1098612X231170159.pdf
-[2026-05-19T14:32:15Z] === auto_ingest_workflow complete (retried=3, staged=1) pipeline_rc=0 ===
-```
-
-**What you'll have after:**
-- New PDFs in `data/raw/` with proper descriptive names
-- Log file: `data/logs/auto_ingest_workflow.log`
-- Anything that still couldn't be matched: `data/manual_inbox/failed/` (with a reason in `data/error_log.jsonl`)
-
-**Options:**
-```powershell
-python src/auto_ingest_workflow.py                    # standard run
-python src/auto_ingest_workflow.py --no-supplement    # skip refreshing missing_papers.csv
-python src/auto_ingest_workflow.py --no-clean         # keep failed/ folder intact for inspection
-python src/auto_ingest_workflow.py --incoming PATH    # use a different drop folder
-```
-
-#### How the PDF matching works
-
-When you drop a PDF in `incoming_manuals/`, the pipeline identifies it using three methods (in order):
-
-1. **PDF metadata** — Some PDFs store the DOI in their document properties
-2. **Filename** — If the filename looks like a DOI (e.g. `10.1177_1098612X231170159.pdf`), it reads the DOI from there
-3. **First page text** — Reads only page 1 of the PDF looking for the DOI in the header or footer
-
-Once a DOI is found, the pipeline checks if it's in `manifest.jsonl`. If not, it automatically looks it up in CrossRef and adds it before trying to ingest. This means PDFs no longer fail just because their DOI wasn't in the manifest.
-
-#### What if a PDF still ends up in `failed/`?
-
-Check `data/error_log.jsonl` for the reason. Common causes:
-
-| Reason | What it means | Fix |
-|--------|--------------|-----|
-| `failed_unknown` | No DOI found anywhere in the PDF or filename | Re-download a text-based PDF (not a scan) |
-| `failed_match` | DOI found but CrossRef doesn't know this paper | Try a different DOI, or check if the DOI is correct |
-| `failed_ambiguous_title` | Title matches multiple papers in the manifest | Rare — check the PDF's actual DOI manually |
-
-**Good news:** PDFs in `failed/` are automatically retried on the next run of `auto_ingest_workflow.py`. You don't need to move them manually.
+**What it does automatically:**
+- Retries any PDFs that failed on a previous run
+- Looks up each PDF's DOI in CrossRef and adds missing entries to `manifest.jsonl`
+- Matches, renames, and moves accepted PDFs to `data/raw/`
+- Updates the scoreboard and missing-papers list
 
 ---
 
 ### Step 6 — Repeat until done
 
 ```
-python src/download.py         → try more OA sources
-python src/supplement.py       → see updated missing list
+python src/download.py              → try more OA sources
+python src/supplement.py            → see updated missing list
 [download PDFs from library]
 python src/auto_ingest_workflow.py  → add manual PDFs
-python pipeline.py             → check the scoreboard
+python pipeline.py                  → check the scoreboard
 ```
 
-Stop when `pipeline.py` shows 250/250 primary PDFs (exit code 0 means you've hit the 200-minimum threshold).
+Stop when `pipeline.py` shows 250/250 primary PDFs.
+
+---
+
+## Phase 3 — Summarize and evaluate
+
+Once `data/raw/` has enough PDFs, Phase 3 turns them into LLM summaries and judge scores. Extraction is column-aware for two-column journals (JVIM, VRU), writes raw text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with references and publisher noise removed.
+
+### The four steps (always in this order)
+
+```
+extract  →  summarize  →  evaluate  →  eval-report
+```
+
+```powershell
+python llm-sum/run_phase3.py extract
+python llm-sum/run_phase3.py summarize
+python llm-sum/run_phase3.py evaluate
+python llm-sum/run_phase3.py eval-report
+```
+
+| Step | Input | Output |
+|------|-------|--------|
+| `extract` | `data/raw/*.pdf` | `data/raw_text/*.jsonl`, `data/processed/*.jsonl` |
+| `summarize` | `data/processed/*.jsonl` | `data/summaries.jsonl` |
+| `evaluate` | `data/summaries.jsonl` | `data/evaluations.jsonl` (append-only) |
+| `eval-report` | `data/evaluations.jsonl` | Terminal scoreboard + `data/results/eval_report_*.json` |
+
+### Safety mode (`PHASE3_MODE`)
+
+| Mode | API calls | Use for |
+|------|-----------|---------|
+| `test` (default) | None — mocks only | Learning the pipeline, running `pytest` |
+| `single` | Real, one paper | First live test |
+| `dev` | Real, small batch | Development runs |
+| `batch` | Real, full corpus via batch APIs | Production run |
+
+Every paid mode asks for confirmation before calling APIs. Set `PHASE3_MODE=test` in `.env` until you are ready to spend money.
+
+### PDF vs processed text comparison (`summarize-all`)
+
+The primary dev command runs **six summaries** from one matched article — 3 providers × 2 input sources:
+
+| Source | Input folder | Summaries |
+|--------|--------------|-----------|
+| Raw PDF | `data/raw/` | 3 |
+| Processed JSONL | `data/processed/` | 3 |
+| **Total** | | **6** |
+
+```powershell
+python llm-sum/run_phase3.py summarize-all --mode single
+```
+
+Outputs land in readable text files:
+
+```text
+data/summaries_pdf/<matched-article-stem>.txt
+data/summaries_txt/<matched-article-stem>.txt
+```
+
+### The blind jury
+
+Every summary is scored by an LLM judge that **never sees which model wrote it**. The judge scores five criteria on a 1–5 scale:
+
+1. **Faithfulness** — facts match the source paper
+2. **Completeness** — key findings are present
+3. **Clinical usefulness** — a vet could act on this
+4. **Clarity** — well-organized and readable
+5. **Safety** — no dangerous omissions or fabrications
+
+The judge also flags hallucinations (claims not supported by the source). Full rubric definition: **[docs/phase3/medhelm_evaluation.md](docs/phase3/medhelm_evaluation.md)**.
+
+### Verify extraction before spending money
+
+```powershell
+python llm-sum/run_phase3.py extract
+python scripts/verify_extraction.py --limit 20
+```
+
+`WARN` can be legitimate for short communications and case reports. `FAIL` needs investigation before any paid summaries.
+
+---
+
+## Phase 4 — Scenarios and provenance
+
+Phase 4 adds three optional helpers around Phase 3. None of them replace the blind judge.
+
+| Helper | What it solves | Command |
+|--------|---------------|---------|
+| **Scenarios** | Reusable, named paper-selection rules | `python pipeline.py` (default: `primary_research_corpus`) |
+| **Offline rubric** | Free sanity check before paying the judge | `python pipeline.py --use-rubric` |
+| **Run manifests** | Record exactly what produced each evaluation run | Written automatically before every `evaluate` run |
+
+List all scenarios:
+
+```powershell
+python pipeline.py --list-scenarios
+```
+
+Full details: **[docs/phase4/README.md](docs/phase4/README.md)**
+
+---
+
+## Phase 5 — Human validation
+
+Before trusting LLM jury scores at scale, we check them against human experts. The workflow is three commands:
+
+```text
+export-human-review  →  (vets fill blind CSVs)  →  ingest-human-review  →  eval-report
+```
+
+```powershell
+# 1. Export blind review packets (no model names in the files)
+python llm-sum/run_phase3.py export-human-review
+
+# 2. After vets return filled scoresheets:
+python llm-sum/run_phase3.py ingest-human-review
+
+# 3. See human-vs-jury agreement in the eval report
+python llm-sum/run_phase3.py eval-report --markdown
+```
+
+Reviewers score the **same five criteria** the jury uses, so agreement is measured on the same construct. Inter-reviewer reliability uses **Krippendorff's α**.
+
+Full workflow: **[docs/phase5/human_validation.md](docs/phase5/human_validation.md)**
+
+---
+
+## Phase 6 — Publication reporting
+
+One command turns evaluation rows into paper-ready quantitative results:
+
+```powershell
+python llm-sum/run_phase3.py eval-report --publication
+```
+
+**What it writes to `data/results/` (timestamped — nothing is overwritten):**
+
+| Artifact | What it is |
+|----------|-----------|
+| `publication_report_<ts>.json` | Full report, machine-readable |
+| `publication_report_<ts>.md` | Same tables in Markdown for a manuscript |
+| `publication_report_<ts>_tables/` | One CSV per table for a stats package |
+
+**Tables include:**
+- Provider comparison (mean jury score, 95% bootstrap CI, cost, cost-per-quality-point)
+- Significance tests (Friedman omnibus + pairwise Wilcoxon, separate for weighted and unweighted scores)
+- Per-stratum breakdowns (species, study design, clinical topic, journal)
+- Input-channel comparison (processed text vs direct PDF)
+- Inter-judge reliability (Krippendorff's α)
+
+**Figures and leaderboard:**
+
+```powershell
+python llm-sum/run_phase3.py report-figures
+```
+
+Writes PNG/SVG charts and a VetHELM-style leaderboard to `data/results/`.
+
+Full details: **[docs/phase6/reporting.md](docs/phase6/reporting.md)** and **[docs/statistics_explained.md](docs/statistics_explained.md)**
 
 ---
 
@@ -386,143 +450,125 @@ Stop when `pipeline.py` shows 250/250 primary PDFs (exit code 0 means you've hit
 vet-llm-research/
 ├── data/
 │   ├── manifest.jsonl            ← Paper catalogue (built by collect.py)
-│   ├── manual_manifest.jsonl     ← Manually ingested papers (built by auto_ingest_workflow.py)
+│   ├── manual_manifest.jsonl     ← Manually ingested papers
+│   ├── summaries.jsonl           ← Phase 3: one row per paper, all provider summaries
+│   ├── evaluations.jsonl         ← Phase 3: blind judge scores (append-only)
+│   ├── human_reviews.jsonl       ← Phase 5: normalized vet scoresheets
+│   ├── rubric_scores.jsonl       ← Phase 4: offline heuristic scores (optional)
 │   ├── error_log.jsonl           ← All errors with details (never deleted)
 │   ├── missing_papers.csv        ← What's still needed (rewritten each supplement run)
 │   │
 │   ├── raw/                      ← ✅ ACCEPTED PDFs (your corpus lives here)
 │   ├── incoming_manuals/         ← 📥 DROP NEW PDFs HERE
-│   │
 │   ├── manual_inbox/             ← Staging area (auto_ingest_workflow.py manages this)
-│   │   ├── *.pdf                 ← Being processed right now
-│   │   ├── failed/               ← Couldn't match (automatically retried on next run)
-│   │   ├── skipped_existing_in_raw/  ← Already in corpus (safe to ignore)
-│   │   └── archive_failed/
-│   │       └── YYYY-MM-DD/       ← Failed PDFs archived by date
-│   │
 │   ├── quarantine/               ← PDFs moved out by audit_article_types.py
-│   ├── raw_text/                 ← Phase 3 raw column-aware extracted text
-│   ├── processed/                ← Phase 3 cleaned text for LLM summaries
+│   │
+│   ├── raw_text/                 ← Phase 3: column-aware extracted text
+│   ├── processed/                ← Phase 3: cleaned text for LLM summaries
+│   ├── summaries_pdf/            ← Phase 3: summarize-all PDF-source outputs
+│   ├── summaries_txt/            ← Phase 3: summarize-all processed-text outputs
+│   ├── human_review/             ← Phase 5: exported blind review packets
+│   ├── run_manifests/            ← Phase 4: provenance records per evaluation run
+│   ├── results/                  ← Phase 3/6: timestamped eval and publication reports
 │   └── logs/
-│       └── auto_ingest_workflow.log  ← Full run log
+│       └── auto_ingest_workflow.log
 │
-├── src/
-│   ├── collect.py                ← Build manifest.jsonl
-│   ├── download.py               ← Auto-download OA PDFs
-│   ├── supplement.py             ← Missing-paper report + shopping list
-│   ├── auto_ingest_workflow.py   ← One-command manual ingest
-│   ├── enrich_manifest_from_pdfs.py  ← CrossRef lookup for unknown PDFs
-│   ├── ingest_manual_pdfs.py     ← Match PDFs to manifest, move to raw/
-│   ├── audit_article_types.py    ← Reclassify/remove non-primary articles
-│   └── extract.py                ← Text extraction (smoke test only)
+├── src/                          ← Phase 2: collect, download, extract, scenarios
+│   ├── collect.py
+│   ├── download.py
+│   ├── supplement.py
+│   ├── auto_ingest_workflow.py
+│   ├── extract.py
+│   ├── scenarios/                ← Phase 4: named paper-selection rules
+│   └── evaluation/               ← Phase 4: offline rubric scoring
 │
-├── pipeline.py                   ← Scoreboard
+├── llm-sum/                      ← Phase 3–6: summarize, judge, report, human review
+│   ├── run_phase3.py             ← Main orchestrator (all subcommands)
+│   ├── summarizer.py
+│   ├── evaluator.py
+│   ├── eval_report.py
+│   ├── report_tables.py          ← Phase 6: publication tables
+│   ├── report_figures.py         ← Phase 6: charts and leaderboard
+│   ├── human_review.py           ← Phase 5: export + ingest
+│   ├── reliability.py            ← Krippendorff's α and agreement stats
+│   └── prompts/                  ← Summarizer and judge prompt templates
+│
+├── scripts/
+│   ├── verify_extraction.py      ← Audit extraction quality before paid runs
+│   └── migrate_processed_filenames.py
+│
+├── tests/                        ← pytest suite (all API calls mocked)
+├── docs/                         ← Phase guides and rubric definitions
+├── pipeline.py                   ← Corpus scoreboard + scenario CLI
 ├── .env                          ← Your settings (never commit this)
 └── .env.template                 ← Settings reference
 ```
 
 ---
 
-## Troubleshooting failed PDFs
+## Troubleshooting
 
-### "A PDF I dropped in incoming_manuals/ ended up in failed/"
+### Phase 2 — Failed PDFs
 
-**Step 1 — Check the error log:**
+**A PDF in `incoming_manuals/` ended up in `failed/`:**
+
 ```powershell
-# Find entries for your PDF
 Select-String -Path data\error_log.jsonl -Pattern "your_filename_or_doi"
+python src/auto_ingest_workflow.py   # failed PDFs are automatically retried
 ```
-
-**Step 2 — Re-run the workflow** (failed PDFs are automatically retried):
-```powershell
-python src/auto_ingest_workflow.py
-```
-
-**Step 3 — If it still fails, check the reason:**
 
 | Error in log | Meaning | Fix |
 |-------------|---------|-----|
-| `pdfplumber metadata read failed` | PDF is a scanned image or corrupt | Download a text-based PDF from the publisher's website (not a scan) |
-| `CrossRef 404` | DOI not registered in CrossRef | Verify the DOI is correct; try searching the title on CrossRef.org |
-| `No DOI found (tried metadata, filename, page-1)` | No DOI anywhere in the file | Rename the file to match its DOI: `10.1177_1098612X231170159.pdf` |
-| `No OA or title linkage` | DOI found but not in manifest and CrossRef failed | Run `collect.py` to refresh the manifest, then retry |
+| `pdfplumber metadata read failed` | Scanned image or corrupt PDF | Download a text-based PDF |
+| `CrossRef 404` | DOI not in CrossRef | Verify the DOI on CrossRef.org |
+| `No DOI found` | No DOI in metadata, filename, or page 1 | Rename file: `10.1177_1098612X231170159.pdf` |
 
-**Pro tip:** If you know the DOI, rename the file before dropping it:
-```
-10.1177_1098612X231170159.pdf    ← use _ instead of / in the DOI
-```
-The pipeline will extract the DOI from the filename automatically.
+**`pipeline.py` exits with code 1:** You haven't reached 200 primary PDFs yet — keep going.
 
-### "supplement.py keeps showing me papers I've already skipped"
+**`supplement.py` keeps showing the same papers:** Run it again — it shuffles randomly each time.
 
-Run it again — it shuffles randomly each time:
-```powershell
-python src/supplement.py
-```
-Each run shows a different subset of missing papers. If you don't want certain papers (e.g., they're all paywalled with no library access), just skip them and run again for new suggestions.
+### Phase 3 — Extraction and evaluation
 
-### "pipeline.py exits with code 1"
+**`verify_extraction.py` shows FAIL:** Compare `data/raw_text/<name>.jsonl` against `data/processed/<name>.jsonl`. If Methods/Results/Discussion disappeared, reference stripping needs adjustment. If raw text is tiny, the PDF is probably scanned.
 
-That just means you haven't reached 200 primary PDFs yet — it's not a crash. Keep going through the loop (download → supplement → manual add).
+**`eval-report` says zero rows:** Run `evaluate` first so `data/evaluations.jsonl` has at least one row.
 
-### "I accidentally ran collect.py twice and have duplicates in manifest.jsonl"
-
-Not a problem — the rest of the pipeline deduplicates by DOI. Duplicate lines in `manifest.jsonl` are safely ignored.
-
-### "verify_extraction.py shows WARN or FAIL"
-
-Run this after Phase 3 extraction and before any paid summaries:
-
-```powershell
-python llm-sum/run_phase3.py extract
-python scripts/verify_extraction.py --limit 20
-```
-
-`WARN` can be legitimate for short communications, case reports, and other article types that may still exist in `data/raw/` but are excluded from the final corpus. `FAIL` needs investigation before spending money. Compare `data/raw_text/<name>.jsonl` against `data/processed/<name>.jsonl`: if Methods, Results, or Discussion disappeared, reference stripping or watermark cleanup needs adjustment; if the raw text itself is tiny, the PDF is probably scanned or not a full research article.
+**Accidental API spending:** Set `PHASE3_MODE=test` in `.env`. The default is already `test` — you must deliberately switch to a paid mode.
 
 ---
 
 ## Optional / advanced commands
 
-### Clean up article types already in `data/raw/`
-
-If you realize some PDFs in `data/raw/` are case reports, editorials, or other non-primary articles:
+### Clean up article types in `data/raw/`
 
 ```powershell
-# Preview only — no changes
-python src/audit_article_types.py
-
-# Move excluded types to quarantine + rename reviews with 2_ prefix
-python src/audit_article_types.py --remove --tag-secondary
+python src/audit_article_types.py              # preview only
+python src/audit_article_types.py --remove --tag-secondary   # move excluded types to quarantine
 ```
 
-After running `--remove`, run `supplement.py` again to get updated missing-paper suggestions.
-
-### Preview manifest enrichment without writing anything
+### Phase 4 offline rubric (free smoke test)
 
 ```powershell
-python src/enrich_manifest_from_pdfs.py --dry-run
+python pipeline.py --use-rubric
 ```
 
-Shows which PDFs would have new manifest entries added, without touching `manifest.jsonl`.
+### Phase 3 batch API (full corpus, 50% cheaper)
 
-### Run supplement with a fixed seed (for reproducible results)
+```powershell
+python llm-sum/run_phase3.py summarize --mode batch
+python llm-sum/check_batch_status.py
+```
+
+### Cost estimate before a live run
+
+```powershell
+python llm-sum/cost_estimator.py
+```
+
+### Run supplement with a fixed seed
 
 ```powershell
 python src/supplement.py --seed 42
-```
-
-Pass any integer as `--seed`. The same number always gives the same suggestions — useful if you need to share a specific list with a collaborator.
-
-### Run a specific part of the workflow manually
-
-```powershell
-# If PDFs are already in manual_inbox/ (not incoming_manuals/)
-python src/ingest_manual_pdfs.py
-python pipeline.py
-
-# Just add CrossRef entries for PDFs already in the inbox
-python src/enrich_manifest_from_pdfs.py
 ```
 
 ---
@@ -542,31 +588,29 @@ python src/enrich_manifest_from_pdfs.py
 **Date range:** 2023-01-01 to 2026-12-31
 
 **Primary vs. secondary PDFs:**
-- **Primary** (count toward the 50-per-journal quota): original research articles
-- **Secondary** (tagged with `2_` prefix, do not count toward quota): systematic reviews, meta-analyses, scoping reviews
+- **Primary** (count toward quota): original research articles
+- **Secondary** (`2_` prefix, not in quota): systematic reviews, meta-analyses
 
-**Article types excluded entirely:** case reports, short communications, brief reports, imaging diagnoses, rapid communications
+**Article types excluded:** case reports, short communications, brief reports, imaging diagnoses
 
-**Minimum threshold:** `pipeline.py` exits 0 when you have ≥ 200 primary PDFs. The full 250 is the goal.
+**Minimum threshold:** `pipeline.py` exits 0 when you have ≥ 200 primary PDFs.
 
 ---
 
-## All environment variables (.env)
+## Key environment variables (.env)
 
 Copy `.env.template` to `.env` and fill in your values. The most important ones:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DRY_RUN` | `true` | Set to `false` for real network calls. Keep `true` to practice without the internet. |
-| `UNPAYWALL_EMAIL` | *(required)* | Your email address — required for CrossRef and Unpaywall access |
-| `COLLECT_CANDIDATES_PER_JOURNAL` | `2000` | How many candidate papers per journal to collect |
+| `DRY_RUN` | `true` | Set to `false` for real network calls in Phase 2 |
+| `UNPAYWALL_EMAIL` | *(required)* | Your email — required for CrossRef and Unpaywall |
+| `PHASE3_MODE` | `test` | `test` / `single` / `dev` / `batch` — controls all Phase 3 API calls |
 | `COLLECT_YEARS` | `2023,2024,2025,2026` | Which years to query |
-| `DOWNLOAD_VERBOSE` | `false` | Set to `true` to see every URL attempted |
-| `MAX_FAILED_PER_JOURNAL` | `300` | Stop-loss: give up on a journal after this many download failures |
-| `MIN_PAGES` | `3` | Reject PDFs shorter than this many pages |
-| `MIN_EXTRACTED_WORDS` | `3000` | Reject PDFs with fewer than this many words (after removing references) |
-| `PDFPLUMBER_USE_TEXT_FLOW` | `true` | Preserve reading order in two-column PDFs during Phase 3 extraction |
-| `EXCLUDE_ARTICLE_TYPE_PATTERNS` | *(see template)* | Comma-separated title phrases that mark non-primary articles |
+| `MIN_EXTRACTED_WORDS` | `3000` | Reject PDFs with fewer words after removing references |
+| `PDFPLUMBER_USE_TEXT_FLOW` | `true` | Preserve reading order in two-column PDFs |
+| `PUBLICATION_BOOTSTRAP_RESAMPLES` | `2000` | Bootstrap resamples for Phase 6 confidence intervals |
+| `HUMAN_REVIEW_SAMPLE_SIZE` | `15` | How many summaries to export for Phase 5 |
 
 Full list in `.env.template`.
 
@@ -575,25 +619,25 @@ Full list in `.env.template`.
 ## Design decisions
 
 **Why CrossRef instead of PubMed?**
-CrossRef covers all 5 target journals with structured metadata (title, DOI, year, authors, abstract). PubMed's E-utils are used as a *download fallback* (PMC hosts many free PDFs), not as the primary catalogue source.
+CrossRef covers all 5 target journals with structured metadata. PubMed's E-utils are used as a download fallback (PMC), not as the primary catalogue.
 
-**Why random shuffling in supplement.py?**
-The paper list is always in the same manifest order (newest-first from CrossRef). Without shuffling, you'd see the same suggestions every run, even after skipping papers you can't get. Shuffling surfaces different candidates each time.
+**Why JSONL everywhere?**
+Each line is an independent JSON object. If one line is corrupted, the rest of the file is still readable. Append-only logs (`evaluations.jsonl`, `error_log.jsonl`) preserve full audit history.
+
+**Why blind judging?**
+If the judge knew which model wrote a summary, it could play favourites. Blinding both the LLM jury and human reviewers keeps scores independent and defensible.
+
+**Why three LLM providers?**
+OpenAI, Anthropic, and Gemini use different architectures and training data. Running all three under identical prompts isolates provider quality from prompt quality.
+
+**Why separate `raw_text/` and `processed/`?**
+Raw text is the faithful PDF extraction. Processed text has references and publisher noise removed. Keeping both lets you compare "what the PDF actually says" vs "what we send to the LLM."
+
+**Why append-only `evaluations.jsonl`?**
+Re-running the judge never deletes old scores. You can always trace which run produced which row via the run manifest.
 
 **Why retry failed PDFs automatically?**
-A PDF can fail on one run (because its DOI wasn't in the manifest yet) and succeed on the next (after `enrich_manifest_from_pdfs.py` adds the entry). Automatically moving PDFs out of `failed/` and retrying them eliminates a manual step.
-
-**Why look up DOIs from three places (metadata, filename, page 1)?**
-Most publisher PDFs don't store the DOI in their embedded metadata dictionary — they show it as text on page 1, and download tools often name files after their DOI (e.g. `10.1177_xxx.pdf`). Checking all three places means the pipeline can identify almost any publisher PDF without human intervention.
-
-**Why metadata-only DOIs are NOT used for page-text scanning?**
-The first 5 pages of many papers include a reference list. Scanning page text for DOIs would risk adding a *cited paper* to the manifest instead of the paper itself. The enrichment step therefore checks metadata, then filename, then page 1 only — never pages 2–5.
-
-**Why append-only manifests?**
-`manifest.jsonl` and `manual_manifest.jsonl` are only ever appended. This preserves the full collection history and makes reruns safe: deduplication happens at read time, never by deleting existing rows.
-
-**Why 1-second delay between CrossRef calls in enrich_manifest_from_pdfs.py?**
-CrossRef's polite pool provides higher rate limits to clients that identify themselves with an email address and keep requests to ~1/second. The `UNPAYWALL_EMAIL` in `.env` is sent in the `User-Agent` header for this reason.
+A PDF can fail because its DOI wasn't in the manifest yet, then succeed after enrichment adds the entry. Automatic retry eliminates a manual step.
 
 ---
 
@@ -601,29 +645,54 @@ CrossRef's polite pool provides higher rate limits to clients that identify them
 
 | Term | Meaning |
 |------|---------|
-| **API** | Application Programming Interface — a way for two programs to talk to each other over the internet. CrossRef, Unpaywall, and PubMed are all accessed via their APIs. |
-| **Candidate** | A paper in `manifest.jsonl` that has not yet been downloaded. All manifest entries start as candidates. |
-| **CrossRef** | The non-profit registry that assigns and tracks DOIs for academic journals. Used by `collect.py` to find paper metadata. |
-| **DOI** | Digital Object Identifier — a permanent link to a paper, e.g. `10.1111/jvim.12345`. Every paper in the corpus has one. |
-| **DRY_RUN** | When `DRY_RUN=true`, scripts skip real network calls and use mock/fixture data. Safe for testing and practice. |
-| **Enrich (manifest enrichment)** | The step where `enrich_manifest_from_pdfs.py` looks up unknown DOIs in CrossRef and adds them to `manifest.jsonl` so ingest can match the PDFs. |
+| **API** | Application Programming Interface — a way for two programs to talk over the internet. CrossRef, Unpaywall, and the LLM providers are all accessed via APIs. |
+| **Append-only** | A file that is only ever added to, never overwritten. `evaluations.jsonl` and `error_log.jsonl` work this way so audit history is never lost. |
+| **Batch API** | A cheaper, slower OpenAI/Anthropic mode where you submit many requests at once and collect results later (~50% off). Used for full-corpus runs via `PHASE3_MODE=batch`. |
+| **Blind protocol** | The judge (and human reviewers) never see which LLM wrote a summary. This prevents expectation bias. Enforced in `evaluator.py` and `human_review.py`. |
+| **Bootstrap CI** | A statistical method that resamples your data thousands of times to estimate a 95% confidence interval without assuming a normal distribution. Used in Phase 6 publication tables. |
+| **BudgetGuard** | A safety class in `src/utils.py` that tracks total API spend and calls `sys.exit()` if a hard budget limit is exceeded. |
+| **Candidate** | A paper in `manifest.jsonl` that has not yet been downloaded. |
+| **CrossRef** | The non-profit registry that assigns DOIs for academic journals. Used by `collect.py` to find paper metadata. |
+| **DOI** | Digital Object Identifier — a permanent link to a paper, e.g. `10.1111/jvim.12345`. |
+| **DRY_RUN** | When `DRY_RUN=true`, Phase 2 scripts skip real network calls and use mock data. Safe for testing. |
+| **Enrich (manifest enrichment)** | `enrich_manifest_from_pdfs.py` looks up unknown DOIs in CrossRef and adds them to `manifest.jsonl` so ingest can match PDFs. |
+| **eval-report** | Read-only command that summarizes `data/evaluations.jsonl` by model, species, study design, and other strata. Saves timestamped snapshots to `data/results/`. |
+| **Evaluation instance** | One (paper × input channel × summary) row that the blind judge scores. A paper judged from both PDF and processed text counts as two instances. |
 | **Exit code** | A number a program returns when it finishes. 0 = success; 1 = something needs attention (not necessarily a crash). |
-| **failed/** | The subfolder inside `data/manual_inbox/` where PDFs land if the pipeline can't identify them. They are automatically retried on the next `auto_ingest_workflow.py` run. |
-| **Fixture** | A small, pre-built data file used for testing. Lives in `tests/fixtures/`. |
-| **ISSN** | International Standard Serial Number — a journal's unique identifier, like a DOI for the journal itself. |
-| **LLM** | Large Language Model — an AI like GPT-4 or Claude. The goal of this pipeline is to build a dataset for evaluating how well LLMs summarize veterinary papers. |
-| **magic bytes** | The first few bytes of a file that identify its type. A real PDF always starts with `%PDF`. If a "PDF" starts with `<html>`, it's a login wall, not a paper. |
-| **manifest.jsonl** | The catalogue file. Each line is a JSON object representing one paper (DOI, title, journal, year, authors, abstract). |
-| **manual_manifest.jsonl** | Same format as `manifest.jsonl`, but contains only papers you added manually. Both are merged by `pipeline.py`. |
-| **OA / open access** | A paper that can be legally downloaded for free. The pipeline only ever downloads OA papers. |
-| **Paywall** | A barrier that requires a journal subscription to access a paper. The pipeline cannot bypass paywalls — those papers must be obtained through the library. |
-| **PMC / PubMed Central** | The U.S. National Institutes of Health free archive of biomedical papers. Many veterinary papers are deposited here. |
-| **Primary PDF** | An original research article that counts toward the 50-per-journal quota. Contrast with secondary (reviews). |
+| **Friedman test** | A non-parametric test for whether provider scores differ across the whole corpus. Used in Phase 6 significance tables. |
+| **Hallucination** | A claim in a summary that is not supported by the source paper. The judge flags these explicitly. |
+| **Human validation** | Phase 5 workflow where veterinarians score a sample of summaries on the same rubric as the LLM jury, to check whether jury scores track expert judgment. |
+| **ISSN** | International Standard Serial Number — a journal's unique identifier. |
+| **JSONL** | JSON Lines — a text file where each line is one JSON object. Corruption-resistant and append-safe. |
+| **Jury score** | The mean of a summary's five criterion scores (faithfulness, completeness, clinical usefulness, clarity, safety). Computed in both weighted and unweighted modes. |
+| **Krippendorff's α (alpha)** | A chance-corrected inter-rater reliability statistic. α = 1 means perfect agreement; α = 0 means no better than chance. Used for inter-judge and inter-reviewer agreement. |
+| **LLM** | Large Language Model — an AI like GPT-4, Claude, or Gemini. This pipeline compares how well different LLMs summarize veterinary papers. |
+| **magic bytes** | The first few bytes of a file that identify its type. A real PDF always starts with `%PDF`. |
+| **manifest.jsonl** | The catalogue file. Each line is one paper (DOI, title, journal, year, authors, abstract, covariates). |
+| **MedHELM** | A medical-LLM evaluation framework from Stanford. We borrowed its habits (named benchmarks, versioned rubrics, stratified reporting) without importing its code. |
+| **OA / open access** | A paper that can be legally downloaded for free. The pipeline only auto-downloads OA papers. |
+| **Offline rubric** | A free, non-AI heuristic scorer (`src/evaluation/rubric_scoring.py`) that checks word overlap and keyword presence. A smoke test only — not the real judge. |
+| **Paywall** | A barrier requiring a journal subscription. Those papers must be obtained through the library. |
+| **PHASE3_MODE** | Single safety knob controlling all Phase 3 API behavior: `test` (mocks), `single` (one paper), `dev` (small batch), `batch` (full corpus). |
+| **PMC / PubMed Central** | NIH's free archive of biomedical papers. A common OA download source. |
+| **Primary PDF** | An original research article counting toward the 50-per-journal quota. |
+| **Processed text** | Cleaned body text in `data/processed/` with references and publisher noise removed. Default input for summarization. |
+| **Provider** | One of the three LLM backends: OpenAI, Anthropic, or Gemini. |
+| **Publication report** | Phase 6 output with provider comparison tables, bootstrap CIs, significance tests, and per-stratum breakdowns. Written by `eval-report --publication`. |
 | **Quarantine** | `data/quarantine/` — where `audit_article_types.py` moves PDFs that shouldn't be in `data/raw/`. |
-| **Raw** | `data/raw/` — the final home of all accepted PDFs, renamed to a consistent format. |
-| **Secondary PDF** | A review article (systematic review, meta-analysis, etc.) — tagged with a `2_` filename prefix and not counted toward the quota. |
-| **Stop-loss** | A safety limit that prevents infinite downloading. `MAX_FAILED_PER_JOURNAL=300` means: give up on a journal after 300 consecutive failures. |
-| **Supplement** | The process of manually filling gaps that `download.py` couldn't fill automatically. `supplement.py` generates the shopping list. |
-| **Unpaywall** | A database that tracks legal open-access locations for papers. `download.py` uses it as its first download source. |
-| **Virtual environment** | An isolated Python installation. `.venv\Scripts\activate` activates it so your packages don't conflict with other Python projects. |
-| **Word-count gate** | The validation rule in `download.py` that rejects PDFs with fewer than 3,000 extracted words. Prevents short articles and corrupted text from entering the corpus. |
+| **Raw text** | Faithful column-aware PDF extraction in `data/raw_text/`, before reference stripping. |
+| **Run manifest** | A JSON file written before every `evaluate` run recording code version, prompt version, model IDs, and dataset snapshot. Enables diffing two runs. |
+| **Scenario** | A named, reusable paper-selection rule in `src/scenarios/`. Example: `primary_research_corpus` applies the journal quota and primary/secondary classification. |
+| **Secondary PDF** | A review article tagged with `2_` prefix — kept but not counted toward quota. |
+| **Seed** | A fixed random number (`seed=42`) that makes LLM outputs reproducible where the provider supports it. |
+| **Stratified reporting** | Breaking down scores by research covariates (species, study design, clinical topic, journal) so you can see whether one provider wins everywhere or only in certain areas. |
+| **Stop-loss** | A safety limit preventing infinite downloading. `MAX_FAILED_PER_JOURNAL=300` gives up on a journal after 300 consecutive failures. |
+| **Summarize-all** | Dev command that runs 6 summaries (3 providers × 2 input sources) on one matched article for PDF-vs-processed comparison. |
+| **Supplement** | Manually filling gaps that `download.py` couldn't fill. `supplement.py` generates the shopping list. |
+| **Taxonomy** | `vet_taxonomy_v1` in `src/scenarios/taxonomy.py` — a versioned category tree for grouping evaluation tasks (species, study design, clinical topic). |
+| **Temperature** | An LLM setting controlling randomness. This pipeline always uses `temperature=0.0` for reproducibility. |
+| **Unpaywall** | A database tracking legal open-access locations for papers. `download.py` uses it as its first download source. |
+| **Virtual environment** | An isolated Python installation. `.venv\Scripts\activate` activates it. |
+| **VetHELM** | This project's name for its MedHELM-inspired evaluation layer: blind jury, stratified reporting, publication tables, and human validation. |
+| **Wilcoxon signed-rank test** | A paired non-parametric test comparing two providers on the same papers. Used in Phase 6 pairwise significance tables. |
+| **Word-count gate** | Validation rule rejecting PDFs with fewer than 3,000 extracted words. Prevents short articles from entering the corpus. |
