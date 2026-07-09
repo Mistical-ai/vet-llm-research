@@ -113,6 +113,7 @@ That guide explains how the folders connect, how data moves from PDF to summary 
 | 5 | [docs/phase5/human_validation.md](docs/phase5/human_validation.md) — blind human review workflow |
 | 6 | [docs/phase6/reporting.md](docs/phase6/reporting.md) — publication tables and figures |
 | Stats | [docs/statistics_explained.md](docs/statistics_explained.md) — Friedman, Wilcoxon, bootstrap CIs in plain English |
+| Booklet | [docs/booklet/BOOKLET.md](docs/booklet/BOOKLET.md) — full teaching booklet, start to finish, for a complete beginner (plus a standalone chapter for veterinarian reviewers) |
 
 ---
 

@@ -67,6 +67,8 @@ from models_config import all_providers, compute_cost
 from reliability import compute_reliability
 from scenarios import VET_TAXONOMY_V1, VeterinarySummaryQualityScenario
 from eval_report import iter_evaluation_rows
+from eval_instances import load_manifest_index
+import stats_engine  # noqa: E402  (information density, subscription economics, covariates)
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
@@ -89,6 +91,14 @@ DEFAULT_CI_ALPHA = 0.05
 # unstable, so the reported verdict is caveated (the number is still shown for
 # transparency). Mirrors reliability.MIN_CORRELATION_N's intent.
 MIN_ITEMS_FOR_SIGNIFICANCE = 10
+
+# Multiple-comparison correction applied to the family of pairwise Wilcoxon
+# p-values within one score mode. Benjamini-Hochberg (false discovery rate) is
+# used rather than Holm/Bonferroni because a stratified study runs many
+# comparisons and FDR keeps power without inflating false positives; it comes
+# from scipy.stats.false_discovery_control (no new dependency, no hand-rolled
+# math — same rule as every other statistic here).
+MULTIPLE_COMPARISON_METHOD = "benjamini-hochberg"
 
 
 # ===========================================================================
@@ -242,6 +252,24 @@ def bootstrap_ci(
         "ci_high": round(float(ci.high), 3),
         "n": n,
     }
+
+
+def benjamini_hochberg(p_values: list[float]) -> list[float]:
+    """Benjamini-Hochberg FDR-adjusted p-values (q-values) for a family of tests.
+
+    Wraps ``scipy.stats.false_discovery_control`` (method="bh") so the
+    correction comes from a validated implementation, not hand-rolled ranking.
+    Input order is preserved: the i-th returned q-value corresponds to the
+    i-th input p-value. An empty input returns an empty list; a single p-value
+    is returned unchanged (a family of one needs no correction). q-values are
+    rounded to 4 decimals to match the raw p-value formatting elsewhere.
+    """
+    if not p_values:
+        return []
+    if len(p_values) == 1:
+        return [round(float(p_values[0]), 4)]
+    adjusted = scipy_stats.false_discovery_control(p_values, method="bh")
+    return [round(float(q), 4) for q in adjusted]
 
 
 # ===========================================================================
@@ -438,6 +466,10 @@ def build_provider_comparison(
             if mean_cost is not None and mean_unweighted not in (None, 0)
             else None
         )
+        subscription_cost = stats_engine.subscription_cost_per_summary()
+        subscription_cost_per_quality = (
+            round(subscription_cost / mean_unweighted, 6) if mean_unweighted else None
+        )
         rows.append({
             "provider": provider,
             "n_items": len(unweighted),
@@ -450,6 +482,12 @@ def build_provider_comparison(
                 "n_priced": len(costs),
             },
             "cost_per_quality_point": cost_per_quality,
+            # Consumer-economics companion to the real-API cost above: a flat
+            # monthly subscription price ($20/mo by default — see
+            # stats_engine.subscription_cost_per_summary), NOT the logged API
+            # spend. Answers "is the subscription worth it to a practicing
+            # vet?" rather than "what did this research run cost."
+            "subscription_cost_per_quality_point": subscription_cost_per_quality,
             "mean_judge_disagreement": (
                 round(_mean(disagreements), 3) if disagreements else None
             ),
@@ -509,14 +547,27 @@ def build_significance(
                 "diff_ci_low": diff_ci["ci_low"],
                 "diff_ci_high": diff_ci["ci_high"],
                 "underpowered": len(shared) < MIN_ITEMS_FOR_SIGNIFICANCE,
+                # Filled in below once the whole family's p-values are known.
+                "p_adjusted": None,
             }
             pairwise.append(entry)
+
+    # Benjamini-Hochberg correction across the family of pairwise p-values in
+    # THIS score mode (unweighted and weighted are separate families, each with
+    # its own Friedman gate). Only entries with an available Wilcoxon p-value
+    # enter the family; unavailable tests keep p_adjusted=None.
+    testable = [e for e in pairwise if e["wilcoxon"].get("available") and e["wilcoxon"].get("p_value") is not None]
+    adjusted = benjamini_hochberg([e["wilcoxon"]["p_value"] for e in testable])
+    for entry, q in zip(testable, adjusted):
+        entry["p_adjusted"] = q
 
     return {
         "score_key": score_key,
         "friedman": friedman_result,
         "pairwise_wilcoxon": pairwise,
         "min_items_for_significance": MIN_ITEMS_FOR_SIGNIFICANCE,
+        "multiple_comparison_method": MULTIPLE_COMPARISON_METHOD,
+        "n_comparisons_corrected": len(testable),
     }
 
 
@@ -602,17 +653,50 @@ def build_publication_report(
     seed: int = DEFAULT_BOOTSTRAP_SEED,
     n_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
     cost_batched: bool = False,
+    manifest_index: dict[str, dict[str, Any]] | None = None,
+    summaries_by_doi: dict[str, dict[str, str]] | None = None,
+    human_review_rows: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the full publication report dict from evaluation rows.
 
     The shape is always the same so callers (Markdown/CSV renderers, tests) can
-    read it without special-casing an empty corpus. ``cost_index`` is injectable
-    for tests; when None it is left absent from the cost columns (the CLI builds
-    it from summaries.jsonl). All statistics are offline and hand-rolled.
+    read it without special-casing an empty corpus. ``cost_index``,
+    ``manifest_index``, ``summaries_by_doi``, and ``human_review_rows`` are all
+    injectable for tests (each defaults to reading its real data/ file only
+    when left None — the CLI's ``main()`` builds them); this keeps the pure
+    builder testable against in-memory fixtures without touching disk. All
+    statistics are offline and hand-rolled or scikit-learn/scipy-backed.
     """
     materialized = list(rows)
     item_scores = collect_item_scores(materialized)
     providers = _providers_in_order(item_scores)
+
+    # Computed once and reused for both the "provider_comparison" table below
+    # and the subscription-economics section, so the bootstrap resampling
+    # behind quality_unweighted only runs once per report.
+    provider_comparison_rows = build_provider_comparison(
+        item_scores, providers, cost_index, seed=seed, n_resamples=n_resamples,
+    )
+
+    resolved_manifest_index = manifest_index if manifest_index is not None else load_manifest_index()
+    resolved_summaries_by_doi = (
+        summaries_by_doi if summaries_by_doi is not None else stats_engine.load_summaries_by_provider()
+    )
+    information_density = stats_engine.build_information_density_report(
+        resolved_manifest_index, resolved_summaries_by_doi,
+    )
+
+    provider_mean_quality = {
+        row["provider"]: row["quality_unweighted"]["mean"] for row in provider_comparison_rows
+    }
+    subscription_economics = stats_engine.build_subscription_efficiency(provider_mean_quality)
+
+    resolved_human_review_rows = list(
+        human_review_rows if human_review_rows is not None else stats_engine.iter_human_review_rows()
+    )
+    covariate_analysis = stats_engine.build_covariate_report(
+        materialized, resolved_human_review_rows, item_scores, providers,
+    )
 
     notes = [
         "Significance tests use scipy.stats: Wilcoxon signed-rank (method='auto', "
@@ -631,6 +715,30 @@ def build_publication_report(
             "rates); judge cost is a separate shared overhead and is not attributed "
             "to a provider here."
         )
+    notes.append(
+        "Subscription-based cost-per-quality is a separate consumer-economics view "
+        "(flat monthly subscription price / papers-per-month), not derived from "
+        "logged API token costs — see stats_engine.py."
+    )
+    notes.append(
+        "Information density's 'retained-or-more' cutoff (TF-IDF cosine similarity "
+        f">= {stats_engine.INFORMATION_DENSITY_RETENTION_THRESHOLD}) is a named, "
+        "tunable modeling choice (stats_engine.INFORMATION_DENSITY_RETENTION_THRESHOLD), "
+        "not a reproduction of Appleby et al. (2023)'s exact metric."
+    )
+    notes.append(
+        "Covariate Cohen's Kappa cells are computed on a small human-review sample "
+        f"and are flagged 'underpowered' below n={stats_engine.MIN_ITEMS_FOR_KAPPA} "
+        "(stats_engine.MIN_ITEMS_FOR_KAPPA); treat low-n cells as illustrative, not conclusive."
+    )
+    notes.append(
+        "Pairwise Wilcoxon p-values carry a Benjamini-Hochberg FDR-adjusted "
+        "companion (p_adjusted, scipy.stats.false_discovery_control), corrected "
+        "across the family of pairwise comparisons within each score mode "
+        "(unweighted/weighted are separate families). Read the adjusted value "
+        "when calling a pair significant; the raw p-value is kept alongside for "
+        "transparency."
+    )
 
     return {
         "taxonomy": VET_TAXONOMY_V1.describe(VeterinarySummaryQualityScenario.name),
@@ -643,9 +751,10 @@ def build_publication_report(
             {"available": True, "batched": cost_batched} if cost_index is not None
             else {"available": False, "reason": "No cost index supplied."}
         ),
-        "provider_comparison": build_provider_comparison(
-            item_scores, providers, cost_index, seed=seed, n_resamples=n_resamples,
-        ),
+        "provider_comparison": provider_comparison_rows,
+        "information_density": information_density,
+        "subscription_economics": subscription_economics,
+        "covariate_analysis": covariate_analysis,
         "significance_unweighted": build_significance(
             item_scores, providers, score_key="unweighted", seed=seed, n_resamples=n_resamples,
         ),
@@ -685,13 +794,17 @@ def _fmt_ci(block: dict[str, Any]) -> str:
     return f"{mean:.2f} [{low:.2f}, {high:.2f}]"
 
 
-def _fmt_p(test: dict[str, Any]) -> str:
-    if not test.get("available"):
-        return "-"
-    p = test.get("p_value")
+def _fmt_pval(p: float | None) -> str:
+    """Format a bare p/q-value, or '-' when it could not be computed."""
     if p is None:
         return "-"
     return "<0.001" if p < 0.001 else f"{p:.3f}"
+
+
+def _fmt_p(test: dict[str, Any]) -> str:
+    if not test.get("available"):
+        return "-"
+    return _fmt_pval(test.get("p_value"))
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -723,8 +836,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "mean USD to generate one summary; cost/quality is USD per unweighted point."
     )
     lines.append("")
-    lines.append("| Provider | N | Unweighted (95% CI) | Weighted (95% CI) | Mean cost (USD) | Cost/quality pt | Mean judge disagreement |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| Provider | N | Unweighted (95% CI) | Weighted (95% CI) | Mean cost (USD) | Cost/quality pt | Subscription cost/quality pt | Mean judge disagreement |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for row in report["provider_comparison"]:
         cost = row["cost"]
         lines.append(
@@ -732,8 +845,16 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{_fmt_ci(row['quality_weighted'])} | "
             f"{_fmt(cost['mean_usd'], 5) if cost['available'] else '-'} | "
             f"{_fmt(row['cost_per_quality_point'], 5)} | "
+            f"{_fmt(row.get('subscription_cost_per_quality_point'), 5)} | "
             f"{_fmt(row['mean_judge_disagreement'])} |"
         )
+    lines.append("")
+    lines.append(
+        "*Cost/quality pt is the real API cost this study paid. Subscription "
+        "cost/quality pt is a separate consumer-economics view: a flat "
+        "$20/month subscription split across 500 papers/month "
+        "($0.04/summary) — see \"Subscription economics\" below.*"
+    )
     lines.append("")
 
     # --- Significance ---
@@ -753,16 +874,25 @@ def render_markdown(report: dict[str, Any]) -> str:
         else:
             lines.append(f"**Friedman:** {fr.get('reason', 'not available')}")
         lines.append("")
-        lines.append("| Pair | Shared items | Mean score diff (A−B) | 95% CI | Wilcoxon p | Note |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| Pair | Shared items | Mean score diff (A−B) | 95% CI | Wilcoxon p | p (BH-adj) | Note |")
+        lines.append("|---|---|---|---|---|---|---|")
         for pair in sig["pairwise_wilcoxon"]:
             note = "underpowered (n<%d)" % sig["min_items_for_significance"] if pair["underpowered"] else ""
             ci = (f"[{_fmt(pair['diff_ci_low'])}, {_fmt(pair['diff_ci_high'])}]"
                   if pair["diff_ci_low"] is not None else "-")
             lines.append(
                 f"| {pair['provider_a']} vs {pair['provider_b']} | {pair['n_shared']} | "
-                f"{_fmt(pair['mean_diff'])} | {ci} | {_fmt_p(pair['wilcoxon'])} | {note} |"
+                f"{_fmt(pair['mean_diff'])} | {ci} | {_fmt_p(pair['wilcoxon'])} | "
+                f"{_fmt_pval(pair.get('p_adjusted'))} | {note} |"
             )
+        method = sig.get("multiple_comparison_method", MULTIPLE_COMPARISON_METHOD)
+        n_corrected = sig.get("n_comparisons_corrected", 0)
+        lines.append("")
+        lines.append(
+            f"*p (BH-adj): Benjamini-Hochberg FDR-adjusted across the "
+            f"{n_corrected} testable pair(s) in this score mode ({method}). "
+            "Prefer it over the raw Wilcoxon p when declaring a pair significant.*"
+        )
         lines.append("")
 
     # --- Per-stratum ---
@@ -803,6 +933,87 @@ def render_markdown(report: dict[str, Any]) -> str:
                     cells.append("-")
             lines.append(f"| {entry['input_source']} | " + " | ".join(cells) + " |")
         lines.append("")
+
+    # --- Information density (vs. Appleby et al. 2023) ---
+    density = report.get("information_density") or {}
+    lines.append("## Information density (summary vs. abstract)")
+    lines.append("")
+    if not density.get("available"):
+        lines.append(density.get("reason", "Not available."))
+        lines.append("")
+    else:
+        overall = density["overall"]
+        lines.append(
+            f"Appleby et al. (2023) found AI summaries carried less information than "
+            f"the source abstract **{density['appleby_2023_failure_rate']*100:.1f}%** of the time "
+            "(word count + TF-IDF/cosine similarity of the summary against the paper's own abstract). "
+            f"Across {density['n_pairs']} summary-abstract pair(s) here, "
+            f"**{overall['pct_retained_or_more']*100:.1f}%** retained similar-or-more information "
+            f"(TF-IDF cosine similarity >= {density['retention_cosine_threshold']})."
+        )
+        lines.append("")
+        lines.append("| Provider | N | High fidelity % | Moderate % | Lost details % | Retained-or-more % |")
+        lines.append("|---|---|---|---|---|---|")
+        for provider, stats in density["by_provider"].items():
+            lines.append(
+                f"| {provider} | {stats['n']} | {stats['pct_high']*100:.0f}% | "
+                f"{stats['pct_moderate']*100:.0f}% | {stats['pct_low']*100:.0f}% | "
+                f"{stats['pct_retained_or_more']*100:.0f}% |"
+            )
+        lines.append("")
+
+    # --- Subscription economics ---
+    lines.append("## Subscription-based cost-per-quality")
+    lines.append("")
+    lines.append(
+        "Consumer-economics view — what a practicing vet would actually pay "
+        "($20/month flat subscription, 500 papers/month), separate from the "
+        "real API cost tracked above."
+    )
+    lines.append("")
+    lines.append("| Provider | Mean quality | Cost/summary (USD) | Efficiency (quality / cost) |")
+    lines.append("|---|---|---|---|")
+    for row in report.get("subscription_economics") or []:
+        quality = "-" if row["mean_quality"] is None else f"{row['mean_quality']:.2f}"
+        efficiency = "-" if row["efficiency"] is None else f"{row['efficiency']:.1f}"
+        lines.append(
+            f"| {row['provider']} | {quality} | {row['subscription_cost_per_summary_usd']:.4f} | {efficiency} |"
+        )
+    lines.append("")
+
+    # --- Covariate analysis (research meat) ---
+    covariate = report.get("covariate_analysis") or {}
+    for field in covariate.get("fields", []):
+        field_rows = covariate.get("by_field", {}).get(field, [])
+        if not field_rows:
+            continue
+        lines.append(f"## Covariate analysis — by {field.replace('_', ' ')}")
+        lines.append("")
+        lines.append(
+            f"Hallucination rate, mean quality, and Cohen's Kappa (LLM judge vs. human), together. "
+            f"Kappa cells below n={covariate['min_items_for_kappa']} human-reviewed items are flagged "
+            "underpowered — shown for transparency, not a firm conclusion."
+        )
+        lines.append("")
+        for provider in report["providers"]:
+            lines.append(f"**{provider}**")
+            lines.append("")
+            lines.append(f"| {field.replace('_', ' ').title()} | N | Hallucination rate | Mean quality | Cohen's Kappa (n) |")
+            lines.append("|---|---|---|---|---|")
+            for cell in field_rows:
+                cell_stats = cell["providers"].get(provider, {})
+                halluc = cell_stats.get("hallucination_rate")
+                quality = cell_stats.get("mean_quality")
+                kappa = cell_stats.get("cohen_kappa")
+                kappa_n = cell_stats.get("kappa_n", 0)
+                underpowered = " (underpowered)" if cell_stats.get("kappa_underpowered") else ""
+                lines.append(
+                    f"| {cell['value']} | {cell_stats.get('n_items', 0)} | "
+                    f"{'-' if halluc is None else f'{halluc*100:.0f}%'} | "
+                    f"{'-' if quality is None else f'{quality:.2f}'} | "
+                    f"{'-' if kappa is None else f'{kappa:.2f}'} (n={kappa_n}){underpowered} |"
+                )
+            lines.append("")
 
     # --- Reliability (brief) ---
     reliability = report.get("reliability") or {}
@@ -851,14 +1062,55 @@ def render_csvs(report: dict[str, Any]) -> dict[str, str]:
     files["provider_comparison.csv"] = _csv_string(
         ["provider", "n_items", "unweighted_mean", "unweighted_ci_low", "unweighted_ci_high",
          "weighted_mean", "weighted_ci_low", "weighted_ci_high", "mean_cost_usd",
-         "total_cost_usd", "cost_per_quality_point", "mean_judge_disagreement"],
+         "total_cost_usd", "cost_per_quality_point", "subscription_cost_per_quality_point",
+         "mean_judge_disagreement"],
         [[
             r["provider"], r["n_items"],
             r["quality_unweighted"]["mean"], r["quality_unweighted"]["ci_low"], r["quality_unweighted"]["ci_high"],
             r["quality_weighted"]["mean"], r["quality_weighted"]["ci_low"], r["quality_weighted"]["ci_high"],
             r["cost"]["mean_usd"], r["cost"]["total_usd"], r["cost_per_quality_point"],
+            r.get("subscription_cost_per_quality_point"),
             r["mean_judge_disagreement"],
         ] for r in report["provider_comparison"]],
+    )
+
+    # Information density (per (doi, provider) row — the raw data behind the
+    # per-provider percentages in the Markdown report).
+    density = report.get("information_density") or {}
+    files["information_density.csv"] = _csv_string(
+        ["doi", "provider", "abstract_words", "summary_words", "word_count_ratio",
+         "word_count_label", "cosine_similarity", "band", "retained_or_more"],
+        [[
+            r["doi"], r["provider"], r["abstract_words"], r["summary_words"], r["ratio"],
+            r["label"], r["cosine_similarity"], r["band"], r["retained_or_more"],
+        ] for r in (density.get("rows") or [])],
+    )
+
+    # Subscription economics.
+    files["subscription_economics.csv"] = _csv_string(
+        ["provider", "mean_quality", "subscription_cost_per_summary_usd", "efficiency"],
+        [[
+            r["provider"], r["mean_quality"], r["subscription_cost_per_summary_usd"], r["efficiency"],
+        ] for r in (report.get("subscription_economics") or [])],
+    )
+
+    # Covariate analysis (long form: field, value, provider, n, hallucination
+    # rate, quality, kappa).
+    covariate_rows: list[list[Any]] = []
+    covariate = report.get("covariate_analysis") or {}
+    for field in covariate.get("fields", []):
+        for cell in covariate.get("by_field", {}).get(field, []):
+            for provider in providers:
+                stats = cell["providers"].get(provider, {})
+                covariate_rows.append([
+                    field, cell["value"], provider, stats.get("n_items", 0),
+                    stats.get("hallucination_rate"), stats.get("mean_quality"),
+                    stats.get("cohen_kappa"), stats.get("kappa_n", 0), stats.get("kappa_underpowered", False),
+                ])
+    files["covariate_analysis.csv"] = _csv_string(
+        ["field", "value", "provider", "n_items", "hallucination_rate", "mean_quality",
+         "cohen_kappa", "kappa_n", "kappa_underpowered"],
+        covariate_rows,
     )
 
     # Pairwise significance (both modes stacked).
@@ -869,12 +1121,13 @@ def render_csvs(report: dict[str, Any]) -> dict[str, str]:
             test = pair["wilcoxon"]
             sig_rows.append([
                 mode, pair["provider_a"], pair["provider_b"], pair["n_shared"],
-                test.get("statistic"), test.get("p_value"),
+                test.get("statistic"), test.get("p_value"), pair.get("p_adjusted"),
                 pair["mean_diff"], pair["diff_ci_low"], pair["diff_ci_high"], pair["underpowered"],
             ])
     files["significance_pairwise.csv"] = _csv_string(
         ["score_mode", "provider_a", "provider_b", "n_shared", "wilcoxon_statistic",
-         "wilcoxon_p", "mean_diff", "diff_ci_low", "diff_ci_high", "underpowered"],
+         "wilcoxon_p", "wilcoxon_p_bh_adjusted", "mean_diff", "diff_ci_low", "diff_ci_high",
+         "underpowered"],
         sig_rows,
     )
 
@@ -974,9 +1227,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
     parser.add_argument("--summaries", type=Path, default=SUMMARIES_PATH,
-                        help="Source of summariser token counts for the cost columns "
+                        help="Source of summariser token counts for the cost columns, and "
+                             "candidate summaries for information density "
                              "(default: data/summaries.jsonl). Cost is omitted for items "
                              "with no token record here.")
+    parser.add_argument("--human-reviews", type=Path, default=None,
+                        help="Normalized human-review rows for the covariate analysis's "
+                             "Cohen's Kappa (default: data/human_reviews.jsonl; missing is fine).")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                         help="Where to save the report (default: data/results/).")
     parser.add_argument("--seed", type=int, default=None,
@@ -1003,9 +1260,12 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = list(iter_evaluation_rows(args.evaluations))
     cost_index = build_summary_cost_index(args.summaries, batched=cost_batched)
+    summaries_by_doi = stats_engine.load_summaries_by_provider(args.summaries)
+    human_review_rows = list(stats_engine.iter_human_review_rows(args.human_reviews))
     report = build_publication_report(
         rows, cost_index=cost_index, seed=seed, n_resamples=n_resamples,
-        cost_batched=cost_batched,
+        cost_batched=cost_batched, summaries_by_doi=summaries_by_doi,
+        human_review_rows=human_review_rows,
     )
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report["generated_at"] = ts

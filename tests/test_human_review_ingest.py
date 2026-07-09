@@ -192,6 +192,10 @@ def test_analyze_single_reviewer_has_correlation_but_no_agreement(tmp_path: Path
     overall = analysis["by_reviewer"]["reviewer_1"]["overall"]
     assert overall["n"] == 3
     assert overall["spearman"] == 1.0
+    # Cohen's Kappa + percent agreement are categorical companions to Spearman:
+    # human and jury both rank 4,3,5 exactly -> perfect categorical agreement too.
+    assert overall["cohen_kappa"] == 1.0
+    assert overall["percent_agreement"] == 1.0
 
 
 def test_analyze_two_reviewers_reports_inter_reviewer_alpha(tmp_path: Path) -> None:

@@ -798,6 +798,40 @@ def cmd_report_figures(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# stats-engine
+# ---------------------------------------------------------------------------
+
+def cmd_stats_engine(args: argparse.Namespace) -> int:
+    """Information density, Cohen's Kappa IRR, subscription economics, and
+    covariate 'research meat' tables.
+
+    Offline only — no API calls. Delegates to stats_engine.main() so the
+    module stays independently runnable/testable (same pattern as
+    cmd_eval_report's --publication delegation to report_tables.py). These
+    same sections are also folded into 'eval-report --publication'; this
+    subcommand is for a standalone run.
+    """
+    from stats_engine import main as stats_engine_main
+
+    delegate = ["--evaluations", str(args.evaluations), "--results-dir", str(args.results_dir)]
+    if args.summaries is not None:
+        delegate += ["--summaries", str(args.summaries)]
+    if args.human_reviews is not None:
+        delegate += ["--human-reviews", str(args.human_reviews)]
+    if args.subscription_price_usd is not None:
+        delegate += ["--subscription-price-usd", str(args.subscription_price_usd)]
+    if args.papers_per_month is not None:
+        delegate += ["--papers-per-month", str(args.papers_per_month)]
+    if args.json:
+        delegate.append("--json")
+    if args.markdown:
+        delegate.append("--markdown")
+    if args.no_save:
+        delegate.append("--no-save")
+    return stats_engine_main(delegate)
+
+
+# ---------------------------------------------------------------------------
 # export-human-review
 # ---------------------------------------------------------------------------
 
@@ -1175,6 +1209,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_figures.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                            help="Where to save the leaderboard + figures (default: data/results/).")
     p_figures.set_defaults(func=cmd_report_figures)
+
+    p_stats = sub.add_parser(
+        "stats-engine",
+        help="Information density, Cohen's Kappa IRR, subscription economics, "
+             "and provider x covariate tables (species/study_design/journal).",
+    )
+    _add_mode_arg(p_stats)
+    p_stats.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
+    p_stats.add_argument("--summaries", type=Path, default=None,
+                         help="Source of manifest abstracts + candidate summaries "
+                              "for information density (default: data/summaries.jsonl).")
+    p_stats.add_argument("--human-reviews", type=Path, default=None,
+                         help="Normalized human-review rows for Cohen's Kappa "
+                              "(default: data/human_reviews.jsonl; missing is fine).")
+    p_stats.add_argument("--subscription-price-usd", type=float, default=None,
+                         help="Override SUBSCRIPTION_COST_PER_MONTH_USD (default: $20/month).")
+    p_stats.add_argument("--papers-per-month", type=int, default=None,
+                         help="Override SUBSCRIPTION_PAPERS_PER_MONTH (default: 500).")
+    p_stats_output = p_stats.add_mutually_exclusive_group()
+    p_stats_output.add_argument("--json", action="store_true", help="Print full report JSON.")
+    p_stats_output.add_argument("--markdown", action="store_true", help="Print the Markdown report.")
+    p_stats.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
+                         help="Where to save the report (default: data/results/).")
+    p_stats.add_argument("--no-save", action="store_true",
+                         help="Print only; don't write a report file.")
+    p_stats.set_defaults(func=cmd_stats_engine)
 
     p_human = sub.add_parser(
         "export-human-review",

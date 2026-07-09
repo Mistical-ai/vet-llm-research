@@ -49,3 +49,10 @@ numpy>=1.23
 # display server is required, so this is safe to run on a CI box or the AI's
 # sandboxed shell.
 matplotlib>=3.7
+# Validated implementations of Cohen's Kappa (sklearn.metrics.cohen_kappa_score)
+# and TF-IDF + cosine similarity (sklearn.feature_extraction.text.TfidfVectorizer,
+# sklearn.metrics.pairwise.cosine_similarity) used by llm-sum/stats_engine.py.
+# Rides on the numpy/scipy already pinned above — same rationale as the scipy
+# note further up: a peer-reviewed, citable library beats a hand-rolled formula
+# whenever one already exists.
+scikit-learn>=1.3

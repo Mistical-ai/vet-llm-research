@@ -14,10 +14,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+import eval_instances
 import report_tables as rt
+import stats_engine
 from report_tables import (
+    benjamini_hochberg,
     bootstrap_ci,
     build_publication_report,
+    build_significance,
     build_summary_cost_index,
     collect_item_scores,
     friedman,
@@ -26,6 +32,21 @@ from report_tables import (
     render_markdown,
     wilcoxon_signed_rank,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stats_engine_lookups(monkeypatch, tmp_path):
+    """build_publication_report now also reads manifest abstracts and
+    data/human_reviews.jsonl for its information-density/covariate sections.
+    Auto-applied to every test in this file (most call build_publication_report
+    directly with no manifest/human-reviews override) so none of them
+    accidentally reads this repo's real (multi-MB) data/manifest.jsonl or
+    data/summaries.jsonl. Mirrors test_eval_report.py's `_isolate_detail_lookups`.
+    """
+    monkeypatch.setattr(eval_instances, "MANIFEST_PATH", tmp_path / "no_manifest.jsonl")
+    monkeypatch.setattr(eval_instances, "MANUAL_MANIFEST_PATH", tmp_path / "no_manual_manifest.jsonl")
+    monkeypatch.setattr(stats_engine, "HUMAN_REVIEWS_PATH", tmp_path / "no_human_reviews.jsonl")
+    monkeypatch.setattr(stats_engine, "SUMMARIES_PATH", tmp_path / "no_summaries.jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +138,23 @@ def test_bootstrap_ci_single_value_has_no_interval() -> None:
     assert result["ci_low"] is None and result["ci_high"] is None
 
 
+def test_benjamini_hochberg_matches_known_values() -> None:
+    # Classic BH example: three ordered p-values, q_i = min over j>=i of p_j*m/j.
+    assert benjamini_hochberg([0.01, 0.04, 0.20]) == [0.03, 0.06, 0.20]
+
+
+def test_benjamini_hochberg_preserves_input_order() -> None:
+    # Unsorted input: the i-th q-value must correspond to the i-th p-value.
+    adjusted = benjamini_hochberg([0.20, 0.01, 0.04])
+    assert adjusted == [0.20, 0.03, 0.06]
+
+
+def test_benjamini_hochberg_edge_cases() -> None:
+    assert benjamini_hochberg([]) == []
+    # A family of one needs no correction — returned unchanged.
+    assert benjamini_hochberg([0.03]) == [0.03]
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -174,6 +212,17 @@ def test_build_publication_report_shape_and_significance() -> None:
     assert top["quality_unweighted"]["mean"] == 5.0
     assert top["cost"]["available"] is True
     assert top["cost_per_quality_point"] is not None
+    # Subscription cost-per-quality is a separate, always-present column
+    # (flat $20/mo / 500 papers, not derived from the real cost above).
+    assert top["subscription_cost_per_quality_point"] == round(0.04 / 5.0, 6)
+
+    # New stats_engine sections are always present with the documented shape,
+    # even with no manifest/summaries/human-review data behind them (isolated
+    # by this file's autouse fixture) — they degrade to "unavailable"/empty
+    # rather than being absent keys.
+    assert report["information_density"]["available"] is False
+    assert report["subscription_economics"][0]["provider"] == "openai"
+    assert report["covariate_analysis"]["fields"] == list(stats_engine.COVARIATE_FIELDS)
 
     # Omnibus + pairwise significance on the fully separated corpus.
     sig = report["significance_unweighted"]
@@ -184,8 +233,32 @@ def test_build_publication_report_shape_and_significance() -> None:
     assert pair["n_shared"] == 6
     assert pair["mean_diff"] == 2.0
 
+    # Every testable pair carries a Benjamini-Hochberg-adjusted p >= its raw p
+    # (correction only ever moves p-values upward), and the family size + method
+    # are recorded for the methods section.
+    assert sig["multiple_comparison_method"] == "benjamini-hochberg"
+    assert sig["n_comparisons_corrected"] == 3  # 3 pairs among 3 providers
+    for p in sig["pairwise_wilcoxon"]:
+        assert p["p_adjusted"] is not None
+        assert p["p_adjusted"] >= p["wilcoxon"]["p_value"]
+
     # Taxonomy header names the versioned benchmark.
     assert report["taxonomy"]["taxonomy_id"] == "vet_taxonomy_v1"
+
+
+def test_build_significance_single_family_p_adjusted_equals_raw() -> None:
+    """With only two providers there is one pairwise test, so BH leaves it
+    unchanged (a family of one needs no correction)."""
+    item_scores = collect_item_scores([
+        _eval_row(f"10.1/{i}", "openai", "openai", 5.0, 5.0) for i in range(1, 7)
+    ] + [
+        _eval_row(f"10.1/{i}", "anthropic", "openai", 4.0, 4.0) for i in range(1, 7)
+    ])
+    sig = build_significance(item_scores, ["openai", "anthropic"],
+                             score_key="unweighted", seed=42, n_resamples=50)
+    assert sig["n_comparisons_corrected"] == 1
+    only = sig["pairwise_wilcoxon"][0]
+    assert only["p_adjusted"] == round(only["wilcoxon"]["p_value"], 4)
 
 
 def test_report_handles_single_provider_gracefully() -> None:
@@ -219,6 +292,8 @@ def test_render_markdown_has_expected_sections() -> None:
     assert "## Significance (unweighted score)" in md
     assert "## Processed text vs. direct PDF" in md
     assert "## Notes on method" in md
+    # The pairwise table exposes the BH-adjusted p column.
+    assert "p (BH-adj)" in md
 
 
 def test_render_csvs_emits_all_tables() -> None:
@@ -231,6 +306,8 @@ def test_render_csvs_emits_all_tables() -> None:
     assert "input_source_comparison.csv" in csvs
     # Header + one row per provider in the comparison CSV.
     assert csvs["provider_comparison.csv"].splitlines()[0].startswith("provider,")
+    # The pairwise CSV carries the BH-adjusted p column.
+    assert "wilcoxon_p_bh_adjusted" in csvs["significance_pairwise.csv"].splitlines()[0]
 
 
 # ---------------------------------------------------------------------------

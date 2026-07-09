@@ -72,6 +72,7 @@ from eval_instances import EvaluationInstance, STRATIFICATION_FIELDS, iter_evalu
 from summarize_all_ingest import iter_summarize_all_instances  # noqa: E402
 from eval_report import iter_evaluation_rows  # noqa: E402
 import reliability  # noqa: E402  (agreement + correlation stats, reused for humans)
+from stats_engine import categorical_agreement  # noqa: E402  (Cohen's Kappa + percent agreement)
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
@@ -800,7 +801,17 @@ def _inter_reviewer_agreement(rows: list[dict[str, Any]], n_reviewers: int) -> d
 
 
 def _correlate(human: list[float], jury: list[float]) -> dict[str, Any]:
-    """Pearson + Spearman + Bland-Altman for one aligned human/jury series."""
+    """Pearson + Spearman + Bland-Altman + Cohen's Kappa for one aligned
+    human/jury series.
+
+    Pearson/Spearman/Bland-Altman measure rank/linear agreement on the raw
+    continuous scores. Cohen's Kappa (+ percent agreement) is a different,
+    categorical question — "how often do the two raters land on the exact
+    same 1-5 category, correcting for the agreement expected by chance" — so
+    both are reported rather than one replacing the other. Kappa needs
+    discrete categories; stats_engine.categorical_agreement rounds the
+    continuous composites to the nearest 1-5 integer first.
+    """
     n = len(human)
     pearson = reliability.pearson(human, jury)
     spearman = reliability.spearman(human, jury)
@@ -817,6 +828,7 @@ def _correlate(human: list[float], jury: list[float]) -> dict[str, Any]:
         "spearman": spearman,
         "spearman_p": reliability.spearman_p(human, jury),
         "bland_altman": reliability.bland_altman(human, jury),
+        **categorical_agreement(human, jury),
         # n is passed so the interpretation withholds a verdict on an
         # underpowered sample (see reliability.MIN_CORRELATION_N).
         "interpretation": reliability.interpret_correlation(headline, n),

@@ -32,8 +32,8 @@ The tables:
 - **Provider comparison** — each provider's mean jury score in **both modes**
   (unweighted = plain MedHELM average; weighted = this project's
   clinical-risk-weighted average), each with a **95% bootstrap confidence
-  interval**, plus mean cost, **cost-per-quality-point**, and mean judge
-  disagreement.
+  interval**, plus mean cost, **cost-per-quality-point**, a **subscription
+  cost-per-quality-point** (§5), and mean judge disagreement.
 - **Significance** — a **Friedman** omnibus test across all providers and
   **pairwise Wilcoxon signed-rank** tests, computed **separately for the
   unweighted and weighted score**, with a bootstrap CI on each pair's mean
@@ -44,6 +44,13 @@ The tables:
   provider, kept separate from the clinical strata.
 - **Inter-judge reliability** — a one-line summary (Krippendorff's alpha),
   populated only for a multi-judge jury run (reuses `reliability.py`).
+- **Information density** (§6) — word count + TF-IDF/cosine similarity of
+  each summary against the paper's own abstract, re-running Appleby et al.
+  (2023)'s benchmark against this study's providers.
+- **Covariate analysis** (§7) — one table per (provider × species /
+  study_design / journal) cell, with hallucination rate, quality, **and**
+  Cohen's Kappa (LLM judge vs. human) together — the "research meat" a
+  stratified veterinary study needs, not just overall averages.
 
 If there are no evaluation rows yet, nothing is written and the command says so.
 
@@ -71,6 +78,19 @@ Environment defaults live in `.env` (`PUBLICATION_BOOTSTRAP_SEED`,
 `PUBLICATION_BOOTSTRAP_RESAMPLES`, `PUBLICATION_COST_BATCHED`); a CLI flag always
 overrides the env value.
 
+Sections 5-7 below (subscription economics, information density, covariate
+analysis) are also available as their own standalone command, independent of
+the rest of the publication report:
+
+```powershell
+python llm-sum/run_phase3.py stats-engine --markdown
+```
+
+which accepts its own `--subscription-price-usd` / `--papers-per-month`
+overrides (see §5) alongside the same `--evaluations` / `--summaries` /
+`--human-reviews` / `--json` / `--markdown` / `--no-save` flags as the other
+Phase 6 commands.
+
 ## 3. How to read the numbers
 
 - **The unit of analysis is one item = (paper × input channel).** A paper judged
@@ -89,6 +109,11 @@ overrides the env value.
 - **`underpowered (n<10)`** on a pairwise row means fewer than ten shared items
   stood behind that test; the p-value is shown for transparency but is too
   unstable to lean on. Collect more evaluated papers before concluding.
+- **Use the BH-adjusted p, not the raw one, to call a pair significant.** Each
+  score mode runs several pairwise Wilcoxon tests, so the pairwise table adds a
+  **`p (BH-adj)`** column — the Benjamini-Hochberg false-discovery-rate-adjusted
+  p-value (see §8). The raw Wilcoxon p is kept beside it for transparency, but a
+  "provider A beat provider B" claim should rest on the adjusted value.
 
 ## 4. Cost
 
@@ -106,7 +131,86 @@ Two caveats surface as honest gaps rather than wrong numbers:
   batch API, so cost defaults to **real-time** rates. Pass `--cost-batched`
   (or set `PUBLICATION_COST_BATCHED=true`) if the run used the batch API.
 
-## 5. Statistics
+## 5. Subscription-based cost-per-quality
+
+Section 4's cost is a **research-budget** question: what did this study
+actually spend? This section answers a different, **consumer-economics**
+question: *is a $20/month subscription worth it to a practicing vet?*
+
+The assumption: a vet summarizing 500 papers/month (20/day × 25 days) on a
+flat $20/month subscription pays **$0.04/summary**, regardless of token usage
+— unlike the real API cost, which scales with how long the paper and summary
+are. `efficiency = mean quality / $0.04` is reported per provider so a higher
+number means better value for the subscription price, not a cheaper API bill.
+
+This is a deliberately separate column from `cost_per_quality_point` in the
+provider comparison table — neither replaces the other, since they answer
+different questions. Defaults are overridable via `SUBSCRIPTION_COST_PER_MONTH_USD`
+and `SUBSCRIPTION_PAPERS_PER_MONTH` in `.env` (see `.env.template`), or
+`--subscription-price-usd` / `--papers-per-month` on the standalone
+`stats-engine` command (§2).
+
+## 6. Information density (vs. Appleby et al. 2023)
+
+A 2023 study (Appleby et al.) found that AI-written summaries carried *less*
+information than the source abstract 79.7% of the time. This section re-runs
+that check against this study's own three providers, using two measuring
+sticks computed by [`llm-sum/stats_engine.py`](../../llm-sum/stats_engine.py):
+
+- **Word count** — is the summary shorter, about the same length, or longer
+  than the abstract?
+- **TF-IDF + cosine similarity** — does the summary's *meaningful* vocabulary
+  (rare, specific veterinary terms, not filler words) overlap with the
+  abstract's? Fit once over the **whole corpus** (every abstract + every
+  candidate summary in the run), not per-pair — a 2-document IDF is
+  degenerate and washes out exactly the signal this metric needs. Computed
+  via `sklearn.feature_extraction.text.TfidfVectorizer` and
+  `sklearn.metrics.pairwise.cosine_similarity`.
+
+Cosine similarity **>= 0.85** is banded "high fidelity" (kept almost all
+technical meaning); **< 0.50** is "lost key details"; in between is
+"moderate." The headline number — percent of summaries with similar-or-more
+information (cosine >= 0.50) — is compared against Appleby et al.'s
+benchmarks: **>= 60%** reads as meaningful progress since 2023; **<= 20%**
+(i.e. still failing >= 80% of the time) reads as the problem persisting. The
+0.50/0.85 cutoffs are named, tunable constants
+(`stats_engine.INFORMATION_DENSITY_RETENTION_THRESHOLD` /
+`_HIGH_THRESHOLD`) — an explicit modeling choice, not a re-derivation of
+Appleby et al.'s own exact formula, since that isn't reproducible from the
+numbers available. See
+[`docs/statistics_explained.md`](../statistics_explained.md#part-46--tf-idf-and-cosine-similarity-information-density)
+for the plain-English explanation of TF-IDF and cosine similarity.
+
+## 7. Covariate analysis (the "research meat")
+
+Per-stratum quality (§1's per-stratum breakdown) and per-stratum hallucination
+rate live in different tables today; this section joins them **and** adds
+Cohen's Kappa, one table per (provider × species / study_design / journal)
+cell:
+
+- **Hallucination rate** — share of that provider's summaries in that stratum
+  value with at least one unsupported claim.
+- **Mean quality** — same unweighted jury score as the rest of this report,
+  scoped to that cell.
+- **Cohen's Kappa** (+ n) — agreement between the LLM judge and a human
+  reviewer on that cell's items, from `data/human_reviews.jsonl` (Phase 5).
+  See [`docs/statistics_explained.md`](../statistics_explained.md#part-45--cohens-kappa-and-percent-agreement)
+  for what Kappa measures and why it's different from Krippendorff's alpha.
+
+This lets a reader ask "does GPT-5 perform worse on equine papers (rare in
+training data) than canine papers?" or "do all providers struggle with case
+series but do fine on RCTs?" directly, e.g. *"GPT-5 has a 0.82 Kappa for
+canine papers but only 0.45 for equine papers."*
+
+**Read the n before the Kappa.** The human-review sample is small (Phase 5's
+default is `HUMAN_REVIEW_SAMPLE_SIZE=15`) split across every provider and
+every stratum value, so most cells will have very few human-reviewed items.
+Any cell below `stats_engine.MIN_ITEMS_FOR_KAPPA` (default 5) is flagged
+`kappa_underpowered: true` in the JSON / "(underpowered)" in the Markdown —
+shown for transparency, not as a firm conclusion. Collect more human reviews
+before leaning on a specific cell's Kappa.
+
+## 8. Statistics
 
 > **New to Wilcoxon, Friedman, or what scipy/numpy even are?** Read the plain-
 > language primer first: [`docs/statistics_explained.md`](../statistics_explained.md).
@@ -132,8 +236,18 @@ Specifics for a methods section:
   degrees of freedom, over items every provider scored (complete blocks).
 - **Confidence intervals** — `scipy.stats.bootstrap`, percentile method, 2000
   resamples by default, seeded (`numpy` `default_rng`) for exact reproducibility.
+- **Multiple-comparison correction** — `scipy.stats.false_discovery_control`
+  (`method="bh"`, Benjamini-Hochberg). Each score mode's pairwise Wilcoxon
+  p-values form one family and are FDR-adjusted together; unweighted and
+  weighted are separate families, each independently gated by its own Friedman
+  omnibus. Benjamini-Hochberg (false discovery rate) is chosen over
+  Holm/Bonferroni (family-wise error rate) because a stratified study runs many
+  comparisons and FDR preserves statistical power while still controlling false
+  positives. The raw and adjusted p-values are both reported; the adjusted one
+  (`p_adjusted` / `wilcoxon_p_bh_adjusted`) is the one to cite. A family of one
+  comparison is returned unchanged (nothing to correct).
 
-## 6. Guardrails
+## 9. Guardrails
 
 This command is **read-only and offline** — it never calls a provider API and
 never writes to `evaluations.jsonl` (only to `data/results/`). It is safe for
@@ -143,7 +257,7 @@ evaluation manually in PowerShell (see
 [`docs/phase3/run_phase3.md`](../phase3/run_phase3.md)); a jury run
 (`--jury`) additionally fills the reliability line.
 
-## 7. Figures + the VetHELM-style leaderboard
+## 10. Figures + the VetHELM-style leaderboard
 
 The tables above are for a methods section; this command is for a slide or a
 results-page hero:

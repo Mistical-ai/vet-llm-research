@@ -46,6 +46,21 @@ for _path in (_HERE, _SRC):
 # so we duplicate the call here for safety. load_dotenv is idempotent.
 load_dotenv(dotenv_path=_REPO_ROOT / ".env")
 
+# Force UTF-8 on the console streams. Windows terminals default to a legacy
+# code page (cp1252) that cannot encode the Unicode these scripts print — the
+# U+2212 minus in the significance table headers, em dashes throughout the
+# Markdown reports, Greek letters (alpha, chi-square) in the stats output, and
+# accented author names in article titles. Without this, `print`-ing a report
+# dies with UnicodeEncodeError even though the saved .md/.json/.csv files (which
+# write encoding="utf-8" explicitly) are fine. Guarded because a captured stream
+# (pytest) or an already-UTF-8 stream may not need — or expose — reconfigure().
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if hasattr(_stream, "reconfigure") and (getattr(_stream, "encoding", "") or "").lower() not in ("utf-8", "utf8"):
+            _stream.reconfigure(encoding="utf-8")
+    except (ValueError, OSError):
+        pass
+
 # Expose repo paths as importable constants for convenience.
 REPO_ROOT = _REPO_ROOT
 LLM_SUM_DIR = _HERE

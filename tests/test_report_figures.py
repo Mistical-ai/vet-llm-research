@@ -15,6 +15,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+import eval_instances
 import report_figures as rf
 from report_figures import (
     aggregate_criterion_means,
@@ -29,6 +32,23 @@ from report_figures import (
     save_leaderboard,
 )
 import report_tables as rt
+import stats_engine
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stats_engine_lookups(monkeypatch, tmp_path):
+    """Every test here exercises build_leaderboard, which falls back to
+    report_tables.build_publication_report when no `report=` is passed — and
+    that now also reads manifest abstracts + data/human_reviews.jsonl for the
+    information-density/covariate sections. Auto-applied (not per-test) so no
+    test in this file accidentally reads this repo's real (multi-MB)
+    data/manifest.jsonl or data/summaries.jsonl. Mirrors
+    test_eval_report.py's `_isolate_detail_lookups` for the same reason.
+    """
+    monkeypatch.setattr(eval_instances, "MANIFEST_PATH", tmp_path / "no_manifest.jsonl")
+    monkeypatch.setattr(eval_instances, "MANUAL_MANIFEST_PATH", tmp_path / "no_manual_manifest.jsonl")
+    monkeypatch.setattr(stats_engine, "HUMAN_REVIEWS_PATH", tmp_path / "no_human_reviews.jsonl")
+    monkeypatch.setattr(stats_engine, "SUMMARIES_PATH", tmp_path / "no_summaries.jsonl")
 
 
 # ---------------------------------------------------------------------------

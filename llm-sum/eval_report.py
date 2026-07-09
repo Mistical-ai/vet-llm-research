@@ -402,13 +402,20 @@ def _fmt_corr(coef: float | None, p: float | None) -> str:
     return f"{coef:.2f} (p<0.001)" if p < 0.001 else f"{coef:.2f} (p={p:.3f})"
 
 
+def _fmt_kappa(kappa: float | None, n: int | None) -> str:
+    """Format a Cohen's Kappa cell, or '-' when undefined (n<2)."""
+    return "-" if kappa is None else f"{kappa:.2f} (n={n or 0})"
+
+
 def _corr_row_md(label: str, stats: dict[str, Any]) -> str:
     ba = stats.get("bland_altman") or {}
     return (
         f"| {label} | {stats.get('n', 0)} | "
         f"{_fmt_corr(stats.get('spearman'), stats.get('spearman_p'))} | "
         f"{_fmt_corr(stats.get('pearson'), stats.get('pearson_p'))} | "
-        f"{_fmt_stat(ba.get('mean_bias'))} |"
+        f"{_fmt_stat(ba.get('mean_bias'))} | "
+        f"{_fmt_kappa(stats.get('cohen_kappa'), stats.get('n'))} | "
+        f"{_fmt_pct(stats.get('percent_agreement'))} |"
     )
 
 
@@ -418,9 +425,13 @@ def _render_hvj_markdown(hvj: dict[str, Any] | None, heading: str) -> list[str]:
         return []
     overall = hvj.get("overall") or {}
     overall_w = hvj.get("overall_weighted") or {}
-    lines = [f"**{heading}** (Spearman is the headline; bias is mean human − jury):", ""]
-    lines.append("| Score | N | Spearman | Pearson | Bias |")
-    lines.append("|---|---|---|---|---|")
+    lines = [
+        f"**{heading}** (Spearman is the headline; bias is mean human − jury; "
+        "Kappa/% Agreement are categorical, rounded to the nearest 1-5 score):",
+        "",
+    ]
+    lines.append("| Score | N | Spearman | Pearson | Bias | Cohen's Kappa | % Agreement |")
+    lines.append("|---|---|---|---|---|---|---|")
     lines.append(_corr_row_md("**Overall (unweighted, MedHELM-comparable)**", overall))
     if overall_w:
         lines.append(_corr_row_md("Overall (weighted, clinical-risk)", overall_w))
@@ -432,8 +443,8 @@ def _render_hvj_markdown(hvj: dict[str, Any] | None, heading: str) -> list[str]:
     if per_criterion:
         lines.append("<details><summary>Per-criterion diagnostics</summary>")
         lines.append("")
-        lines.append("| Criterion | N | Spearman | Pearson | Bias |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| Criterion | N | Spearman | Pearson | Bias | Cohen's Kappa | % Agreement |")
+        lines.append("|---|---|---|---|---|---|---|")
         for criterion, stats in per_criterion.items():
             lines.append(_corr_row_md(criterion, stats))
         lines.append("")
@@ -981,7 +992,9 @@ def _print_hvj(hvj: dict[str, Any] | None, heading: str) -> None:
         return (f"    {label:<28} "
                 f"spearman={_fmt_corr(stats.get('spearman'), stats.get('spearman_p'))}  "
                 f"pearson={_fmt_corr(stats.get('pearson'), stats.get('pearson_p'))}  "
-                f"bias={_fmt_stat(ba.get('mean_bias'))}  (n={stats.get('n', 0)})")
+                f"bias={_fmt_stat(ba.get('mean_bias'))}  "
+                f"kappa={_fmt_kappa(stats.get('cohen_kappa'), stats.get('n'))}  "
+                f"agreement={_fmt_pct(stats.get('percent_agreement'))}  (n={stats.get('n', 0)})")
 
     print(f"  {heading} (Spearman | Pearson | bias human-jury):")
     print(_corr_line("overall (unweighted, MedHELM)", overall))

@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import report_tables as rt
+import stats_engine
 from human_review import HUMAN_REVIEWS_PATH, human_vs_jury_by_provider, iter_human_review_rows
 from reliability import CRITERIA, compute_reliability
 from eval_report import iter_evaluation_rows
@@ -626,6 +627,8 @@ def main(argv: list[str] | None = None) -> int:
 
     report = rt.build_publication_report(
         rows, cost_index=cost_index, seed=seed, n_resamples=n_resamples, cost_batched=cost_batched,
+        summaries_by_doi=stats_engine.load_summaries_by_provider(args.summaries),
+        human_review_rows=human_rows,
     )
     leaderboard = build_leaderboard(rows, report=report, human_rows=human_rows)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
