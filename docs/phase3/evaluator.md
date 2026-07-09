@@ -1,6 +1,10 @@
 # evaluator.py
 
-> **New to the judge?** Read the plain-English walkthrough first: [How the Judge Works & the Rubric](judge_and_rubric.md)
+> **Doc role: operator how-to.** This page covers the CLI, file paths, and
+> troubleshooting for running `evaluator.py`. For the authoritative rubric
+> definition and jury-score math, see
+> [MedHELM-Style Evaluation](medhelm_evaluation.md). For the superseded
+> Vet-Score v2.0 rubric, see the [legacy reference](judge_and_rubric.md).
 
 ## What it does
 
@@ -11,7 +15,7 @@ Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alo
 ## When to run it
 
 * After `data/summaries.jsonl` has at least one row with `status=success`.
-* In `single`/`dev` mode whenever you change the judge prompt configured by `JUDGE_PROMPT_FILE` (default: `llm-sum/prompts/judge_v2.txt`).
+* In `single`/`dev` mode whenever you change the judge prompt configured by `JUDGE_PROMPT_FILE` (default: `llm-sum/prompts/judge_medhelm_v1.txt`).
 
 ## Inputs
 
@@ -20,7 +24,7 @@ Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alo
 | `data/summaries.jsonl`                | Source of (paper, summariser, summary) triples.                            |
 | `data/processed/*.jsonl`              | Cleaned reference text the judge compares against.                         |
 | `data/evaluations.jsonl` (if exists)  | Used by `--resume` (default on).                                           |
-| `llm-sum/prompts/judge_v2.txt`        | Default vet-specific judge prompt — must contain `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`. |
+| `llm-sum/prompts/judge_medhelm_v1.txt` | Default vet-specific judge prompt (MedHELM-style, 5 criteria) — must contain `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`. |
 | `.env`                                | `PHASE3_MODE`, `JUDGE_MODELS` (default `openai`), `JUDGE_PROMPT_FILE`, plus the API key for whatever judges are listed. |
 
 ## Outputs
@@ -35,10 +39,64 @@ Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alo
 ```powershell
 python llm-sum/evaluator.py                          # uses PHASE3_MODE from .env
 python llm-sum/evaluator.py --mode single            # override
-python llm-sum/evaluator.py --judges openai,anthropic  # multi-judge
+python llm-sum/evaluator.py --judges openai,anthropic  # explicit multi-judge list
+python llm-sum/evaluator.py --jury                   # full 3-judge panel (opt-in)
 python llm-sum/evaluator.py --no-resume              # re-evaluate everything
 python llm-sum/evaluator.py --limit 3                # override mode's paper_limit
 ```
+
+### Choosing the judges (default stays 1 judge)
+
+The default is a single `openai` judge — cheapest, and unchanged. There are four
+ways to pick judges, in precedence order (first match wins):
+
+| Control | Example | Result |
+|---------|---------|--------|
+| `--judges` (CLI) | `--judges openai,anthropic` | Exactly that list. Overrides everything below. |
+| `--jury` (CLI) | `--jury` | The full panel `openai,anthropic,gemini`. |
+| `JURY_PRESET` (`.env`) | `JURY_PRESET=panel` | `panel` → full panel; `solo` → single `openai`. |
+| `JUDGE_MODELS` (`.env`) | `JUDGE_MODELS=openai` | The list as written (default `openai`). |
+
+`--jury` is just a shortcut for `JURY_PRESET=panel` scoped to one command. When
+two or more judges score the data, `eval-report` adds a **Reliability** section
+(see [MedHELM-Style Evaluation](medhelm_evaluation.md#reliability-checks)); with
+one judge it prints a one-line note explaining why there is no agreement
+estimate. Each added judge roughly multiplies judge-call cost by the judge count.
+
+## Choosing the input source: `run_phase3.py evaluate`
+
+`evaluator.py` (this page) always reads `data/summaries.jsonl`, written by
+`run_phase3.py summarize`. If you've instead been using `run_phase3.py
+summarize-all` — which writes readable `.txt` provider-comparison files to
+`data/dev_tests/summaries_txt/` (dev mode) or `data/summaries_txt/` (every
+other mode) — use `run_phase3.py evaluate` instead of this script directly.
+It accepts an extra `EVAL_INPUT_MODE` setting (`.env`) / `--input-mode` flag
+(CLI) that judges those `.txt` files without changing anything about how
+judging itself works — same judge calls, same rubric, same parsing:
+
+```powershell
+python llm-sum/run_phase3.py evaluate --mode test  --input-mode dev       # mocked smoke test
+python llm-sum/run_phase3.py evaluate --mode dev   --input-mode dev       # judge data/dev_tests/summaries_txt (PHASE3_DEV_LIMIT articles)
+python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular   # judge data/summaries_txt (full corpus, once you're ready)
+```
+
+| `EVAL_INPUT_MODE` / `--input-mode` | Reads from |
+|---|---|
+| `jsonl` (default) | `data/summaries.jsonl` — unchanged original behaviour. |
+| `dev` | `data/dev_tests/summaries_txt/` |
+| `regular` | `data/summaries_txt/` |
+| `auto` | `dev` when `PHASE3_MODE=dev`, otherwise `regular` — so switching `PHASE3_MODE` also switches the folder. |
+
+Only the processed-text side is ever judged — `summaries_pdf/` (direct-PDF
+comparison files) is never read by any input mode. There is no journal-
+stratified sampling in `dev`/`regular`/`auto` mode (that machinery assumes
+`manifest.jsonl`-backed `summaries.jsonl`); instead every article found in
+the folder is judged, capped by the mode's paper limit or `--limit` — for
+`dev` mode that is `PHASE3_DEV_LIMIT` articles (default 5), the same cap
+`summarize`/`summarize-all` already use, so "how many articles does dev mode
+evaluate" is one number everywhere. When the same article has several
+timestamped `.txt` runs (`SUMMARIZE_ALL_UNIQUE_OUTPUT=true`), only the most
+recent run per article is judged.
 
 ## The blind protocol
 
@@ -72,7 +130,7 @@ Tried in order:
 
 | Symptom                                                              | Cause                                                       | Fix                                                                                |
 |----------------------------------------------------------------------|-------------------------------------------------------------|------------------------------------------------------------------------------------|
-| `quality_score = 99` in many rows                                    | Judge keeps returning conversational text instead of JSON.  | Open the file named by `JUDGE_PROMPT_FILE` (default `llm-sum/prompts/judge_v2.txt`); tighten the "return JSON only" instruction. |
+| `quality_score = 99` in many rows                                    | Judge keeps returning conversational text instead of JSON.  | Open the file named by `JUDGE_PROMPT_FILE` (default `llm-sum/prompts/judge_medhelm_v1.txt`); tighten the "return JSON only" instruction. |
 | `Judge failed after retries`                                         | Network/API issue.                                          | Check `data/error_log.jsonl` for the underlying error; re-run with `--resume`.     |
 | Forbidden-token assertion failure in `tests/test_evaluator.py`       | Someone edited the judge prompt to mention a model name.    | Remove the mention; the blind protocol is non-negotiable for study validity.        |
 
@@ -84,10 +142,13 @@ $env:PHASE3_DEV_LIMIT = "2"
 python llm-sum/evaluator.py
 # → [phase3] mode=dev | limit=2 | real-time | confirm-required
 # → [phase3:safety] Type 'yes' to confirm: yes
-# → [phase3:evaluate] 10.1111/jvim.16872 openai -> openai score=8 via json ($0.04)
-# → [phase3:evaluate] 10.1111/jvim.16872 anthropic -> openai score=7 via json ($0.04)
-# → [phase3:evaluate] 10.1111/jvim.16872 gemini -> openai score=8 via json ($0.04)
-# → [phase3:evaluate] 10.1111/vru.13314  openai -> openai score=9 via json ($0.04)
+# → [phase3:evaluate] 10.1111/jvim.16872 openai -> openai score=4.0 via json ($0.04)
+# → [phase3:evaluate] 10.1111/jvim.16872 anthropic -> openai score=3.85 via json ($0.04)
+# → [phase3:evaluate] 10.1111/jvim.16872 gemini -> openai score=4.0 via json ($0.04)
+# → [phase3:evaluate] 10.1111/vru.13314  openai -> openai score=3.67 via json ($0.04)
 # → ...
 # → [phase3:evaluate] done. counts={'evaluated': 6, ...} budget_spent=$0.24
 ```
+
+`score` here is the row's primary `jury_score` (1–5 scale, MedHELM-style default) —
+not the legacy 1–10 `quality_score`.

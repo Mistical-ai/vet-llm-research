@@ -32,3 +32,20 @@ anthropic>=0.40.0
 google-genai>=1.0.0
 # Counts text tokens for OpenAI-style models, helping estimate how much text fits into a model request.
 tiktoken>=0.7.0
+
+# Phase 6: Publication reporting & statistics
+# Peer-reviewed, citable statistics — exact small-sample significance tests
+# (Wilcoxon signed-rank, Friedman) and bootstrap confidence intervals — so the
+# numbers in a paper come from a validated library, not hand-rolled math. Pinned
+# so every machine reproduces the identical result. Note: Krippendorff's alpha in
+# llm-sum/reliability.py stays hand-rolled because scipy does not implement it.
+scipy>=1.11
+# Numerical arrays underneath scipy (also used by pandas above); pinned explicitly
+# so the reporting layer never depends on a transitive install.
+numpy>=1.23
+# Renders the publication figures (provider comparison, cost-quality Pareto,
+# per-criterion heatmap, reliability plot) headlessly to PNG/SVG in
+# llm-sum/report_figures.py. Uses the non-interactive "Agg" backend only — no
+# display server is required, so this is safe to run on a CI box or the AI's
+# sandboxed shell.
+matplotlib>=3.7

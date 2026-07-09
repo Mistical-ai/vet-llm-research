@@ -58,13 +58,13 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from models_config import compute_cost, get_model_spec  # noqa: E402
 from file_paths import doi_to_slug  # noqa: E402
 from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
-from eval_instances import iter_evaluation_instances  # noqa: E402
+from eval_instances import EvaluationInstance, iter_evaluation_instances  # noqa: E402
 from eval_metrics import calculate_automatic_metrics  # noqa: E402
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
@@ -83,12 +83,62 @@ JUDGE_MODELS = [
     p.strip() for p in os.getenv("JUDGE_MODELS", "openai").split(",") if p.strip()
 ]
 
+# The full MedHELM-style jury panel. Kept as a named constant so switching from
+# the 1-judge default to a 3-judge panel is a single documented step
+# (--jury on the CLI, or JURY_PRESET=panel in .env) rather than a manual list.
+JURY_PANEL = ["openai", "anthropic", "gemini"]
+
+
+def _resolve_preset_judges() -> list[str] | None:
+    """Expand JURY_PRESET (read at call time) into a judge list, or None.
+
+    ``panel`` → the full three-provider jury; ``solo`` → a single openai judge.
+    Read from the environment here (not captured at import) so a test or a
+    between-run .env edit takes effect without reimporting the module. An
+    unknown value is ignored with a warning so a typo cannot silently change
+    who judges.
+    """
+    preset = os.getenv("JURY_PRESET", "").strip().lower()
+    if preset == "panel":
+        return list(JURY_PANEL)
+    if preset == "solo":
+        return ["openai"]
+    if preset:
+        print(f"[phase3:evaluate] Unknown JURY_PRESET={preset!r}; "
+              "falling back to JUDGE_MODELS.")
+    return None
+
+
+def resolve_judges(cli_judges: str | None = None, *, jury: bool = False) -> list[str]:
+    """Resolve the active judge list from the layered opt-in controls.
+
+    Precedence (first match wins), so the explicit choice always beats a preset:
+        1. ``--judges openai,anthropic`` — an explicit comma-separated list.
+        2. ``--jury`` — the convenience flag expanding to the full panel.
+        3. ``JURY_PRESET=panel|solo`` in .env.
+        4. ``JUDGE_MODELS`` in .env (default: a single ``openai`` judge).
+
+    The 1-judge default is unchanged: with no CLI flag and no preset this returns
+    ``JUDGE_MODELS`` exactly as before.
+    """
+    if cli_judges:
+        return [j.strip() for j in cli_judges.split(",") if j.strip()]
+    if jury:
+        return list(JURY_PANEL)
+    preset = _resolve_preset_judges()
+    if preset is not None:
+        return preset
+    return list(JUDGE_MODELS)
+
 BENCHMARK_NAME = os.getenv("EVAL_BENCHMARK_NAME", "vet_lit_summary_medhelm")
 RUBRIC_VERSION = os.getenv("EVAL_RUBRIC_VERSION", "vet_medhelm_score_v1.0")
 EVALUATOR_VERSION = os.getenv("EVALUATOR_VERSION", "evaluator-medhelm-v1.0")
 
-# Criterion weights mirror llm-sum/eval_config/medhelm_vet_summary.yaml. The
-# Python copy is deliberate: evaluator math stays unit-testable and never relies
+# This dict is the single runtime source of truth for criterion weights.
+# llm-sum/eval_config/medhelm_vet_summary.yaml carries a documentation mirror
+# of these same values for human readers; tests/test_weight_consistency.py
+# asserts the two never silently drift apart. Keeping the weights here (not
+# read from YAML) means evaluator math stays unit-testable and never relies
 # on the judge to perform arithmetic correctly.
 _DEFAULT_MEDHELM_CRITERION_WEIGHTS = {
     "faithfulness": 1.5,
@@ -264,32 +314,52 @@ def scale_jury_to_quality_score(jury_score: float) -> int:
     return int(round(((jury_score - 1) / 4) * 9 + 1))
 
 
+def _mean_and_spread(values: list[float]) -> tuple[float | None, float | None]:
+    """Return (mean, max-minus-min) for a list of scores, or (None, None).
+
+    Max-minus-min is used as the disagreement measure because it is easy to
+    explain to a beginner reader and needs no scipy. Krippendorff's alpha in
+    reliability.py is the chance-corrected companion for multi-judge runs.
+    """
+    if not values:
+        return None, None
+    return round(sum(values) / len(values), 2), round(max(values) - min(values), 2)
+
+
 def aggregate_jury_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate multiple judge rows for the same paper-summary pair.
 
     MedHELM-style reliability mode can use several judges. The append-only
     JSONL design stores one row per judge, so this helper computes the
     cross-judge view without rewriting history.
+
+    Both aggregation methods are averaged across judges — not just the primary
+    ``jury_score`` — so switching ``JURY_AGGREGATION_MODE`` after a multi-judge
+    run never needs the judges re-run. Each mode also carries its own
+    disagreement spread, because judges can agree on the weighted score while
+    disagreeing on the unweighted one (or vice versa).
     """
-    valid_scores = [
-        float(row["jury_score"])
-        for row in rows
-        if isinstance(row.get("jury_score"), (int, float))
-    ]
-    if not valid_scores:
-        return {
-            "jury_score": None,
-            "judge_count": len(rows),
-            "valid_judge_count": 0,
-            "judge_disagreement": None,
-        }
+    def _values(field: str) -> list[float]:
+        return [
+            float(row[field])
+            for row in rows
+            if isinstance(row.get(field), (int, float))
+        ]
+
+    primary_mean, primary_spread = _mean_and_spread(_values("jury_score"))
+    weighted_mean, weighted_spread = _mean_and_spread(_values("jury_score_weighted"))
+    unweighted_mean, unweighted_spread = _mean_and_spread(_values("jury_score_unweighted"))
+
     return {
-        "jury_score": round(sum(valid_scores) / len(valid_scores), 2),
+        "jury_score": primary_mean,
         "judge_count": len(rows),
-        "valid_judge_count": len(valid_scores),
-        # Max-minus-min is easy to explain to beginner readers and flags
-        # clinically important judge disagreement without requiring scipy.
-        "judge_disagreement": round(max(valid_scores) - min(valid_scores), 2),
+        "valid_judge_count": len(_values("jury_score")),
+        "judge_disagreement": primary_spread,
+        # Both aggregation methods preserved across judges (see docstring).
+        "jury_score_weighted_mean": weighted_mean,
+        "jury_score_unweighted_mean": unweighted_mean,
+        "judge_disagreement_weighted": weighted_spread,
+        "judge_disagreement_unweighted": unweighted_spread,
     }
 
 
@@ -666,7 +736,10 @@ def _call_judge_openai(user_message: str) -> dict:
         model=spec.model_id,
         messages=[{"role": "user", "content": user_message}],
         temperature=TEMPERATURE,
-        max_tokens=MAX_OUTPUT_TOKENS,
+        # Newer reasoning-capable OpenAI models (e.g. gpt-5.x) reject the
+        # older `max_tokens` name and require `max_completion_tokens`
+        # instead — see summarizer._openai_completion_token_arg().
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
         seed=SEED,
         # Native JSON mode is the reliable contract. Text parsing of a
         # conversational response is unstable across providers and versions.
@@ -906,23 +979,33 @@ def confirm_real_judge(profile: ModeProfile, force: bool) -> bool:
 
 def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                    paper_limit: int | None = None,
-                   doi_filter: set[str] | None = None) -> dict[str, int]:
-    """Run the blind judge loop over summaries.jsonl.
+                   doi_filter: set[str] | None = None,
+                   instances: Iterable[EvaluationInstance] | None = None) -> dict[str, int]:
+    """Run the blind judge loop over a set of evaluation instances.
 
     doi_filter: when provided, only evaluate DOIs in this set. Used by
     run_phase3.py's journal-stratified sampling to pass a pre-selected
     subset without changing evaluator logic.
+
+    instances: when provided, judge exactly these instances instead of
+    building them from summaries.jsonl (paper_limit/doi_filter are ignored in
+    that case — the caller already resolved which instances to include). This
+    is how run_phase3.py's alternate EVAL_INPUT_MODE feeds evaluate() from
+    summarize-all's .txt comparison files without changing anything about how
+    judging itself works — the judge loop below is identical either way.
     """
     judges = judges or JUDGE_MODELS
     prompt_template = load_judge_prompt()
     guard = BudgetGuard()
     counts = {"evaluated": 0, "skipped": 0, "failed": 0, "no_text": 0}
 
-    for instance in iter_evaluation_instances(
+    instance_iter = instances if instances is not None else iter_evaluation_instances(
         summaries_path=SUMMARIES_PATH,
         doi_filter=doi_filter,
         paper_limit=paper_limit,
-    ):
+    )
+
+    for instance in instance_iter:
         # Automatic metrics are computed once per paper-summary pair and then
         # attached to every judge row. This avoids recomputing deterministic
         # text overlap metrics when reliability mode uses multiple judges.
@@ -983,15 +1066,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Override PHASE3_MODE from .env: test|single|dev|batch.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Override the mode's default paper_limit.")
-    parser.add_argument("--judges", default=",".join(JUDGE_MODELS),
-                        help="Comma-separated judge provider keys.")
+    parser.add_argument("--judges", default=None,
+                        help="Comma-separated judge provider keys. Overrides --jury "
+                             "and JURY_PRESET. Default: JUDGE_MODELS from .env "
+                             f"({','.join(JUDGE_MODELS)}).")
+    parser.add_argument("--jury", action="store_true",
+                        help="Convenience switch for the full 3-judge panel "
+                             f"({','.join(JURY_PANEL)}); same as JURY_PRESET=panel.")
     parser.add_argument("--no-resume", action="store_true",
                         help="Re-evaluate even pairs already in evaluations.jsonl.")
     parser.add_argument("--force", action="store_true",
                         help="Bypass interactive confirmation. USE WITH CAUTION.")
     args = parser.parse_args(argv)
 
-    judges = [j.strip() for j in args.judges.split(",") if j.strip()]
+    judges = resolve_judges(args.judges, jury=args.jury)
 
     profile = resolve_mode(args.mode)
     paper_limit = args.limit if args.limit is not None else profile.paper_limit

@@ -2,6 +2,22 @@
 
 This is a hands-on walkthrough for turning your collected PDFs into LLM summaries and quality scores. It assumes **no prior knowledge** of the pipeline. Read it top to bottom the first time; after that, the [mode cheat-sheet](#the-one-control-you-need-to-understand-phase3_mode) and [recipes](#copy-paste-recipes) are all you'll need.
 
+### Doc map
+
+| Doc | Role |
+|-----|------|
+| [phase3/README.md](README.md) (this page) | Beginner walkthrough — the whole `extract → summarize → evaluate → status` pipeline, step by step. |
+| [run_phase3.md](run_phase3.md) | Full CLI/flag reference for the orchestrator. |
+| [medhelm_evaluation.md](medhelm_evaluation.md) | **Authoritative** rubric definition and jury-score math for the current default judge. |
+| [evaluator.md](evaluator.md) | Operator how-to for `evaluator.py` — CLI, inputs/outputs, troubleshooting. |
+| [judge_and_rubric.md](judge_and_rubric.md) | Legacy reference for the superseded Vet-Score v2.0 rubric (`judge_v2.txt`). |
+| [summarizer.md](summarizer.md) | Operator how-to for `summarizer.py`. |
+| [prepare_texts.md](prepare_texts.md) | Operator how-to for PDF-to-text extraction. |
+| [verify_extraction.md](verify_extraction.md) | Operator how-to for the extraction audit tool. |
+| [cost_estimator.md](cost_estimator.md) | Operator how-to for offline cost forecasting. |
+| [check_batch_status.md](check_batch_status.md) | Operator how-to for collecting batch-API results. |
+| [../phase4/README.md](../phase4/README.md) | Scenarios, offline rubric, and run-manifest provenance (Phase 4). |
+
 > **Primary command right now** — six summaries from one matched article (3 from raw PDF + 3 from processed JSONL). Use the hyphenated subcommand **`summarize-all`**, not `summarize all`:
 >
 > ```powershell
@@ -26,6 +42,8 @@ The end product is two data files you'll analyse in Phase 4–5:
 ```
 data/summaries.jsonl      one row per paper, holding all three models' summaries
 data/evaluations.jsonl    one row per (paper, summary, judge) — the scores
+data/results/             timestamped eval-report snapshots (eval_report_<UTC time>.json),
+                          written each time you run `run_phase3.py eval-report`
 ```
 
 Everything you run lives in two folders:
@@ -270,7 +288,7 @@ For each summary, a judge model scores quality, counts hallucinations, and flags
 
 **Purpose:** every `evaluate` run automatically writes a provenance record *before* any judge is called, and patches it with a terminal status once scoring finishes. If two runs ever produce different `jury_score` numbers, diff their manifests instead of trusting memory — code version, prompt file, dataset content, and model versions are all recorded.
 
-**File location:** `data/processed/run_manifest_<run_id>.json` (gitignored, like the rest of `data/`).
+**File location:** `data/run_manifests/run_manifest_<run_id>.json` (gitignored, like the rest of `data/`). This is a fixed location independent of `PROCESSED_DIR_NAME`, so pointing the processed-text cache at an alternate folder (e.g. for an extraction experiment) never redirects manifests along with it.
 
 **Example fields:**
 
@@ -315,6 +333,7 @@ Do this whenever you change the prompt in `llm-sum/prompts/`.
 # .env: PHASE3_MODE=single
 python llm-sum/run_phase3.py summarize      # type 'yes' → 1 paper × 3 models
 python llm-sum/run_phase3.py evaluate
+python llm-sum/run_phase3.py eval-report    # snapshot saved to data/results/
 ```
 Read the resulting summary by hand. If it looks good, scale up. If not, fix the prompt and repeat — you've spent 16 cents, not $40.
 
@@ -345,6 +364,7 @@ data/summaries_txt/<matched-article-stem>.txt
 python llm-sum/run_phase3.py summarize --estimate
 python llm-sum/run_phase3.py summarize      # type 'yes'
 python llm-sum/run_phase3.py evaluate
+python llm-sum/run_phase3.py eval-report
 python llm-sum/run_phase3.py status
 ```
 
@@ -362,7 +382,8 @@ python llm-sum/run_phase3.py summarize          # 3. type 'yes' → submits batc
 
 python llm-sum/check_batch_status.py            # 4. collect finished results
 python llm-sum/run_phase3.py evaluate           # 5. judge the collected summaries
-python llm-sum/run_phase3.py status             # 6. final scoreboard
+python llm-sum/run_phase3.py eval-report        # 6. snapshot saved to data/results/
+python llm-sum/run_phase3.py status             # 7. final scoreboard
 ```
 
 *Why batch for the real run:* you send all 250 requests at once and the provider returns them within 24 hours at **50% off**. You start it before leaving for the day and collect in the morning. While you wait you can even switch `.env` to `single` to tinker with prompts — `check_batch_status.py` ignores the current mode and always collects whatever jobs are pending, so the two don't interfere.

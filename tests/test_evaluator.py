@@ -20,6 +20,7 @@ import pytest
 import evaluator
 from evaluator import (
     BLIND_FORBIDDEN_TOKENS,
+    JURY_PANEL,
     MEDHELM_CRITERION_WEIGHTS,
     SCORE_SENTINEL_MALFORMED,
     UNWEIGHTED_CRITERION_WEIGHTS,
@@ -30,6 +31,7 @@ from evaluator import (
     calculate_jury_score,
     needs_human_review,
     parse_judge_response,
+    resolve_judges,
 )
 
 
@@ -279,6 +281,74 @@ def test_aggregate_jury_scores_tracks_disagreement() -> None:
     assert aggregate["judge_disagreement"] == 1.0
 
 
+def test_aggregate_jury_scores_preserves_both_modes() -> None:
+    """Cross-judge aggregation keeps weighted AND unweighted means, each with
+    its own disagreement spread, so switching JURY_AGGREGATION_MODE after a
+    multi-judge run never needs the judges re-run."""
+    rows = [
+        {"jury_score": 4.0, "jury_score_weighted": 4.2, "jury_score_unweighted": 4.0},
+        {"jury_score": 3.0, "jury_score_weighted": 2.8, "jury_score_unweighted": 3.0},
+    ]
+    aggregate = aggregate_jury_scores(rows)
+    assert aggregate["jury_score"] == 3.5
+    assert aggregate["jury_score_weighted_mean"] == 3.5
+    assert aggregate["jury_score_unweighted_mean"] == 3.5
+    # Weighted judges disagreed more (4.2 vs 2.8) than unweighted (4.0 vs 3.0).
+    assert aggregate["judge_disagreement_weighted"] == 1.4
+    assert aggregate["judge_disagreement_unweighted"] == 1.0
+
+
+def test_aggregate_jury_scores_empty_rows_returns_nones() -> None:
+    aggregate = aggregate_jury_scores([{"jury_score": None}])
+    assert aggregate["jury_score"] is None
+    assert aggregate["valid_judge_count"] == 0
+    assert aggregate["judge_disagreement"] is None
+    assert aggregate["jury_score_weighted_mean"] is None
+    assert aggregate["judge_disagreement_unweighted"] is None
+
+
+# ---------------------------------------------------------------------------
+# Judge selection: --judges / --jury / JURY_PRESET / JUDGE_MODELS
+# ---------------------------------------------------------------------------
+
+def test_resolve_judges_defaults_to_judge_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No CLI flag and no preset → the unchanged 1-judge default."""
+    monkeypatch.delenv("JURY_PRESET", raising=False)
+    monkeypatch.setattr(evaluator, "JUDGE_MODELS", ["openai"])
+    assert resolve_judges(None, jury=False) == ["openai"]
+
+
+def test_resolve_judges_jury_flag_expands_to_panel() -> None:
+    assert resolve_judges(None, jury=True) == JURY_PANEL
+    assert resolve_judges(None, jury=True) == ["openai", "anthropic", "gemini"]
+
+
+def test_resolve_judges_explicit_list_overrides_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit --judges beats --jury and JURY_PRESET."""
+    monkeypatch.setenv("JURY_PRESET", "panel")
+    assert resolve_judges("anthropic", jury=True) == ["anthropic"]
+
+
+def test_resolve_judges_preset_panel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JURY_PRESET", "panel")
+    assert resolve_judges(None, jury=False) == JURY_PANEL
+
+
+def test_resolve_judges_preset_solo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JURY_PRESET", "solo")
+    assert resolve_judges(None, jury=False) == ["openai"]
+
+
+def test_resolve_judges_unknown_preset_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JURY_PRESET", "quintet")
+    monkeypatch.setattr(evaluator, "JUDGE_MODELS", ["openai"])
+    assert resolve_judges(None, jury=False) == ["openai"]
+
+
 def test_call_judge_uses_call_time_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("PHASE3_MODE", "single")
@@ -423,6 +493,43 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
     assert counts["evaluated"] == 2  # 2 papers × 1 summariser × 1 judge
     lines = evaluations_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
+
+
+def test_run_evaluation_with_explicit_instances_bypasses_summaries_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `instances` override lets a caller (run_phase3.py's alternate
+    EVAL_INPUT_MODE) judge a pre-built instance list without evaluator.py
+    ever reading summaries.jsonl — proving the judge loop itself is unchanged
+    regardless of where instances come from."""
+    from eval_instances import EvaluationInstance
+
+    missing_summaries_path = tmp_path / "does_not_exist.jsonl"
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    monkeypatch.setattr(evaluator, "SUMMARIES_PATH", missing_summaries_path)
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
+
+    instances = [
+        EvaluationInstance(
+            doi="10.9999/txt.0001",
+            summarizer="openai",
+            reference_text="Reference body. " * 30,
+            candidate_summary="A candidate summary.",
+            input_source="processed",
+            strata={"input_source": "processed"},
+            summary_record={"doi": "10.9999/txt.0001"},
+            manifest_record={},
+        ),
+    ]
+
+    counts = evaluator.run_evaluation(judges=["openai"], resume=False, instances=instances)
+
+    assert counts["evaluated"] == 1
+    assert not missing_summaries_path.exists()  # never created or read
+    rows = [json.loads(line) for line in evaluations_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["doi"] == "10.9999/txt.0001"
+    assert rows[0]["summarizer"] == "openai"
 
 
 # ---------------------------------------------------------------------------

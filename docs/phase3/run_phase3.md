@@ -26,13 +26,14 @@ Type `yes` at the confirmation prompt for paid modes (`single`, `dev`).
 
 ## What it does
 
-The Phase 3 orchestrator CLI. One entry point with six subcommands; every subcommand prints the active `PHASE3_MODE` banner before doing anything so you cannot run a paid call without seeing the mode first.
+The Phase 3 orchestrator CLI. One entry point with seven subcommands; every subcommand prints the active `PHASE3_MODE` banner before doing anything so you cannot run a paid call without seeing the mode first.
 
 ```
 run_phase3.py extract       → prepare_texts.main()
 run_phase3.py summarize     → summarizer.main()  (or --estimate → cost_estimator)
 run_phase3.py summarize-all → paired PDF + processed JSONL comparison (readable .txt files)
 run_phase3.py evaluate      → evaluator.main()
+run_phase3.py eval-report   → eval_report.main()  (read-only; saves to data/results/)
 run_phase3.py status        → reads jsonl files, prints counts
 run_phase3.py clean         → deletes data/batch/*.jsonl scratch files
 ```
@@ -78,6 +79,7 @@ python llm-sum/run_phase3.py extract --help
 python llm-sum/run_phase3.py summarize --help
 python llm-sum/run_phase3.py summarize-all --help
 python llm-sum/run_phase3.py evaluate --help
+python llm-sum/run_phase3.py eval-report --help
 python llm-sum/run_phase3.py status --help
 ```
 
@@ -207,16 +209,42 @@ python llm-sum/run_phase3.py evaluate --mode dev
 python llm-sum/run_phase3.py evaluate --mode dev --limit 3
 python llm-sum/run_phase3.py evaluate --mode batch
 python llm-sum/run_phase3.py evaluate --mode dev --judges openai,anthropic
+python llm-sum/run_phase3.py evaluate --mode dev --jury
 python llm-sum/run_phase3.py evaluate --mode dev --no-resume
 python llm-sum/run_phase3.py evaluate --mode dev --force
+
+# Judge summarize-all's readable .txt comparison files instead of summaries.jsonl
+python llm-sum/run_phase3.py evaluate --mode dev --input-mode dev
+python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular
 ```
 
 | Flag | Purpose |
 |------|---------|
 | `--limit N` | Override mode's paper limit |
-| `--judges` | Comma-separated judge provider keys |
+| `--judges` | Comma-separated judge provider keys. Overrides `--jury` and `JURY_PRESET`. |
+| `--jury` | Full 3-judge panel (`openai,anthropic,gemini`); same as `JURY_PRESET=panel`. |
+| `--input-mode` | `jsonl` (default), `dev`, `regular`, or `auto` — where to read summaries from. See [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate). |
 | `--no-resume` | Re-evaluate pairs already in `evaluations.jsonl` |
 | `--force` | Bypass confirmation |
+
+### `eval-report` (always free, read-only)
+
+Summarizes `data/evaluations.jsonl` by summariser and clinical strata, plus
+inter-judge reliability when a jury scored the data. See
+[eval_report.md](eval_report.md) for the full flag reference.
+
+```powershell
+python llm-sum/run_phase3.py eval-report
+python llm-sum/run_phase3.py eval-report --json
+python llm-sum/run_phase3.py eval-report --no-save
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--evaluations PATH` | Evaluation rows to summarize (default: `data/evaluations.jsonl`) |
+| `--json` | Print the full report as JSON |
+| `--results-dir PATH` | Where to save the report snapshot (default: `data/results/`) |
+| `--no-save` | Print only; skip writing to `data/results/` |
 
 ### `status` (always free, read-only)
 
@@ -246,6 +274,7 @@ python llm-sum/run_phase3.py extract
 python scripts/verify_extraction.py
 python llm-sum/run_phase3.py summarize --mode test
 python llm-sum/run_phase3.py evaluate --mode test
+python llm-sum/run_phase3.py eval-report
 python llm-sum/run_phase3.py status
 ```
 
@@ -254,6 +283,7 @@ python llm-sum/run_phase3.py status
 ```powershell
 python llm-sum/run_phase3.py summarize --mode single
 python llm-sum/run_phase3.py evaluate --mode single
+python llm-sum/run_phase3.py eval-report
 ```
 
 ### Same article: PDF vs processed — six summaries (readable `.txt` files)
@@ -270,6 +300,7 @@ python llm-sum/run_phase3.py summarize-all --mode dev
 python llm-sum/run_phase3.py summarize --estimate --mode dev
 python llm-sum/run_phase3.py summarize --mode dev
 python llm-sum/run_phase3.py evaluate --mode dev
+python llm-sum/run_phase3.py eval-report
 python llm-sum/run_phase3.py status
 ```
 
@@ -284,6 +315,7 @@ python llm-sum/run_phase3.py summarize --mode batch
 # Hours later:
 python llm-sum/check_batch_status.py
 python llm-sum/run_phase3.py evaluate --mode batch
+python llm-sum/run_phase3.py eval-report
 python llm-sum/run_phase3.py status
 python llm-sum/run_phase3.py clean
 ```
@@ -330,6 +362,7 @@ python llm-sum/run_phase3.py summarize            # type 'yes'; submits batch jo
 # Hours later (or next day):
 python llm-sum/check_batch_status.py              # collect results
 python llm-sum/run_phase3.py evaluate             # judge the collected summaries
+python llm-sum/run_phase3.py eval-report          # snapshot saved to data/results/
 python llm-sum/run_phase3.py status               # final counts
 python llm-sum/run_phase3.py clean                # tidy up
 ```

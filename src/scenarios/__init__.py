@@ -22,6 +22,13 @@ here; the class already wraps ``llm-sum/eval_instances.py`` without live calls.
 from scenarios.base import Scenario, ScenarioPaths
 from scenarios.corpus_status import CorpusStatusReport, PrimaryResearchCorpusScenario
 from scenarios.summarization_quality import VeterinarySummaryQualityScenario
+from scenarios.taxonomy import (
+    TaxonomyCategory,
+    TaxonomyInfo,
+    TaxonomyTask,
+    VeterinaryTaxonomy,
+    VET_TAXONOMY_V1,
+)
 
 __all__ = [
     "Scenario",
@@ -29,4 +36,9 @@ __all__ = [
     "CorpusStatusReport",
     "PrimaryResearchCorpusScenario",
     "VeterinarySummaryQualityScenario",
+    "TaxonomyCategory",
+    "TaxonomyInfo",
+    "TaxonomyTask",
+    "VeterinaryTaxonomy",
+    "VET_TAXONOMY_V1",
 ]

@@ -1,11 +1,13 @@
 # How the Judge Works (Plain English) — Legacy Vet-Score v2.0 Rubric
 
-> **This page describes the legacy Vet-Score v2.0 rubric (`judge_v2.txt`),
-> which is no longer the default.** The current default rubric is the
-> MedHELM-style rubric (five criteria, 1–5 scale, weighted or unweighted
-> `jury_score`) documented in
-> [medhelm_evaluation.md](medhelm_evaluation.md). This page is kept for
-> researchers running an explicit `judge_v2.txt` sensitivity comparison.
+> **Doc role: legacy reference.** This page describes the legacy Vet-Score
+> v2.0 rubric (`judge_v2.txt`), which is no longer the default. The current
+> default rubric is the MedHELM-style rubric (five criteria, 1–5 scale,
+> weighted or unweighted `jury_score`) documented in the authoritative
+> methods reference: [medhelm_evaluation.md](medhelm_evaluation.md). For CLI
+> usage, see the operator how-to: [evaluator.md](evaluator.md). This page is
+> kept for researchers running an explicit `judge_v2.txt` sensitivity
+> comparison.
 
 This page explains **how summaries get scored** under the older Vet-Score
 v2.0 rubric in Phase 3. No code knowledge required.

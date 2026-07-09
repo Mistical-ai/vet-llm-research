@@ -43,6 +43,7 @@ information as a quick-reference table:
 | Give each reproducible paper-selection a fixed, named recipe | `PrimaryResearchCorpusScenario`, `VeterinarySummaryQualityScenario` | `src/scenarios/` |
 | Version the scoring rubric and keep scores structured | `rubric_v1.yaml` + a free heuristic scorer | `docs/rubrics/`, `src/evaluation/` |
 | Record exactly what produced each run's numbers | `RunManifest`, written before judges run | `llm-sum/run_manifest.py` |
+| Group tasks into a named, versioned category taxonomy | `vet_taxonomy_v1` (1 populated category + 2 scaffolded) | `src/scenarios/taxonomy.py` |
 
 **What we deliberately did *not* import:** the full HELM Python framework, PyYAML as a
 new dependency, or a scenario registry that auto-discovers plugins. The goal is
@@ -91,9 +92,23 @@ transformations.  `pipeline.py` only orchestrates and prints.
 
 ### `VeterinarySummaryQualityScenario` (Phase 3 bridge)
 
-**Not wired to a CLI yet.**  It wraps `llm-sum/eval_instances.py` and yields
-the same `EvaluationInstance` rows Phase 3 uses for stratified judging — species,
-study design, clinical topic, journal, input source — without calling any API.
+**CLI:** `python pipeline.py --list-scenarios` (discoverability only — see below)
+or driven for real via `python llm-sum/run_phase3.py evaluate`.
+
+It wraps `llm-sum/eval_instances.py` and yields the same `EvaluationInstance`
+rows Phase 3 uses for stratified judging — species, study design, clinical
+topic, journal, input source — without calling any API.
+
+This scenario is **not** run through `pipeline.py --scenario`: that flag only
+accepts scenarios whose `records()` yields corpus rows (what
+`report_corpus_status()` understands). `VeterinarySummaryQualityScenario`
+yields evaluation instances instead, so it stays driven from
+`llm-sum/run_phase3.py evaluate`, the same place it always was. What changed
+in this chunk is that it is no longer *silently* unwired: `python pipeline.py
+--list-scenarios` prints its name, description, and taxonomy metadata
+alongside `primary_research_corpus`, and every `evaluate` run now records its
+taxonomy id/version in the run manifest's `evaluation_config` (see
+[§5a below](#5a-veterinary-task-taxonomy-srcscenariostaxonomypy)).
 
 Use this when you want a single named object for “the summarization quality
 benchmark” in tests or future orchestration.
@@ -108,6 +123,38 @@ benchmark” in tests or future orchestration.
 | `SUMMARIES_JSONL_PATH` | `data/summaries.jsonl` | summary slots to score |
 
 Manifest and raw PDF paths stay at `data/manifest.jsonl` and `data/raw/` for now.
+
+### 2a. Veterinary task taxonomy (`src/scenarios/taxonomy.py`)
+
+**In plain terms:** a taxonomy is just a name for "which group of tasks does
+this benchmark belong to?" MedHELM organizes its scenarios into categories
+(Clinical Decision Support, Patient Communication, …), and each task carries
+`task` / `what` / `who` / `when` / `language` domain metadata. We borrowed
+that shape — not MedHELM's code — for one reason: so this project's benchmark
+can be cited by a stable name and version (`vet_taxonomy_v1`) instead of
+re-described in prose every time it comes up in a manifest, a report, or a
+paper.
+
+**What's populated today:** one category, **Research Literature
+Summarization**, containing the `veterinary_summary_quality` task (the only
+scenario that exists right now).
+
+**What's scaffolded for later:** **Clinical Decision Support** and **Client
+Communication** are declared as empty categories — reserved names with no
+tasks yet — so a future scenario has a place to register without changing the
+taxonomy's shape or bumping its version just for that.
+
+**Where it shows up:**
+
+- `VeterinarySummaryQualityScenario.metadata()["taxonomy"]` — for tests and
+  any code that inspects a scenario directly.
+- Every `run_manifest_<run_id>.json`'s `evaluation_config.taxonomy` — so a
+  manifest says which taxonomy version produced its rows.
+- `eval_report.py`'s report output (`report["taxonomy"]`, or the `[taxonomy]`
+  line printed above the text-mode report) — so a report is self-describing
+  even without its run manifest alongside it.
+- `python pipeline.py --list-scenarios` — human-readable discovery of every
+  registered scenario and its taxonomy record.
 
 ---
 
@@ -192,7 +239,7 @@ Every `python llm-sum/run_phase3.py evaluate` run writes a provenance JSON file
 **before** any judge is called, then patches it in a `finally` block when scoring
 finishes (success, partial failure, or exception).
 
-**Location:** `data/<PROCESSED_DIR_NAME>/run_manifest_<run_id>.json`
+**Location:** `data/run_manifests/run_manifest_<run_id>.json` (fixed, independent of `PROCESSED_DIR_NAME`)
 
 **Why:** if two runs disagree on `jury_score`, diff manifests instead of memory.
 Each file records git SHA, branch, dataset hash, judge model IDs, resolved model
@@ -232,11 +279,12 @@ Full formulas: [medhelm_evaluation.md](../phase3/medhelm_evaluation.md).
 ## 6. File map
 
 ```text
-pipeline.py                          CLI: corpus status + optional --use-rubric
+pipeline.py                          CLI: corpus status + optional --use-rubric + --list-scenarios
 src/scenarios/
   base.py                            Scenario ABC + ScenarioPaths
   corpus_status.py                   PrimaryResearchCorpusScenario
   summarization_quality.py           VeterinarySummaryQualityScenario
+  taxonomy.py                        vet_taxonomy_v1 — versioned category/task taxonomy
 src/evaluation/
   rubric_scoring.py                  Offline heuristic scorer
 docs/rubrics/rubric_v1.yaml          Auxiliary rubric definition
@@ -250,7 +298,7 @@ data/evaluations.jsonl               Live judge output (gitignored)
 ## 7. Tests
 
 ```powershell
-python -m pytest tests/test_scenarios.py tests/test_rubric_scoring.py tests/test_run_manifest.py tests/test_run_phase3.py -q
+python -m pytest tests/test_scenarios.py tests/test_taxonomy.py tests/test_rubric_scoring.py tests/test_run_manifest.py tests/test_run_phase3.py -q
 ```
 
 These tests mock every paid API call.  Safe to run in CI or before pushing.

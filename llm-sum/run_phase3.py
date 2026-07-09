@@ -8,8 +8,24 @@ One CLI for every Phase 3 step:
     summarize-all
                 Run paired raw-PDF and processed-text summaries, producing
                 readable text files with three provider outputs per source.
-    evaluate    Run the blind judge over data/summaries.jsonl.
+    evaluate    Run the blind judge. Reads data/summaries.jsonl by default;
+                set EVAL_INPUT_MODE (or pass --input-mode) to instead judge
+                summarize-all's data/dev_tests/summaries_txt or
+                data/summaries_txt comparison files.
     eval-report Summarize MedHELM-style evaluation rows by clinical strata.
+                --publication emits paper-ready tables (report_tables.py).
+    report-figures
+                Render publication figures (PNG/SVG) and export a named,
+                taxonomy-keyed leaderboard (JSON + Markdown) from
+                data/evaluations.jsonl (see docs/phase6/reporting.md).
+    export-human-review
+                Sample judged (paper, summary) pairs from data/evaluations.jsonl
+                and export blind review packets for one or more human
+                reviewers (see docs/phase5/human_validation.md).
+    ingest-human-review
+                Read filled-in reviewer scoresheets back into
+                data/human_reviews.jsonl; eval-report then reports inter-reviewer
+                agreement and human-vs-jury correlation.
     status      Print counts: extracted / summarised / evaluated / budget.
     clean       Remove temporary data/batch/*.jsonl scratch files.
 
@@ -39,12 +55,20 @@ from run_manifest import (  # noqa: E402
     resolve_model_versions,
     sha256_file,
     sha256_file_or_empty,
+    sha256_files_combined,
     write_run_manifest,
 )
+from scenarios import VET_TAXONOMY_V1, VeterinarySummaryQualityScenario  # noqa: E402
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
+RESULTS_DIR = DATA_DIR / "results"
+# Deliberately NOT derived from PROCESSED_DIR: PROCESSED_DIR_NAME lets you
+# point the processed-text cache at an alternate folder (e.g. "processedv2"
+# for an extraction experiment) without evaluate's run_manifest_*.json files
+# following it there. Manifests always live in one stable place.
+RUN_MANIFEST_DIR = DATA_DIR / "run_manifests"
 RAW_DIR = DATA_DIR / "raw"
 SUMMARIES_PDF_DIR = DATA_DIR / "summaries_pdf"
 SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
@@ -52,6 +76,7 @@ DEV_TESTS_DIR = DATA_DIR / "dev_tests"
 DEV_TESTS_SUMMARIES_PDF_DIR = DEV_TESTS_DIR / "summaries_pdf"
 DEV_TESTS_SUMMARIES_TXT_DIR = DEV_TESTS_DIR / "summaries_txt"
 SUMMARIZE_ALL_OUTPUT_SETS = ("auto", "regular", "dev-tests")
+EVAL_INPUT_MODES = ("jsonl", "auto", "dev", "regular")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -76,6 +101,29 @@ def _summarize_all_random_match() -> bool:
 def _summarize_all_unique_output() -> bool:
     """Whether summarize-all writes timestamped files instead of stem.txt."""
     return _env_bool("SUMMARIZE_ALL_UNIQUE_OUTPUT", True)
+
+
+def _resolve_eval_input_mode(mode_name: str, cli_override: str | None) -> str:
+    """Resolve which summary source `evaluate` reads from.
+
+    Precedence: --input-mode (CLI) > EVAL_INPUT_MODE (.env) > 'jsonl' default
+    (the original data/summaries.jsonl pipeline, unchanged).
+
+    'auto' expands based on the active PHASE3_MODE, mirroring
+    _summarize_all_output_dirs()'s existing auto behaviour: PHASE3_MODE=dev
+    reads the dev_tests processed-text folder, every other mode reads the
+    regular one. This is what makes 'switch to the regular folder once
+    you're ready for the full corpus' a plain PHASE3_MODE change instead of
+    an extra edit.
+    """
+    raw = (cli_override or os.getenv("EVAL_INPUT_MODE", "jsonl")).strip().lower()
+    if raw == "auto":
+        return "dev" if mode_name == "dev" else "regular"
+    if raw in ("jsonl", "dev", "regular"):
+        return raw
+    print(f"[phase3] WARNING: invalid EVAL_INPUT_MODE={raw!r}; using 'jsonl'. "
+          f"Valid: {EVAL_INPUT_MODES}")
+    return "jsonl"
 
 
 def _summarize_all_output_set() -> str:
@@ -351,16 +399,24 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     profile = resolve_mode(args.mode)
     print(profile.banner())
 
-    judges = (
-        [j.strip() for j in args.judges.split(",") if j.strip()]
-        if args.judges else None
-    )
-
     import evaluator
     from eval_instances import iter_evaluation_instances
 
-    active_judges = judges or evaluator.JUDGE_MODELS
+    # resolve_judges applies the layered opt-in: --judges > --jury > JURY_PRESET
+    # > JUDGE_MODELS. Default stays a single openai judge.
+    judges = evaluator.resolve_judges(args.judges, jury=args.jury)
+    active_judges = judges
     model_ids = {j: get_model_spec(j).model_id for j in active_judges}
+    if len(active_judges) > 1:
+        print(f"[phase3:evaluate] jury of {len(active_judges)} judges: "
+              f"{', '.join(active_judges)} (reliability stats will be reported)")
+
+    input_mode = _resolve_eval_input_mode(profile.name, args.input_mode)
+    if input_mode != "jsonl":
+        return _cmd_evaluate_from_txt_folder(
+            args, profile, judges=judges, active_judges=active_judges,
+            model_ids=model_ids, input_mode=input_mode,
+        )
 
     journal_map: dict[str, list] = {}
 
@@ -443,6 +499,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         "jury_aggregation_mode": evaluator.JURY_AGGREGATION_MODE,
         "mode": profile.name,
         "slice_config": slice_config,
+        "taxonomy": VET_TAXONOMY_V1.describe(VeterinarySummaryQualityScenario.name),
     }
     manifest = build_run_manifest(
         run_id=create_run_id(),
@@ -459,7 +516,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         evaluation_config=evaluation_config,
         selected_instance_ids=selected_instance_ids,
     )
-    manifest_path = PROCESSED_DIR / f"run_manifest_{manifest.run_id}.json"
+    manifest_path = RUN_MANIFEST_DIR / f"run_manifest_{manifest.run_id}.json"
     write_run_manifest(manifest, manifest_path)
 
     status = "started"
@@ -500,6 +557,110 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 status = "completed" if counts.get("failed", 0) == 0 else "failed"
                 _print_reveal_table(doi_filter, journal_map)
                 result = 0 if status == "completed" else 1
+        return result
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        from eval_report import iter_evaluation_rows
+
+        resolved_versions = resolve_model_versions(
+            active_judges, model_ids, list(iter_evaluation_rows()),
+        )
+        finalize_run_manifest(
+            manifest_path, resolved_model_versions=resolved_versions, status=status,
+        )
+
+
+def _cmd_evaluate_from_txt_folder(
+    args: argparse.Namespace, profile, *, judges: list[str], active_judges: list[str],
+    model_ids: dict[str, str], input_mode: str,
+) -> int:
+    """Evaluate summarize-all's processed-text .txt comparison files directly.
+
+    A lighter-weight sibling of cmd_evaluate's data/summaries.jsonl path: no
+    journal-stratified sampling (a .txt folder is usually a hand-run batch,
+    not the full corpus with a manifest to stratify against) — just every
+    article found in the chosen folder, capped by the mode's paper_limit (or
+    --limit). PDF-input comparison files are never read here; only the
+    processed-text side (see docs/phase3/evaluator.md).
+    """
+    from evaluator import confirm_real_judge, run_evaluation
+    from summarize_all_ingest import iter_summarize_all_instances, select_latest_txt_files
+    from utils import require_positive_budget_for_real_run
+    import evaluator
+
+    txt_dir = DEV_TESTS_SUMMARIES_TXT_DIR if input_mode == "dev" else SUMMARIES_TXT_DIR
+    print(f"[phase3:evaluate] input mode={input_mode}: reading processed-text "
+          f"summaries from {txt_dir}")
+
+    paper_limit = args.limit if args.limit is not None else profile.paper_limit
+    selected_files = select_latest_txt_files(txt_dir, paper_limit=paper_limit)
+    if not selected_files:
+        print(f"[phase3:evaluate] No processed-text summaries found in {txt_dir}. "
+              "Run 'summarize-all' first, or change EVAL_INPUT_MODE / --input-mode.")
+        return 1
+
+    instances = list(iter_summarize_all_instances(txt_dir, files=selected_files))
+    dois = sorted({inst.doi for inst in instances})
+    providers_seen = sorted({inst.summarizer for inst in instances})
+    print(f"[phase3:evaluate] {len(dois)} article(s) found, {len(instances)} summary "
+          f"slot(s) to judge (providers: {', '.join(providers_seen) or 'none'})")
+    if not instances:
+        print("[phase3:evaluate] Nothing to judge — no successful provider summaries "
+              "were found in the selected files.")
+        return 1
+
+    prompt_file = evaluator.JUDGE_PROMPT_FILE
+    prompt_path = prompt_file if prompt_file.is_absolute() else REPO_ROOT / prompt_file
+    evaluation_config = {
+        "rubric_version": evaluator.RUBRIC_VERSION,
+        "evaluator_version": evaluator.EVALUATOR_VERSION,
+        "benchmark_name": evaluator.BENCHMARK_NAME,
+        "jury_aggregation_mode": evaluator.JURY_AGGREGATION_MODE,
+        "mode": profile.name,
+        "slice_config": {
+            "type": "summarize_all_txt",
+            "input_mode": input_mode,
+            "source_dir": str(txt_dir),
+            "paper_limit": paper_limit,
+            "articles_found": len(dois),
+        },
+        "taxonomy": VET_TAXONOMY_V1.describe(VeterinarySummaryQualityScenario.name),
+    }
+    manifest = build_run_manifest(
+        run_id=create_run_id(),
+        dataset_path=str(txt_dir),
+        dataset_hash_sha256=sha256_files_combined(selected_files),
+        judges=active_judges,
+        model_ids=model_ids,
+        prompt_template_id=prompt_path.name,
+        prompt_path=str(prompt_path),
+        prompt_sha256=sha256_file(prompt_path),
+        temperature=evaluator.TEMPERATURE,
+        max_output_tokens=evaluator.MAX_OUTPUT_TOKENS,
+        seed=evaluator.SEED,
+        evaluation_config=evaluation_config,
+        selected_instance_ids=dois,
+    )
+    manifest_path = RUN_MANIFEST_DIR / f"run_manifest_{manifest.run_id}.json"
+    write_run_manifest(manifest, manifest_path)
+
+    status = "started"
+    result = 1
+    try:
+        if not confirm_real_judge(profile, force=args.force):
+            status = "failed"
+            result = 1
+        else:
+            require_positive_budget_for_real_run(
+                dry_run=profile.dry_run, context="Phase 3 evaluation",
+            )
+            counts = run_evaluation(
+                judges=judges, resume=not args.no_resume, instances=instances,
+            )
+            status = "completed" if counts.get("failed", 0) == 0 else "failed"
+            result = 0 if status == "completed" else 1
         return result
     except Exception:
         status = "failed"
@@ -570,12 +731,110 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_eval_report(args: argparse.Namespace) -> int:
-    """Print read-only aggregate reports for MedHELM-style evaluation rows."""
+    """Print read-only aggregate reports for MedHELM-style evaluation rows.
+
+    ``--publication`` switches from the operator-facing stratified summary
+    (eval_report.py) to the publication tables + significance tests
+    (report_tables.py): provider comparison with bootstrap CIs, paired
+    Wilcoxon/Friedman tests, per-stratum and processed-vs-PDF breakdowns, and
+    cost-per-quality-point. Both are read-only and offline.
+    """
+    if args.publication:
+        from report_tables import main as publication_main
+        delegate = ["--evaluations", str(args.evaluations), "--results-dir", str(args.results_dir)]
+        if args.json:
+            delegate.append("--json")
+        if args.markdown:
+            delegate.append("--markdown")
+        if args.no_save:
+            delegate.append("--no-save")
+        return publication_main(delegate)
+
     from eval_report import main as report_main
-    delegate = ["--evaluations", str(args.evaluations)]
+    delegate = ["--evaluations", str(args.evaluations), "--results-dir", str(args.results_dir)]
     if args.json:
         delegate.append("--json")
+    if args.markdown:
+        delegate.append("--markdown")
+    if args.no_detail:
+        delegate.append("--no-detail")
+    if args.no_save:
+        delegate.append("--no-save")
+    if args.human_validation_mode is not None:
+        delegate += ["--human-validation-mode", args.human_validation_mode]
     return report_main(delegate)
+
+
+# ---------------------------------------------------------------------------
+# report-figures
+# ---------------------------------------------------------------------------
+
+def cmd_report_figures(args: argparse.Namespace) -> int:
+    """Render publication figures + export the VetHELM-style leaderboard.
+
+    Offline only — no API calls. Delegates to report_figures.main() so the
+    module stays independently runnable/testable (same pattern as
+    cmd_eval_report's --publication delegation to report_tables.py).
+    """
+    print(resolve_mode(args.mode).banner())
+    from report_figures import main as report_figures_main
+
+    delegate = ["--evaluations", str(args.evaluations), "--results-dir", str(args.results_dir)]
+    if args.summaries is not None:
+        delegate += ["--summaries", str(args.summaries)]
+    if args.human_reviews is not None:
+        delegate += ["--human-reviews", str(args.human_reviews)]
+    if args.seed is not None:
+        delegate += ["--seed", str(args.seed)]
+    if args.bootstrap_resamples is not None:
+        delegate += ["--bootstrap-resamples", str(args.bootstrap_resamples)]
+    if args.cost_batched:
+        delegate.append("--cost-batched")
+    if args.no_figures:
+        delegate.append("--no-figures")
+    if args.formats is not None:
+        delegate += ["--formats", args.formats]
+    return report_figures_main(delegate)
+
+
+# ---------------------------------------------------------------------------
+# export-human-review
+# ---------------------------------------------------------------------------
+
+def cmd_export_human_review(args: argparse.Namespace) -> int:
+    """Sample + export blind human-review packets from data/evaluations.jsonl.
+
+    Offline only — no API calls are made. The mode banner is printed only for
+    consistency with the other subcommands (same rationale as cmd_extract).
+    """
+    print(resolve_mode(args.mode).banner())
+    from human_review import main as human_review_main
+
+    delegate: list[str] = []
+    if args.reviewers is not None:
+        delegate += ["--reviewers", str(args.reviewers)]
+    if args.sample_size is not None:
+        delegate += ["--sample-size", str(args.sample_size)]
+    if args.seed is not None:
+        delegate += ["--seed", str(args.seed)]
+    return human_review_main(delegate)
+
+
+def cmd_ingest_human_review(args: argparse.Namespace) -> int:
+    """Ingest filled reviewer scoresheets into data/human_reviews.jsonl.
+
+    Offline only — no API calls. Delegates to human_review.ingest_main (kept
+    separate from the export main() so each side stays independently testable).
+    """
+    print(resolve_mode(args.mode).banner())
+    from human_review import ingest_main
+
+    delegate: list[str] = []
+    if args.review_dir is not None:
+        delegate += ["--review-dir", str(args.review_dir)]
+    if args.output is not None:
+        delegate += ["--output", str(args.output)]
+    return ingest_main(delegate)
 
 
 # ---------------------------------------------------------------------------
@@ -835,7 +1094,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--limit", type=int, default=None,
                         help="Override the mode's paper_limit.")
     p_eval.add_argument("--judges", default=None,
-                        help="Comma-separated judge provider keys.")
+                        help="Comma-separated judge provider keys. Overrides --jury "
+                             "and JURY_PRESET.")
+    p_eval.add_argument("--jury", action="store_true",
+                        help="Use the full 3-judge panel (openai,anthropic,gemini); "
+                             "same as JURY_PRESET=panel. Enables reliability stats.")
+    p_eval.add_argument("--input-mode", choices=EVAL_INPUT_MODES, default=None,
+                        help=("Where to read summaries from. 'jsonl' (default): "
+                              "data/summaries.jsonl, the original pipeline. "
+                              "'dev': data/dev_tests/summaries_txt (summarize-all "
+                              "output). 'regular': data/summaries_txt. 'auto': "
+                              "'dev' when --mode is dev, else 'regular'. Overrides "
+                              "EVAL_INPUT_MODE from .env for this run. PDF-input "
+                              "comparison files are never evaluated."))
     p_eval.add_argument("--no-resume", action="store_true",
                         help="Re-evaluate even pairs already in evaluations.jsonl.")
     p_eval.add_argument("--force", action="store_true",
@@ -847,10 +1118,91 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.set_defaults(func=cmd_status)
 
     p_report = sub.add_parser("eval-report", help="Summarize evaluation rows by model and strata.")
+    _add_mode_arg(p_report)
+    p_report.add_argument("--publication", action="store_true",
+                          help="Emit publication tables instead of the operator summary: "
+                               "provider comparison with 95%% bootstrap CIs, paired "
+                               "Wilcoxon/Friedman significance tests, per-stratum and "
+                               "processed-vs-PDF breakdowns, and cost-per-quality-point. "
+                               "Writes JSON + Markdown + a folder of CSVs. Offline; --no-detail "
+                               "and --human-validation-mode do not apply.")
     p_report.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
-    p_report.add_argument("--json", action="store_true",
+    p_report_output = p_report.add_mutually_exclusive_group()
+    p_report_output.add_argument("--json", action="store_true",
                           help="Print full report JSON instead of compact text.")
+    p_report_output.add_argument("--markdown", action="store_true",
+                          help="Print a plain-English Markdown report; also saves it and a "
+                               "companion per-article detail file to --results-dir.")
+    p_report.add_argument("--no-detail", action="store_true",
+                          help="With --markdown, skip the per-article detail file.")
+    p_report.add_argument("--human-validation-mode",
+                          choices=("per_reviewer", "pooled", "both"), default=None,
+                          help="How to report human-vs-jury correlation: per_reviewer "
+                               "(default; each reviewer validated on their own scores), "
+                               "pooled (all reviewers averaged), or both. Overrides "
+                               "HUMAN_VALIDATION_MODE from .env.")
+    p_report.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
+                          help="Where to save the report snapshot (default: data/results/).")
+    p_report.add_argument("--no-save", action="store_true",
+                          help="Print only; don't write a report file.")
     p_report.set_defaults(func=cmd_eval_report)
+
+    p_figures = sub.add_parser(
+        "report-figures",
+        help="Render publication figures (PNG/SVG) and export a VetHELM-style leaderboard.",
+    )
+    _add_mode_arg(p_figures)
+    p_figures.add_argument("--evaluations", type=Path, default=EVALUATIONS_PATH)
+    p_figures.add_argument("--summaries", type=Path, default=None,
+                           help="Source of summariser token counts for cost columns "
+                                "(default: data/summaries.jsonl).")
+    p_figures.add_argument("--human-reviews", type=Path, default=None,
+                           help="Normalized human-review rows "
+                                "(default: data/human_reviews.jsonl; missing is fine).")
+    p_figures.add_argument("--seed", type=int, default=None,
+                           help="Bootstrap seed (default: PUBLICATION_BOOTSTRAP_SEED or 42).")
+    p_figures.add_argument("--bootstrap-resamples", type=int, default=None,
+                           help="Bootstrap resamples per CI "
+                                "(default: PUBLICATION_BOOTSTRAP_RESAMPLES or 2000).")
+    p_figures.add_argument("--cost-batched", action="store_true",
+                           help="Price summaries at batch (50%%-off) rates. "
+                                "Overrides PUBLICATION_COST_BATCHED.")
+    p_figures.add_argument("--no-figures", action="store_true",
+                           help="Write only the leaderboard JSON/Markdown; skip PNG/SVG figures.")
+    p_figures.add_argument("--formats", default=None,
+                           help="Comma-separated figure formats "
+                                "(default: PUBLICATION_FIGURE_FORMATS or 'png,svg').")
+    p_figures.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
+                           help="Where to save the leaderboard + figures (default: data/results/).")
+    p_figures.set_defaults(func=cmd_report_figures)
+
+    p_human = sub.add_parser(
+        "export-human-review",
+        help="Export blind human-validation review packets from data/evaluations.jsonl.",
+    )
+    _add_mode_arg(p_human)
+    p_human.add_argument("--reviewers", type=int, default=None,
+                         help="Number of independent reviewer copies to export "
+                              "(default: HUMAN_REVIEWERS from .env, or 1).")
+    p_human.add_argument("--sample-size", type=int, default=None,
+                         help="Number of (paper, summary) items to sample "
+                              "(default: HUMAN_REVIEW_SAMPLE_SIZE from .env, or 15).")
+    p_human.add_argument("--seed", type=int, default=None,
+                         help="Sampling seed (default: HUMAN_REVIEW_SEED from .env, or 42).")
+    p_human.set_defaults(func=cmd_export_human_review)
+
+    p_ingest = sub.add_parser(
+        "ingest-human-review",
+        help="Ingest filled reviewer scoresheets into data/human_reviews.jsonl.",
+    )
+    _add_mode_arg(p_ingest)
+    p_ingest.add_argument("--review-dir", type=Path, default=None,
+                          help="Export directory with reviewer_*/ folders and "
+                               "unblinding_key.json (default: data/human_review/).")
+    p_ingest.add_argument("--output", type=Path, default=None,
+                          help="Normalized JSONL output path "
+                               "(default: data/human_reviews.jsonl).")
+    p_ingest.set_defaults(func=cmd_ingest_human_review)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")
     p_clean.set_defaults(func=cmd_clean)

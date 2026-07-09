@@ -15,6 +15,7 @@ import sys
 from typing import Any, Iterable
 
 from scenarios.base import Scenario
+from scenarios.taxonomy import VET_TAXONOMY_V1
 
 
 class VeterinarySummaryQualityScenario(Scenario):
@@ -51,5 +52,6 @@ class VeterinarySummaryQualityScenario(Scenario):
                 "input_source",
             ],
             "uses_live_api": False,
+            "taxonomy": VET_TAXONOMY_V1.describe(self.name),
         })
         return data

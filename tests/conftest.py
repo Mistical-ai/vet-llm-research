@@ -34,6 +34,12 @@ os.environ["BUDGET_HARD_STOP"] = "1000.00"
 # defence-in-depth guardrail so a stray DRY_RUN=false in a child shell
 # can't promote a unit test into a paid API call.
 os.environ.setdefault("PHASE3_MODE", "test")
+# Force the original data/summaries.jsonl pipeline for tests that don't pass
+# --input-mode explicitly. Without this, a local .env with EVAL_INPUT_MODE=
+# dev/regular (routing `evaluate` at data/dev_tests/summaries_txt or
+# data/summaries_txt instead) leaks into run_phase3 wiring tests and makes
+# them fail on developer machines while passing in a clean CI environment.
+os.environ["EVAL_INPUT_MODE"] = "jsonl"
 
 for path in (_REPO_ROOT / "src", _REPO_ROOT / "llm-sum"):
     sp = str(path)

@@ -40,6 +40,15 @@ def test_scenario_imports_and_metadata_are_stable() -> None:
     assert "clinical_topic" in summary_quality.metadata()["stratification_fields"]
 
 
+def test_summary_quality_metadata_carries_taxonomy_record() -> None:
+    summary_quality = VeterinarySummaryQualityScenario()
+    taxonomy = summary_quality.metadata()["taxonomy"]
+
+    assert taxonomy["taxonomy_id"] == "vet_taxonomy_v1"
+    assert taxonomy["category_key"] == "research_literature_summarization"
+    assert taxonomy["task_key"] == "veterinary_summary_quality"
+
+
 def test_load_manifest_records_deduplicates_and_validates_manual_pdfs(tmp_path: Path) -> None:
     scenario = _scenario(tmp_path)
     manual_doi = "10.1111/manual.1"
@@ -145,3 +154,22 @@ def test_pipeline_cli_rejects_unknown_scenario_before_loading(monkeypatch) -> No
         pipeline.main(["--scenario", "unknown"])
 
     assert exc_info.value.code == 2
+
+
+def test_pipeline_cli_list_scenarios_prints_catalog_without_loading_corpus(
+    monkeypatch, capsys
+) -> None:
+    import pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "load_corpus",
+        lambda scenario: pytest.fail("--list-scenarios should never load the corpus"),
+    )
+
+    assert pipeline.main(["--list-scenarios"]) == 0
+
+    out = capsys.readouterr().out
+    assert "primary_research_corpus" in out
+    assert "veterinary_summary_quality" in out
+    assert "vet_taxonomy_v1" in out

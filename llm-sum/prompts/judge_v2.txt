@@ -1,3 +1,5 @@
+[LEGACY RUBRIC — sensitivity/compatibility reference only. NOT the default judge prompt. The current default is judge_medhelm_v1.txt; see docs/phase3/medhelm_evaluation.md. Instructions below are unchanged from the original Vet-Score v2.0 rubric.]
+
 You are an impartial evaluator scoring the quality and factual accuracy of a candidate summary against its reference text. You do not know which system produced the summary.
 
 Hallucination is defined as: any factual claim in the candidate summary that is not explicitly stated or directly implied in the reference text.

@@ -73,7 +73,11 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from file_paths import legacy_doi_filename  # noqa: E402
-from scenarios import PrimaryResearchCorpusScenario, ScenarioPaths  # noqa: E402
+from scenarios import (  # noqa: E402
+    PrimaryResearchCorpusScenario,
+    ScenarioPaths,
+    VeterinarySummaryQualityScenario,
+)
 from utils import env_path, log_error  # noqa: E402
 
 load_dotenv()
@@ -276,6 +280,36 @@ def resolve_pipeline_scenario(name: str) -> PrimaryResearchCorpusScenario:
     )
 
 
+# Every scenario registered under src/scenarios/, for --list-scenarios only.
+# Only PrimaryResearchCorpusScenario is runnable through --scenario above: its
+# records() yields corpus rows this CLI's status report understands.
+# VeterinarySummaryQualityScenario yields evaluation instances instead (see
+# src/scenarios/summarization_quality.py) and is driven from
+# llm-sum/run_phase3.py, not from this corpus-status flow. It is listed here
+# so it is discoverable rather than silently unwired.
+REGISTERED_SCENARIOS = (PrimaryResearchCorpusScenario, VeterinarySummaryQualityScenario)
+
+
+def _print_scenario_catalog() -> None:
+    """Print name/description/metadata for every registered scenario."""
+    print("\n" + "=" * 68)
+    print("  REGISTERED SCENARIOS")
+    print("=" * 68)
+    for scenario_cls in REGISTERED_SCENARIOS:
+        meta = scenario_cls().metadata()
+        print(f"\n[{meta['name']}]")
+        print(f"  {meta['description']}")
+        for key, value in meta.items():
+            if key in ("name", "description"):
+                continue
+            print(f"  {key}: {value}")
+    print(
+        "\nOnly 'primary_research_corpus' is runnable via --scenario here; "
+        "'veterinary_summary_quality' is evaluated through "
+        "llm-sum/run_phase3.py evaluate.\n"
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build CLI flags while keeping the default command unchanged."""
     parser = argparse.ArgumentParser(description="Report veterinary corpus health.")
@@ -293,12 +327,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "without changing corpus status output."
         ),
     )
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="Print name/description/metadata for every registered scenario and exit.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the corpus status CLI and return a shell-friendly exit code."""
     args = build_arg_parser().parse_args(argv)
+
+    if args.list_scenarios:
+        _print_scenario_catalog()
+        return 0
+
     scenario = resolve_pipeline_scenario(args.scenario)
 
     print("[pipeline] Loading corpus (OA manifest + manual manifest)...")

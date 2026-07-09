@@ -33,7 +33,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -67,6 +67,21 @@ def sha256_file_or_empty(path: Path) -> str:
     if not path.exists():
         return sha256_bytes(b"")
     return sha256_file(path)
+
+
+def sha256_files_combined(paths: Iterable[Path]) -> str:
+    """Hash of a stable (name, content-hash) sequence across multiple files.
+
+    Provenance for a dataset that is a folder of files rather than one JSONL —
+    e.g. the summarize-all ``.txt`` comparison files that evaluate's
+    ``dev``/``regular`` input mode reads. Sorted by filename first so the
+    result does not depend on filesystem iteration order.
+    """
+    combined = hashlib.sha256()
+    for path in sorted(paths, key=lambda p: p.name):
+        combined.update(path.name.encode("utf-8"))
+        combined.update(sha256_file(path).encode("utf-8"))
+    return combined.hexdigest()
 
 
 # ---------------------------------------------------------------------------

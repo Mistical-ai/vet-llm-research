@@ -18,9 +18,12 @@ score_range:
   max: 5
 # Two aggregation modes are always computed and stored per row
 # (jury_score_weighted, jury_score_unweighted); JURY_AGGREGATION_MODE in .env
-# picks which one is aliased as the primary jury_score. Weights below are
-# documentation only — evaluator.py's JURY_CRITERION_WEIGHTS (with an optional
-# JURY_CRITERION_WEIGHTS env override) is the value actually used at runtime.
+# picks which one is aliased as the primary jury_score. The weights below are
+# a DOCUMENTATION MIRROR ONLY. evaluator.py's _DEFAULT_MEDHELM_CRITERION_WEIGHTS
+# (optionally overridden at runtime by the JURY_CRITERION_WEIGHTS env var) is
+# the single source of truth actually used to compute scores.
+# tests/test_weight_consistency.py asserts this mirror matches the code
+# defaults so the two can never silently drift apart.
 # See docs/phase3/medhelm_evaluation.md for the full comparison.
 aggregation:
   default_mode: unweighted   # stock MedHELM's flat mean across criteria

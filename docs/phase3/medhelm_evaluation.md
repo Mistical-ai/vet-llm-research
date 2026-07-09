@@ -1,5 +1,11 @@
 # MedHELM-Style Evaluation For Veterinary Summaries
 
+> **Doc role: authoritative methods reference.** This page defines the rubric,
+> the hallucination taxonomy, and the jury-score math — it is the source of
+> truth for "what is scored and how." For CLI usage and file paths, see the
+> operator how-to: [evaluator.md](evaluator.md). For the superseded rubric
+> this one replaced, see the [legacy reference](judge_and_rubric.md).
+
 ## Purpose
 
 This document explains the evaluation method used after the LLMs generate
@@ -52,10 +58,16 @@ stronger evaluation logic.
 - `llm-sum/eval_config/medhelm_vet_summary.yaml` declares the benchmark recipe.
 - `llm-sum/prompts/judge_medhelm_v1.txt` contains the blind judge rubric.
 - `llm-sum/eval_instances.py` joins summaries, cleaned text, and covariates.
+- `llm-sum/summarize_all_ingest.py` builds the same evaluation instances from
+  summarize-all's `.txt` comparison files, for `EVAL_INPUT_MODE=dev|regular`
+  (see [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate)).
 - `llm-sum/eval_metrics.py` calculates local secondary metrics.
 - `llm-sum/evaluator.py` calls the judge, parses JSON, calculates scores, and
   appends rows to `data/evaluations.jsonl`.
-- `llm-sum/eval_report.py` summarizes results by model and clinical strata.
+- `llm-sum/reliability.py` computes offline inter-judge agreement
+  (Krippendorff's alpha, pairwise agreement) for multi-judge runs.
+- `llm-sum/eval_report.py` summarizes results by model and clinical strata, and
+  prints the reliability section when a jury was used.
 
 ## The Rubric
 
@@ -407,6 +419,52 @@ code changes needed:
 
 Each step roughly multiplies judge-call cost by the number of judges.
 
+### One-step panel switch
+
+Typing the three providers every time is easy to get wrong, so the panel has a
+shortcut. All three of these select the same `openai,anthropic,gemini` jury:
+
+- `JURY_PRESET=panel` in `.env` (and `JURY_PRESET=solo` for a single judge).
+- `--jury` on `python llm-sum/run_phase3.py evaluate` or `llm-sum/evaluator.py`,
+  scoped to one command.
+- The explicit `JUDGE_MODELS=openai,anthropic,gemini`.
+
+Precedence is: an explicit `--judges` list beats `--jury`, which beats
+`JURY_PRESET`, which beats `JUDGE_MODELS`. The 1-judge default is unchanged when
+none of these is set.
+
+### Cross-judge aggregation
+
+Each judge writes its own append-only row (the file is never rewritten). When
+several judges score the same summary, `aggregate_jury_scores()` in
+`evaluator.py` computes the cross-judge view **for both aggregation methods at
+once** — `jury_score_weighted_mean` and `jury_score_unweighted_mean`, each with
+its own `judge_disagreement_*` spread. Because both are kept, changing
+`JURY_AGGREGATION_MODE` after a multi-judge run never requires re-running the
+judges.
+
+### Reliability statistics (2+ judges)
+
+When at least two judges score the same summaries, `python llm-sum/run_phase3.py
+eval-report` adds a **Reliability** section, computed offline by
+`llm-sum/reliability.py` (no API calls, no `scipy`/`numpy` dependency):
+
+- **Krippendorff's alpha (interval)** — a single agreement number corrected for
+  chance, for the overall `jury_score` and for each of the five criteria. `1.0`
+  is perfect agreement, `0.0` is chance-level, and negative means the judges
+  disagree more than chance. It tolerates a judge missing on some items, which a
+  simple max-minus-min spread cannot. The report labels the value using
+  Krippendorff's own cutoffs: `>= 0.80` strong, `>= 0.667` acceptable for
+  tentative conclusions, below that interpret with caution.
+- **Per-criterion alpha, mean, and variance** — shows *which* criteria the
+  judges argue about most (safety and clinical usefulness are often the least
+  reproducible).
+- **Pairwise absolute agreement** — for each judge pair, the mean and max score
+  difference on the summaries both judged: a plain-language companion to alpha.
+
+With a single judge the section prints one line explaining that reliability
+needs a jury, and points at `JURY_PRESET=panel`.
+
 ## Output Fields
 
 Each evaluation row is appended to `data/evaluations.jsonl`. JSONL means **one
@@ -588,6 +646,11 @@ This shows the primary mean `jury_score`, both aggregation methods side by
 side, and reliability rates broken down by model and species — the
 MedHELM-style stratified view of your results.
 
+For a narrative, easier-to-read version of the same data — plus a
+companion per-article file for manually cross-checking the judge's verdict
+against the real article — run `eval-report --markdown` instead. See
+[eval_report.md](eval_report.md) for details.
+
 ## Safe Mock Run
 
 The agent and unit tests may use only mock mode:
@@ -611,6 +674,12 @@ For machine-readable output:
 ```powershell
 python llm-sum/run_phase3.py eval-report --json
 ```
+
+Every run also saves the full report JSON to
+`data/results/eval_report_<UTC timestamp>.json` (one file per run, never
+overwritten) — pass `--no-save` to print only, or `--results-dir PATH` to
+save elsewhere for one run. See [eval_report.md](eval_report.md) for the full
+flag reference.
 
 ## Live Evaluation
 
