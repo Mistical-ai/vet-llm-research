@@ -58,8 +58,8 @@ You'll get two things:
 
 1. **A reading document.** This contains a set of items, each labeled
    something like "item 001," "item 002," and so on. Each item has two
-   parts: the full text of the original research article, and one
-   AI-written summary of it. That's all — no author names, no journal name
+   parts: the full text of the original research article, and three
+   AI-written summaries of it. That's all — no author names, no journal name
    tricks, no hints about which AI wrote the summary.
 
 2. **A scoring sheet.** This is a simple spreadsheet with one row for every
