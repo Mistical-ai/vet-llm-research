@@ -512,6 +512,122 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
     assert len(out_lines) == 2
 
 
+def test_doi_filter_restricts_run_and_ignores_paper_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A doi_filter should process only the filtered DOIs, and a paper_limit
+    passed alongside it must be ignored (the filter set already defines
+    exactly which/how-many papers run) — this is what lets run_phase3.py's
+    dev-mode journal-random selection pick precise DOIs out of manifest.jsonl
+    without fighting the sequential paper_limit slicing.
+    """
+    import prepare_texts
+
+    manifest = tmp_path / "manifest.jsonl"
+    processed = tmp_path / "processed"
+    processed.mkdir()
+
+    dois = [f"10.9999/filter.{i:04d}" for i in range(5)]
+    with open(manifest, "w", encoding="utf-8") as f:
+        for d in dois:
+            f.write(json.dumps({"doi": d, "journal": "TEST"}) + "\n")
+
+    from file_paths import doi_to_slug
+    for d in dois:
+        slug = doi_to_slug(d)
+        entry = {"doi": d, "slug": slug, "text": "Body of paper. " * 40}
+        (processed / f"{slug}.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(summarizer, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+
+    selected = {dois[1], dois[3]}
+    counts = summarizer.run_realtime(
+        manifest_path=manifest,
+        providers=["openai"],
+        paper_limit=1,  # would cap at 1 paper if it weren't ignored
+        doi_filter=selected,
+    )
+
+    assert counts["success"] == 2
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "summaries.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert {row["doi"] for row in rows} == selected
+
+
+def test_write_dev_summary_jsonl_outputs_writes_one_file_per_doi(
+    tmp_path: Path,
+) -> None:
+    """
+    write_dev_summary_jsonl_outputs should render exactly one readable .txt
+    per matching (doi, input_source) pair from data/summaries.jsonl, named by
+    descriptive_stem, with every configured provider represented.
+    """
+    from file_paths import descriptive_stem
+
+    summaries_path = tmp_path / "summaries.jsonl"
+    output_dir = tmp_path / "dev_summaries_jsonl"
+
+    keep_entry = {
+        "doi": "10.9999/dev.0001",
+        "input_source": "processed",
+        "journal": "jvim",
+        "title": "A paper about renal disease",
+        "species": "canine",
+        "study_design": "retrospective",
+        "clinical_topic": "nephrology",
+        "models": {
+            "openai": {
+                "status": "success",
+                "summary": "fallback text",
+                "structured_summary": {"objective": "Study the thing."},
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "model_version": "gpt-5.4-test",
+                "timestamp": "2026-07-13T00:00:00+00:00",
+            },
+            "anthropic": {
+                "status": "failed",
+                "error": "simulated failure",
+                "summary": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "model_version": None,
+                "timestamp": "2026-07-13T00:00:00+00:00",
+            },
+        },
+    }
+    other_doi_entry = {**keep_entry, "doi": "10.9999/dev.0002"}
+    other_source_entry = {**keep_entry, "input_source": "raw_text"}
+
+    with open(summaries_path, "w", encoding="utf-8") as f:
+        for entry in (keep_entry, other_doi_entry, other_source_entry):
+            f.write(json.dumps(entry) + "\n")
+
+    written = summarizer.write_dev_summary_jsonl_outputs(
+        {keep_entry["doi"]},
+        output_dir=output_dir,
+        input_source="processed",
+        summaries_path=summaries_path,
+    )
+
+    assert written == 1
+    files = list(output_dir.glob("*.txt"))
+    assert len(files) == 1
+    assert files[0].stem == descriptive_stem(keep_entry)
+
+    content = files[0].read_text(encoding="utf-8")
+    assert "Journal: jvim" in content
+    assert "OPENAI SUMMARY" in content
+    assert "ANTHROPIC SUMMARY" in content
+    assert "No readable summary was produced. Error: simulated failure" in content
+
+
 def test_raw_text_input_source_writes_separate_summary_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

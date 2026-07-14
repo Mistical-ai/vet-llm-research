@@ -312,10 +312,17 @@ def test_aggregate_jury_scores_empty_rows_returns_nones() -> None:
 # ---------------------------------------------------------------------------
 
 def test_resolve_judges_defaults_to_judge_models(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No CLI flag and no preset → the unchanged 1-judge default."""
+    """No CLI flag and no preset → whatever JUDGE_MODELS holds."""
     monkeypatch.delenv("JURY_PRESET", raising=False)
     monkeypatch.setattr(evaluator, "JUDGE_MODELS", ["openai"])
     assert resolve_judges(None, jury=False) == ["openai"]
+
+
+def test_resolve_judges_default_is_panel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The system default (no CLI flag, no preset) is the full 3-judge panel."""
+    monkeypatch.delenv("JURY_PRESET", raising=False)
+    monkeypatch.setattr(evaluator, "JUDGE_MODELS", list(JURY_PANEL))
+    assert resolve_judges(None, jury=False) == ["openai", "anthropic", "gemini"]
 
 
 def test_resolve_judges_jury_flag_expands_to_panel() -> None:
@@ -334,6 +341,11 @@ def test_resolve_judges_explicit_list_overrides_everything(
 def test_resolve_judges_preset_panel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JURY_PRESET", "panel")
     assert resolve_judges(None, jury=False) == JURY_PANEL
+
+
+def test_resolve_judges_preset_duo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JURY_PRESET", "duo")
+    assert resolve_judges(None, jury=False) == ["openai", "anthropic"]
 
 
 def test_resolve_judges_preset_solo(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -699,3 +711,76 @@ def test_minor_hallucination_does_not_trigger_review_alone() -> None:
         ],
     }
     assert needs_human_review(parsed) is False
+
+
+# ---------------------------------------------------------------------------
+# Readable dev-eval mirror (data/dev_evals_jsonl/)
+# ---------------------------------------------------------------------------
+
+def _fake_eval_row(doi: str, summarizer: str, judge: str, **over) -> dict:
+    row = {
+        "doi": doi,
+        "summarizer": summarizer,
+        "judge": judge,
+        "input_source": "processed",
+        "strata": {"journal": "jvim", "input_source": "processed"},
+        "jury_score": 4,
+        "quality_score": 8,
+        "hallucination_count": 0,
+        "requires_human_review": False,
+        "parse_method": "json",
+        "judge_model_version": "gpt-5.4-test",
+        "reasoning": "Solid summary.",
+    }
+    row.update(over)
+    return row
+
+
+def test_write_dev_eval_jsonl_outputs_writes_one_file_per_doi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evaluator import write_dev_eval_jsonl_outputs
+    from file_paths import doi_to_slug
+
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    with open(evaluations_path, "w", encoding="utf-8") as f:
+        for row in (
+            _fake_eval_row("10.1/aaa", "openai", "openai"),
+            _fake_eval_row("10.1/aaa", "anthropic", "openai", requires_human_review=True),
+            _fake_eval_row("10.2/bbb", "gemini", "openai"),
+            _fake_eval_row("10.3/ccc", "openai", "openai"),  # not requested
+        ):
+            f.write(json.dumps(row) + "\n")
+
+    out_dir = tmp_path / "dev_evals_jsonl"
+    written = write_dev_eval_jsonl_outputs(
+        {"10.1/aaa", "10.2/bbb"}, output_dir=out_dir, evaluations_path=evaluations_path,
+    )
+    assert written == 2
+
+    aaa = (out_dir / f"{doi_to_slug('10.1/aaa')}.txt").read_text(encoding="utf-8")
+    # Header begins with DOI: so run_phase3._read_dois_from_dev_folder can parse it.
+    assert aaa.startswith("DOI: 10.1/aaa")
+    # Both provider sections for that DOI are present.
+    assert "SUMMARIZER: openai" in aaa
+    assert "SUMMARIZER: anthropic" in aaa
+    assert "Requires Human Review: Yes" in aaa
+    # The un-requested DOI produced no file.
+    assert not (out_dir / f"{doi_to_slug('10.3/ccc')}.txt").exists()
+
+
+def test_write_dev_eval_jsonl_outputs_overwrites_in_place(
+    tmp_path: Path,
+) -> None:
+    """A re-judge writes one file per DOI keyed by slug (no timestamped dupes)."""
+    from evaluator import write_dev_eval_jsonl_outputs
+
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    evaluations_path.write_text(
+        json.dumps(_fake_eval_row("10.1/aaa", "openai", "openai")) + "\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "dev_evals_jsonl"
+    write_dev_eval_jsonl_outputs({"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path)
+    write_dev_eval_jsonl_outputs({"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path)
+    assert len(list(out_dir.glob("*.txt"))) == 1

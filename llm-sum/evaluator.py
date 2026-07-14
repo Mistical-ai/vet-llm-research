@@ -79,28 +79,35 @@ MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1500"))
 # llm-sum/prompts/judge_v2.txt only when you intentionally need the older
 # Vet-Score v2.0 rubric for comparison.
 JUDGE_PROMPT_FILE = Path(os.getenv("JUDGE_PROMPT_FILE", "llm-sum/prompts/judge_medhelm_v1.txt"))
-JUDGE_MODELS = [
-    p.strip() for p in os.getenv("JUDGE_MODELS", "openai").split(",") if p.strip()
-]
-
-# The full MedHELM-style jury panel. Kept as a named constant so switching from
-# the 1-judge default to a 3-judge panel is a single documented step
-# (--jury on the CLI, or JURY_PRESET=panel in .env) rather than a manual list.
+# The full MedHELM-style jury panel and its 2-judge subset. Named constants so
+# the default (the full panel) and the one-word JURY_PRESET switches all draw
+# from a single source. ``duo`` keeps the two flagship judges; drop to ``solo``
+# (openai only) for the cheapest single-grader runs.
 JURY_PANEL = ["openai", "anthropic", "gemini"]
+JURY_DUO = ["openai", "anthropic"]
+
+# Default judge set is the FULL 3-judge panel: evaluation should be a real jury,
+# not a single grader. Override with JUDGE_MODELS=... (any comma list),
+# JURY_PRESET=solo|duo|panel, or --judges / --jury for a single run.
+JUDGE_MODELS = [
+    p.strip() for p in os.getenv("JUDGE_MODELS", ",".join(JURY_PANEL)).split(",") if p.strip()
+]
 
 
 def _resolve_preset_judges() -> list[str] | None:
     """Expand JURY_PRESET (read at call time) into a judge list, or None.
 
-    ``panel`` → the full three-provider jury; ``solo`` → a single openai judge.
-    Read from the environment here (not captured at import) so a test or a
-    between-run .env edit takes effect without reimporting the module. An
-    unknown value is ignored with a warning so a typo cannot silently change
-    who judges.
+    ``panel`` → the full three-provider jury; ``duo`` → openai + anthropic;
+    ``solo`` → a single openai judge. Read from the environment here (not
+    captured at import) so a test or a between-run .env edit takes effect
+    without reimporting the module. An unknown value is ignored with a warning
+    so a typo cannot silently change who judges.
     """
     preset = os.getenv("JURY_PRESET", "").strip().lower()
     if preset == "panel":
         return list(JURY_PANEL)
+    if preset == "duo":
+        return list(JURY_DUO)
     if preset == "solo":
         return ["openai"]
     if preset:
@@ -115,11 +122,11 @@ def resolve_judges(cli_judges: str | None = None, *, jury: bool = False) -> list
     Precedence (first match wins), so the explicit choice always beats a preset:
         1. ``--judges openai,anthropic`` — an explicit comma-separated list.
         2. ``--jury`` — the convenience flag expanding to the full panel.
-        3. ``JURY_PRESET=panel|solo`` in .env.
-        4. ``JUDGE_MODELS`` in .env (default: a single ``openai`` judge).
+        3. ``JURY_PRESET=panel|duo|solo`` in .env.
+        4. ``JUDGE_MODELS`` in .env (default: the full 3-judge panel).
 
-    The 1-judge default is unchanged: with no CLI flag and no preset this returns
-    ``JUDGE_MODELS`` exactly as before.
+    With no CLI flag and no preset this returns ``JUDGE_MODELS``, which now
+    defaults to the full openai,anthropic,gemini panel.
     """
     if cli_judges:
         return [j.strip() for j in cli_judges.split(",") if j.strip()]
@@ -886,6 +893,96 @@ def append_evaluation(row: dict, path: Path | None = None) -> None:
     resolved.parent.mkdir(parents=True, exist_ok=True)
     with open(resolved, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Readable dev-eval mirror (data/dev_evals_jsonl/)
+# ---------------------------------------------------------------------------
+
+def _format_dev_eval_entry_as_text(doi: str, rows: list[dict]) -> str:
+    """Render one paper's judge rows into a plain-English report.
+
+    The readable sibling of ``summarizer._format_dev_summary_entry_as_text``:
+    the eval-side counterpart written to ``data/dev_evals_jsonl/`` so a human
+    can eyeball dev judge results without parsing JSON. The header begins with
+    ``DOI:`` so ``run_phase3._read_dois_from_dev_folder`` can read it back for
+    the incremental skip. ``data/evaluations.jsonl`` remains the source of truth.
+    """
+    strata = rows[0].get("strata") if rows and isinstance(rows[0].get("strata"), dict) else {}
+    journal = str(strata.get("journal") or "Not recorded")
+    input_source = str(strata.get("input_source") or rows[0].get("input_source") or "processed")
+
+    lines = [
+        f"DOI: {doi or 'Not recorded'}",
+        f"Journal: {journal}",
+        f"Input Source: {input_source}",
+        "",
+        "This file mirrors data/evaluations.jsonl for this DOI in a human-readable",
+        "form so a dev-mode judge run can be eyeballed; the JSONL file remains the",
+        "source of truth. One section per (summarizer, judge) pair below.",
+    ]
+
+    # Deterministic ordering so the readable file is stable across re-runs.
+    for row in sorted(
+        rows, key=lambda r: (str(r.get("summarizer")), str(r.get("judge")))
+    ):
+        score = row.get("jury_score")
+        if score is None:
+            score = row.get("quality_score")
+        reasoning = str(row.get("reasoning") or "").strip() or "Not recorded"
+        lines.extend([
+            "",
+            "=" * 78,
+            f"SUMMARIZER: {row.get('summarizer') or '?'}   JUDGE: {row.get('judge') or '?'}",
+            "=" * 78,
+            f"Score: {score}",
+            f"Quality Score (1-10 alias): {row.get('quality_score')}",
+            f"Hallucination Count: {row.get('hallucination_count')}",
+            f"Requires Human Review: {'Yes' if row.get('requires_human_review') else 'No'}",
+            f"Parse Method: {row.get('parse_method') or 'Not recorded'}",
+            f"Judge Model Version: {row.get('judge_model_version') or 'Not recorded'}",
+            "",
+            "Reasoning:",
+            reasoning,
+        ])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_dev_eval_jsonl_outputs(
+    dois: set[str],
+    *,
+    output_dir: Path,
+    evaluations_path: Path | None = None,
+) -> int:
+    """Render a readable ``.txt`` file per DOI into ``data/dev_evals_jsonl/``.
+
+    The eval-side sibling of ``summarizer.write_dev_summary_jsonl_outputs``: it
+    reads the judge rows ``run_evaluation`` just appended to
+    ``data/evaluations.jsonl`` for the given ``dois`` and writes one file per
+    paper. It never modifies ``evaluations.jsonl`` (that file stays append-only,
+    the single source of truth — see CLAUDE.md's Phase 3 rules).
+
+    One file per DOI, keyed by the DOI slug so a re-judge overwrites in place
+    rather than accumulating timestamped duplicates. Returns the number of files
+    written.
+    """
+    source = evaluations_path if evaluations_path is not None else EVALUATIONS_PATH
+    rows_by_doi: dict[str, list[dict]] = {}
+    for row in _iter_summaries(source):  # generic JSONL iterator, reused here
+        doi = str(row.get("doi", "")).strip()
+        if doi and doi in dois:
+            rows_by_doi.setdefault(doi, []).append(row)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for doi, rows in rows_by_doi.items():
+        out_path = output_dir / f"{doi_to_slug(doi)}.txt"
+        tmp_path = out_path.with_suffix(".txt.tmp")
+        tmp_path.write_text(_format_dev_eval_entry_as_text(doi, rows), encoding="utf-8")
+        tmp_path.replace(out_path)
+        written += 1
+    return written
 
 
 # ---------------------------------------------------------------------------

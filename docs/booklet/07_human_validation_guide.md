@@ -92,6 +92,21 @@ There's no time limit and no required pace. Some items will be quick to
 score; others — especially ones where something feels a little off — may be
 worth a second read.
 
+### You might see the same article more than once — that's okay
+
+To make the best use of your time, your reading document may sometimes pair
+the *same* article with more than one AI-written summary, appearing as
+separate, unconnected items — possibly many items apart, so you likely won't
+read them back to back. This lets us get more independent scores without
+asking you to read more articles than necessary.
+
+If that happens, treat each occurrence as if it were the very first time
+you'd seen that article. Score it purely on its own — don't flip back to
+compare it with an earlier summary of the same article, and don't let your
+impression of one summary color your score for another. Each one is asking
+the same question fresh: *judged entirely on its own, is this a summary I
+could trust?*
+
 ---
 
 ## 5. Filling in the scoring sheet

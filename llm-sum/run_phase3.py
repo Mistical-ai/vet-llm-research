@@ -8,10 +8,13 @@ One CLI for every Phase 3 step:
     summarize-all
                 Run paired raw-PDF and processed-text summaries, producing
                 readable text files with three provider outputs per source.
-    evaluate    Run the blind judge. Reads data/summaries.jsonl by default;
-                set EVAL_INPUT_MODE (or pass --input-mode) to instead judge
-                summarize-all's data/dev_tests/summaries_txt or
-                data/summaries_txt comparison files.
+    evaluate    Run the blind judge. Reads data/summaries.jsonl by default.
+                --mode dev instead judges only the papers in
+                data/dev_summaries_jsonl/ (written by `summarize --mode dev`) and
+                mirrors the scores into data/dev_evals_jsonl/, skipping papers
+                already evaluated there. Set EVAL_INPUT_MODE (or pass
+                --input-mode) to instead judge summarize-all's
+                data/dev_tests/summaries_txt or data/summaries_txt comparison files.
     eval-report Summarize MedHELM-style evaluation rows by clinical strata.
                 --publication emits paper-ready tables (report_tables.py).
     report-figures
@@ -46,6 +49,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from human_review import SAMPLE_UNITS  # noqa: E402
 from models_config import all_providers, get_model_spec  # noqa: E402
 from phase3_mode import resolve_mode, VALID_MODES  # noqa: E402
 from run_manifest import (  # noqa: E402
@@ -75,8 +79,19 @@ SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
 DEV_TESTS_DIR = DATA_DIR / "dev_tests"
 DEV_TESTS_SUMMARIES_PDF_DIR = DEV_TESTS_DIR / "summaries_pdf"
 DEV_TESTS_SUMMARIES_TXT_DIR = DEV_TESTS_DIR / "summaries_txt"
+# Readable sibling of data/summaries.jsonl for just the dev-mode batch: one
+# .txt per journal-random-selected paper, jsonl/raw_text only, no PDF
+# involved. Distinct from DEV_TESTS_DIR, which is summarize-all's PDF-vs-
+# processed-text *comparison* output — see .env.template section 11 for the
+# full explanation of when to use which folder.
+DEV_SUMMARIES_JSONL_DIR = DATA_DIR / "dev_summaries_jsonl"
+# Readable judge-side sibling of DEV_SUMMARIES_JSONL_DIR: `evaluate --mode dev`
+# writes one .txt per judged dev paper here (see _cmd_evaluate_from_dev_jsonl).
+# data/evaluations.jsonl stays the append-only source of truth; this is the
+# eyeball-it mirror. Distinct from data/dev_tests/ (summarize-all comparison).
+DEV_EVALS_JSONL_DIR = DATA_DIR / "dev_evals_jsonl"
 SUMMARIZE_ALL_OUTPUT_SETS = ("auto", "regular", "dev-tests")
-EVAL_INPUT_MODES = ("jsonl", "auto", "dev", "regular")
+EVAL_INPUT_MODES = ("jsonl", "auto", "dev", "regular", "dev-jsonl")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -106,8 +121,17 @@ def _summarize_all_unique_output() -> bool:
 def _resolve_eval_input_mode(mode_name: str, cli_override: str | None) -> str:
     """Resolve which summary source `evaluate` reads from.
 
-    Precedence: --input-mode (CLI) > EVAL_INPUT_MODE (.env) > 'jsonl' default
-    (the original data/summaries.jsonl pipeline, unchanged).
+    Precedence: --input-mode (CLI) > dev-mode default > EVAL_INPUT_MODE (.env)
+    > 'jsonl' default.
+
+    Dev mode is special: when no --input-mode is passed on the CLI, PHASE3_MODE=dev
+    resolves to 'dev-jsonl' REGARDLESS of EVAL_INPUT_MODE. That flow reads the
+    readable dev-summary folder (data/dev_summaries_jsonl/) written by
+    `summarize --mode dev` and writes results to data/dev_evals_jsonl/ — this is
+    the folder-driven dev loop. Anyone who still wants the old behaviour for a dev
+    run can pass it explicitly on the CLI: `--input-mode jsonl` restores the
+    journal-stratified data/summaries.jsonl pipeline, and `--input-mode dev`
+    restores the summarize-all data/dev_tests comparison path.
 
     'auto' expands based on the active PHASE3_MODE, mirroring
     _summarize_all_output_dirs()'s existing auto behaviour: PHASE3_MODE=dev
@@ -116,14 +140,54 @@ def _resolve_eval_input_mode(mode_name: str, cli_override: str | None) -> str:
     you're ready for the full corpus' a plain PHASE3_MODE change instead of
     an extra edit.
     """
+    if cli_override is None and mode_name == "dev":
+        return "dev-jsonl"
     raw = (cli_override or os.getenv("EVAL_INPUT_MODE", "jsonl")).strip().lower()
     if raw == "auto":
         return "dev" if mode_name == "dev" else "regular"
-    if raw in ("jsonl", "dev", "regular"):
+    if raw in ("jsonl", "dev", "regular", "dev-jsonl"):
         return raw
     print(f"[phase3] WARNING: invalid EVAL_INPUT_MODE={raw!r}; using 'jsonl'. "
           f"Valid: {EVAL_INPUT_MODES}")
     return "jsonl"
+
+
+def _read_dois_from_dev_folder(folder: Path) -> set[str]:
+    """Return the set of real DOIs recorded in a dev-mode readable folder.
+
+    Both data/dev_summaries_jsonl/ and data/dev_evals_jsonl/ write one .txt per
+    paper whose first line is ``DOI: <doi>`` (see summarizer's
+    ``_format_dev_summary_entry_as_text`` and evaluator's
+    ``_format_dev_eval_entry_as_text``). We parse that header rather than the
+    filename on purpose: dev files are written as ``<stem>__<run_suffix>.txt``,
+    so the same DOI can reappear under a new timestamped suffix. Keying skip
+    logic off the DOI in the header keeps a re-generated paper recognised as
+    already-done; keying off the filename stem would wrongly treat it as new.
+
+    A missing folder (or a file without a parseable DOI line) contributes
+    nothing rather than raising, matching the corruption-resilient style used
+    across the pipeline.
+    """
+    dois: set[str] = set()
+    if not folder.exists():
+        return dois
+    for path in sorted(folder.glob("*.txt")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if stripped.lower().startswith("doi:"):
+                        doi = stripped.split(":", 1)[1].strip()
+                        if doi and doi.lower() not in {"not recorded", "none"}:
+                            dois.add(doi)
+                    # Only the header block matters; stop at the first non-empty
+                    # line so a "DOI:" appearing later in prose is never picked up.
+                    break
+        except OSError:
+            continue
+    return dois
 
 
 def _summarize_all_output_set() -> str:
@@ -193,6 +257,15 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     profile = resolve_mode(args.mode)
     print(profile.banner())
 
+    # Visible confirmation of which text cache this run actually reads from —
+    # PROCESSED_DIR_NAME in .env.template controls this for every mode
+    # (test/single/dev/batch alike), so this line is the easiest way to
+    # confirm a dev or batch run is really pointed at data/processedv2.
+    if args.input_source == "processed":
+        print(f"[phase3:summarize] processed-text source: {PROCESSED_DIR}")
+    elif args.input_source == "raw_text":
+        print(f"[phase3:summarize] raw-text source: {RAW_TEXT_DIR}")
+
     if args.input_source == "pdf" and profile.name not in {"test", "single"}:
         print("[phase3:summarize] direct PDF input is limited to test/single comparison runs.")
         return 1
@@ -209,9 +282,12 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                   "Run single mode to record real token counts from the providers.")
             return 1
         # Import lazily so a missing tiktoken / SDK doesn't break other commands.
-        import os
         from cost_estimator import run as run_estimate
-        judges = [j.strip() for j in os.getenv("JUDGE_MODELS", "openai").split(",") if j.strip()]
+        from evaluator import resolve_judges
+        # Estimate against exactly the judges a real run would use (default: the
+        # full 3-judge panel), honouring JURY_PRESET so the projected cost isn't
+        # silently low by 3x.
+        judges = resolve_judges()
         run_estimate(
             batched=profile.use_batch,
             judge_providers=judges,
@@ -219,9 +295,80 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # Dev-mode journal-random selection: pick one random paper per journal
+    # (round-robin for extra picks beyond PHASE3_DEV_LIMIT/--limit) BEFORE any
+    # provider is called, instead of just summarizing whichever manifest rows
+    # happen to come first. Skipped for pdf input_source (dev never uses it —
+    # see the guard above) and for non-dev modes, which keep their existing
+    # sequential/full-corpus behavior unchanged.
+    doi_filter_dois: set[str] | None = None
+    dev_run_suffix: str | None = None
+    if profile.name == "dev" and args.input_source != "pdf":
+        effective_limit = args.limit if args.limit is not None else profile.paper_limit
+        manifest_path = args.manifest if args.manifest else MANIFEST_PATH
+        by_journal = _load_manifest_by_journal(manifest_path, args.input_source)
+        if not by_journal:
+            print(f"[phase3:summarize] No journal-mapped papers with cached "
+                  f"{args.input_source} text found via {manifest_path}. Run "
+                  "'extract' first, or check PROCESSED_DIR_NAME in .env.")
+            return 1
+
+        # Incremental dev sampling: drop papers already written to
+        # data/dev_summaries_jsonl/ so a re-run picks NEW papers instead of the
+        # same ones. --no-skip-existing forces reconsidering them. Selection
+        # stays deterministic (seed + the fixed exclusion set); the round-robin
+        # sampler just re-draws over the smaller remaining pool per journal.
+        if not args.no_skip_existing:
+            done = _read_dois_from_dev_folder(DEV_SUMMARIES_JSONL_DIR)
+            if done:
+                by_journal = {
+                    journal: [
+                        r for r in records
+                        if str(r.get("doi", "")).strip() not in done
+                    ]
+                    for journal, records in by_journal.items()
+                }
+                by_journal = {j: recs for j, recs in by_journal.items() if recs}
+                print(f"[phase3:summarize] skipping {len(done)} paper(s) already in "
+                      f"{DEV_SUMMARIES_JSONL_DIR}; picking from the remainder.")
+                if not by_journal:
+                    print("[phase3:summarize] No un-summarised journal-mapped papers "
+                          "remain. Pass --no-skip-existing to re-pick already-done "
+                          f"papers, or clear {DEV_SUMMARIES_JSONL_DIR}.")
+                    return 1
+
+        dev_seed = int(os.getenv("PHASE3_DEV_SAMPLE_SEED", "42"))
+        selected_records = _sample_round_robin_by_journal(
+            by_journal, effective_limit, seed=dev_seed,
+        )
+        doi_filter_dois = {
+            str(r.get("doi", "")).strip() for r in selected_records if r.get("doi")
+        }
+
+        print(f"\n[phase3:summarize] Dev-mode journal-random selection "
+              f"(seed={dev_seed}, {len(by_journal)} journal(s) eligible, "
+              f"input_source={args.input_source}):")
+        print(f"  {'Journal':<20}  Title")
+        print("  " + "-" * 68)
+        for record in sorted(selected_records, key=lambda r: str(r.get("journal", ""))):
+            title = str(record.get("title") or "Untitled")
+            print(f"  {str(record.get('journal', '')):<20}  {title[:64]}")
+        print(f"  TOTAL: {len(doi_filter_dois)} paper(s)")
+        if len(doi_filter_dois) < effective_limit:
+            print(f"[phase3:summarize] WARNING: selected {len(doi_filter_dois)}/"
+                  f"{effective_limit} papers — not enough journals with cached "
+                  f"{args.input_source} text for the requested limit.")
+        print()
+        dev_run_suffix = _summary_run_suffix()
+
     from summarizer import main as summarize_main
     delegate = ["--mode", profile.name]
-    if args.limit is not None:
+    if doi_filter_dois is not None:
+        # --doi-filter is the precise selection; --limit would just print a
+        # misleading "overrides mode default" line since it isn't what's
+        # actually controlling which/how-many papers run here.
+        delegate += ["--doi-filter", ",".join(sorted(doi_filter_dois))]
+    elif args.limit is not None:
         delegate += ["--limit", str(args.limit)]
     if args.resume:
         delegate.append("--resume")
@@ -235,7 +382,25 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         delegate += ["--input-source", args.input_source]
     if args.guide_summary:
         delegate += ["--guide-summary", str(args.guide_summary)]
-    return summarize_main(delegate)
+    result = summarize_main(delegate)
+
+    if doi_filter_dois is not None and result == 0:
+        # Only render the readable folder once the underlying run actually
+        # succeeded — a declined confirmation prompt (or any other non-zero
+        # return) means nothing was summarized, so there's nothing to show.
+        # Partial per-provider failures within a successful run are fine; the
+        # formatter already renders a failed slot as an explicit error line.
+        from summarizer import write_dev_summary_jsonl_outputs
+        written = write_dev_summary_jsonl_outputs(
+            doi_filter_dois,
+            output_dir=DEV_SUMMARIES_JSONL_DIR,
+            input_source=args.input_source,
+            output_suffix=dev_run_suffix,
+        )
+        print(f"[phase3:summarize] wrote {written} readable dev summary "
+              f"file(s) to {DEV_SUMMARIES_JSONL_DIR}")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +479,86 @@ def _sample_by_journal(
             journal_map[journal] = dois
             doi_filter.update(dois)
     return doi_filter, journal_map
+
+
+# ---------------------------------------------------------------------------
+# summarize dev-mode helpers (journal-random selection, BEFORE any API call)
+# ---------------------------------------------------------------------------
+#
+# These are the manifest-side counterpart to _load_summaries_by_journal /
+# _sample_by_journal above: those two sample from summaries.jsonl AFTER
+# summarize has already run (used by `evaluate`'s own dev-mode stratified
+# sampling). The two below sample from manifest.jsonl BEFORE any provider is
+# called, so `summarize --mode dev` can pick which papers to spend money on
+# in the first place — one random paper per journal, instead of just taking
+# whichever manifest rows happen to come first.
+
+def _load_manifest_by_journal(
+    manifest_path: Path, input_source: str
+) -> dict[str, list[dict]]:
+    """Group manifest records by journal, keeping only records that already
+    have cached text on disk for ``input_source``.
+
+    manifest.jsonl includes every DOI ever considered, including ones that
+    were never downloaded or whose extraction failed — those have no cached
+    text and can't be summarized, so they're dropped here rather than in the
+    caller. This is also what makes the noisy one-off manifest rows (a stray
+    "Veterinary Record" or "Life" DOI, for example) fall out naturally: they
+    were never downloaded, so they never got cached text, so they're never
+    eligible for dev-mode selection.
+    """
+    from prepare_texts import find_cached_jsonl
+
+    by_journal: dict[str, list[dict]] = {}
+    if not manifest_path.exists():
+        return by_journal
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            journal = str(record.get("journal", "")).strip().lower()
+            if not journal:
+                continue
+            if find_cached_jsonl(record, input_source=input_source) is None:
+                continue
+            by_journal.setdefault(journal, []).append(record)
+    return by_journal
+
+
+def _sample_round_robin_by_journal(
+    by_journal: dict[str, list[dict]], limit: int, seed: int = 42
+) -> list[dict]:
+    """Pick up to ``limit`` records, one random paper per journal per pass.
+
+    With ``limit`` equal to the number of journals (the common case:
+    PHASE3_DEV_LIMIT=5, 5 journals), this returns exactly one random paper per
+    journal. If ``limit`` is larger than the number of journals, extra picks
+    spill into a second (third, ...) round-robin pass across journals in
+    sorted order, so no journal gets a second paper before every journal has
+    gotten a first one. If a journal runs out of eligible papers it's simply
+    skipped in later passes — the caller is responsible for warning if the
+    total returned is short of ``limit``.
+    """
+    rng = random.Random(seed)
+    queues: dict[str, list[dict]] = {
+        journal: rng.sample(records, len(records))
+        for journal, records in by_journal.items()
+    }
+    journals = sorted(queues)
+
+    selected: list[dict] = []
+    while len(selected) < limit and any(queues[j] for j in journals):
+        for journal in journals:
+            if len(selected) >= limit:
+                break
+            if queues[journal]:
+                selected.append(queues[journal].pop())
+    return selected
 
 
 def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]]) -> None:
@@ -403,7 +648,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     from eval_instances import iter_evaluation_instances
 
     # resolve_judges applies the layered opt-in: --judges > --jury > JURY_PRESET
-    # > JUDGE_MODELS. Default stays a single openai judge.
+    # > JUDGE_MODELS. Default is the full 3-judge panel (openai,anthropic,gemini).
     judges = evaluator.resolve_judges(args.judges, jury=args.jury)
     active_judges = judges
     model_ids = {j: get_model_spec(j).model_id for j in active_judges}
@@ -412,6 +657,11 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
               f"{', '.join(active_judges)} (reliability stats will be reported)")
 
     input_mode = _resolve_eval_input_mode(profile.name, args.input_mode)
+    if input_mode == "dev-jsonl":
+        return _cmd_evaluate_from_dev_jsonl(
+            args, profile, judges=judges, active_judges=active_judges,
+            model_ids=model_ids,
+        )
     if input_mode != "jsonl":
         return _cmd_evaluate_from_txt_folder(
             args, profile, judges=judges, active_judges=active_judges,
@@ -676,6 +926,158 @@ def _cmd_evaluate_from_txt_folder(
         )
 
 
+def _cmd_evaluate_from_dev_jsonl(
+    args: argparse.Namespace, profile, *, judges: list[str], active_judges: list[str],
+    model_ids: dict[str, str],
+) -> int:
+    """Judge exactly the papers already in data/dev_summaries_jsonl/.
+
+    This is the folder-driven dev loop `evaluate --mode dev` uses by default
+    (see _resolve_eval_input_mode). It reads back the DOIs written by
+    `summarize --mode dev`, judges their matching articles (reference text from
+    the processed-text cache, candidate summaries from data/summaries.jsonl —
+    both resolved by iter_evaluation_instances via run_evaluation's doi_filter),
+    and mirrors the scores into readable data/dev_evals_jsonl/ files so the run
+    can be eyeballed. data/evaluations.jsonl stays the append-only source of
+    truth.
+
+    Incremental by design: DOIs that already have a data/dev_evals_jsonl/ file
+    are skipped so repeated runs only judge newly-summarised papers. --no-resume
+    turns BOTH that folder-skip and run_evaluation's per-row already_evaluated()
+    skip off, forcing a full (paid) re-judge that also rewrites the readable
+    mirror.
+    """
+    from evaluator import (
+        confirm_real_judge,
+        run_evaluation,
+        write_dev_eval_jsonl_outputs,
+    )
+    from utils import require_positive_budget_for_real_run
+    import evaluator
+
+    source_dois = _read_dois_from_dev_folder(DEV_SUMMARIES_JSONL_DIR)
+    print(f"[phase3:evaluate] input mode=dev-jsonl: reading dev summaries from "
+          f"{DEV_SUMMARIES_JSONL_DIR}")
+    if not source_dois:
+        print(f"[phase3:evaluate] No dev summaries found in {DEV_SUMMARIES_JSONL_DIR}. "
+              "Run 'summarize --mode dev' first.")
+        return 1
+
+    # Skip papers whose readable eval file already exists (unless --no-resume,
+    # which re-includes them for a full re-judge). A DOI with rows already in
+    # evaluations.jsonl but NO dev_evals_jsonl file (e.g. a crash between the
+    # append and the mirror write) is not folder-present, so it stays in the
+    # target set: the paid call below is then row-skipped by already_evaluated(),
+    # but write_dev_eval_jsonl_outputs still backfills the missing readable file.
+    done_dois = set() if args.no_resume else _read_dois_from_dev_folder(DEV_EVALS_JSONL_DIR)
+    target_dois = source_dois - done_dois
+
+    print(f"[phase3:evaluate] {len(source_dois)} dev paper(s) found; "
+          f"{len(done_dois)} already in {DEV_EVALS_JSONL_DIR.name}; "
+          f"{len(target_dois)} to judge.")
+    if not target_dois:
+        print("[phase3:evaluate] All dev articles already evaluated; nothing to do. "
+              "Run 'summarize --mode dev' to add more, or pass --no-resume to re-judge.")
+        return 0
+
+    # Hash the specific dev-summary files that seed this run for provenance.
+    selected_files = sorted(
+        p for p in DEV_SUMMARIES_JSONL_DIR.glob("*.txt")
+        if _read_dois_from_dev_folder_file(p) in target_dois
+    )
+
+    prompt_file = evaluator.JUDGE_PROMPT_FILE
+    prompt_path = prompt_file if prompt_file.is_absolute() else REPO_ROOT / prompt_file
+    evaluation_config = {
+        "rubric_version": evaluator.RUBRIC_VERSION,
+        "evaluator_version": evaluator.EVALUATOR_VERSION,
+        "benchmark_name": evaluator.BENCHMARK_NAME,
+        "jury_aggregation_mode": evaluator.JURY_AGGREGATION_MODE,
+        "mode": profile.name,
+        "slice_config": {
+            "type": "dev_jsonl",
+            "source_dir": str(DEV_SUMMARIES_JSONL_DIR),
+            "articles_found": len(source_dois),
+            "articles_to_judge": len(target_dois),
+        },
+        "taxonomy": VET_TAXONOMY_V1.describe(VeterinarySummaryQualityScenario.name),
+    }
+    manifest = build_run_manifest(
+        run_id=create_run_id(),
+        dataset_path=str(DEV_SUMMARIES_JSONL_DIR),
+        dataset_hash_sha256=sha256_files_combined(selected_files),
+        judges=active_judges,
+        model_ids=model_ids,
+        prompt_template_id=prompt_path.name,
+        prompt_path=str(prompt_path),
+        prompt_sha256=sha256_file(prompt_path),
+        temperature=evaluator.TEMPERATURE,
+        max_output_tokens=evaluator.MAX_OUTPUT_TOKENS,
+        seed=evaluator.SEED,
+        evaluation_config=evaluation_config,
+        selected_instance_ids=sorted(target_dois),
+    )
+    manifest_path = RUN_MANIFEST_DIR / f"run_manifest_{manifest.run_id}.json"
+    write_run_manifest(manifest, manifest_path)
+
+    status = "started"
+    result = 1
+    try:
+        if not confirm_real_judge(profile, force=args.force):
+            status = "failed"
+            result = 1
+        else:
+            require_positive_budget_for_real_run(
+                dry_run=profile.dry_run, context="Phase 3 evaluation",
+            )
+            counts = run_evaluation(
+                judges=judges, resume=not args.no_resume, doi_filter=target_dois,
+            )
+            written = write_dev_eval_jsonl_outputs(
+                target_dois, output_dir=DEV_EVALS_JSONL_DIR,
+            )
+            print(f"[phase3:evaluate] wrote {written} readable dev eval "
+                  f"file(s) to {DEV_EVALS_JSONL_DIR}")
+            status = "completed" if counts.get("failed", 0) == 0 else "failed"
+            result = 0 if status == "completed" else 1
+        return result
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        from eval_report import iter_evaluation_rows
+
+        resolved_versions = resolve_model_versions(
+            active_judges, model_ids, list(iter_evaluation_rows()),
+        )
+        finalize_run_manifest(
+            manifest_path, resolved_model_versions=resolved_versions, status=status,
+        )
+
+
+def _read_dois_from_dev_folder_file(path: Path) -> str | None:
+    """Return the single real DOI recorded in one dev-mode readable .txt file.
+
+    A per-file companion to _read_dois_from_dev_folder used when we need to know
+    which specific file corresponds to a DOI (e.g. to hash only the dev-summary
+    files that seed a run). Returns None if no DOI header is present.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.lower().startswith("doi:"):
+                    doi = stripped.split(":", 1)[1].strip()
+                    if doi and doi.lower() not in {"not recorded", "none"}:
+                        return doi
+                return None
+    except OSError:
+        return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
@@ -849,6 +1251,8 @@ def cmd_export_human_review(args: argparse.Namespace) -> int:
         delegate += ["--reviewers", str(args.reviewers)]
     if args.sample_size is not None:
         delegate += ["--sample-size", str(args.sample_size)]
+    if args.sample_unit is not None:
+        delegate += ["--sample-unit", args.sample_unit]
     if args.seed is not None:
         delegate += ["--seed", str(args.seed)]
     return human_review_main(delegate)
@@ -1079,6 +1483,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Skip (doi, model) pairs already at status=success.")
     p_sum.add_argument("--force", action="store_true",
                        help="Bypass interactive confirmation. USE WITH CAUTION.")
+    p_sum.add_argument("--no-skip-existing", action="store_true",
+                       help="Dev mode only: reconsider papers already written to "
+                            "data/dev_summaries_jsonl/ instead of skipping them. "
+                            "By default dev runs are incremental and pick new papers.")
     p_sum.add_argument("--providers", default=None,
                        help="Comma-separated subset of providers.")
     p_sum.add_argument("--manifest", type=Path, default=None)
@@ -1134,15 +1542,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Use the full 3-judge panel (openai,anthropic,gemini); "
                              "same as JURY_PRESET=panel. Enables reliability stats.")
     p_eval.add_argument("--input-mode", choices=EVAL_INPUT_MODES, default=None,
-                        help=("Where to read summaries from. 'jsonl' (default): "
-                              "data/summaries.jsonl, the original pipeline. "
-                              "'dev': data/dev_tests/summaries_txt (summarize-all "
-                              "output). 'regular': data/summaries_txt. 'auto': "
-                              "'dev' when --mode is dev, else 'regular'. Overrides "
-                              "EVAL_INPUT_MODE from .env for this run. PDF-input "
-                              "comparison files are never evaluated."))
+                        help=("Where to read summaries from. NOTE: --mode dev defaults "
+                              "to 'dev-jsonl' (reads data/dev_summaries_jsonl/, writes "
+                              "data/dev_evals_jsonl/) regardless of EVAL_INPUT_MODE; pass "
+                              "--input-mode explicitly to override. 'jsonl': "
+                              "data/summaries.jsonl, the original journal-stratified "
+                              "pipeline. 'dev': data/dev_tests/summaries_txt (summarize-all "
+                              "output). 'regular': data/summaries_txt. 'dev-jsonl': the "
+                              "folder-driven dev loop. 'auto': 'dev' when --mode is dev, "
+                              "else 'regular'. Overrides EVAL_INPUT_MODE from .env for this "
+                              "run. PDF-input comparison files are never evaluated."))
     p_eval.add_argument("--no-resume", action="store_true",
-                        help="Re-evaluate even pairs already in evaluations.jsonl.")
+                        help="Re-evaluate even pairs already in evaluations.jsonl. In "
+                             "dev-jsonl mode this also re-includes papers already in "
+                             "data/dev_evals_jsonl/ for a full re-judge.")
     p_eval.add_argument("--force", action="store_true",
                         help="Bypass confirmation. USE WITH CAUTION.")
     p_eval.set_defaults(func=cmd_evaluate)
@@ -1245,8 +1658,15 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Number of independent reviewer copies to export "
                               "(default: HUMAN_REVIEWERS from .env, or 1).")
     p_human.add_argument("--sample-size", type=int, default=None,
-                         help="Number of (paper, summary) items to sample "
+                         help="Number to sample, counted per --sample-unit "
                               "(default: HUMAN_REVIEW_SAMPLE_SIZE from .env, or 15).")
+    p_human.add_argument("--sample-unit", choices=SAMPLE_UNITS, default=None,
+                         help="What --sample-size counts: 'items' (one (article, "
+                              "provider) pair per count, default) or 'articles' "
+                              "(one article per count, every provider's summary "
+                              "of it included -- e.g. 5 articles x 3 providers = "
+                              "15 scored items from 5 articles actually read). "
+                              "Default: HUMAN_REVIEW_SAMPLE_UNIT from .env, or 'items'.")
     p_human.add_argument("--seed", type=int, default=None,
                          help="Sampling seed (default: HUMAN_REVIEW_SEED from .env, or 42).")
     p_human.set_defaults(func=cmd_export_human_review)

@@ -321,6 +321,8 @@ python llm-sum/run_phase3.py eval-report
 
 Every paid mode asks for confirmation before calling APIs. Set `PHASE3_MODE=test` in `.env` until you are ready to spend money.
 
+**Dev mode is an incremental loop.** `summarize --mode dev` picks one random paper per journal and writes readable `.txt` files to `data/dev_summaries_jsonl/`; `evaluate --mode dev` then judges exactly those papers and writes readable scores to `data/dev_evals_jsonl/`. Both stages skip papers already done, so re-running grows the sample paper-by-paper. Full step-by-step: [docs/phase3/dev_evaluation_guide.md](docs/phase3/dev_evaluation_guide.md).
+
 ### PDF vs processed text comparison (`summarize-all`)
 
 The primary dev command runs **six summaries** from one matched article — 3 providers × 2 input sources:

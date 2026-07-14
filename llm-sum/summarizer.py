@@ -63,7 +63,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from models_config import all_providers, compute_cost, get_model_spec  # noqa: E402
-from file_paths import doi_to_slug, resolve_existing_pdf_path  # noqa: E402
+from file_paths import descriptive_stem, doi_to_slug, resolve_existing_pdf_path  # noqa: E402
 from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
 from extract import truncate_to_limit  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
@@ -1464,9 +1464,19 @@ def run_realtime(
     providers: list[str] | None = None,
     input_source: str = "processed",
     guide_summary_path: Path | None = GUIDE_SUMMARY_FILE,
+    doi_filter: set[str] | None = None,
 ) -> dict[str, int]:
     """
     Sequentially summarise each paper across each provider in real time.
+
+    ``doi_filter``, when provided, restricts the run to exactly those DOIs
+    (used by dev-mode journal-stratified selection in run_phase3.py). Rows
+    outside the filter are skipped silently — not counted anywhere in
+    ``counts`` — since they were never selected for this run in the first
+    place. ``paper_limit`` is ignored whenever a filter is given: the filter
+    set already says precisely how many/which papers run, and manifest order
+    isn't guaranteed to match selection order, so a paper_limit early-break
+    could cut the loop off before every filtered DOI is reached.
     """
     providers = providers or list(all_providers())
     prompt_templates, guide_summary, resolved_guide_path, _prompt_paths = (
@@ -1485,10 +1495,13 @@ def run_realtime(
     summaries_by_doi: dict[str, dict] = dict(existing)
 
     for record in _iter_manifest(manifest_path):
-        if paper_limit is not None and processed_papers >= paper_limit:
+        record_doi = str(record.get("doi", "")).strip()
+        if doi_filter is not None and record_doi not in doi_filter:
+            continue
+        if doi_filter is None and paper_limit is not None and processed_papers >= paper_limit:
             break
 
-        doi = str(record.get("doi", "")).strip()
+        doi = record_doi
         if not doi:
             continue
 
@@ -1631,6 +1644,48 @@ def _enrich_result_with_human_readable(result: dict) -> dict:
     return result
 
 
+def _format_provider_section(provider: str, result: dict) -> list[str]:
+    """
+    Build the "=== PROVIDER SUMMARY ===" block shared by every folder-based
+    readable-text output (summarize-all's PDF/processed comparison files and
+    the dev-mode jsonl-only files both use this).
+
+    Falls back to computing the readable text from ``structured_summary`` when
+    ``human_readable`` isn't already attached to the result — summarize-all
+    calls ``_enrich_result_with_human_readable`` before this runs, but
+    ``run_realtime`` (the plain ``summarize`` pipeline, data/summaries.jsonl)
+    does not, since that file's schema is left untouched on purpose.
+    """
+    lines = [
+        "",
+        "=" * 78,
+        f"{provider.upper()} SUMMARY",
+        "=" * 78,
+        f"Status: {result.get('status') or 'unknown'}",
+        f"Model Version: {result.get('model_version') or 'Not recorded'}",
+        f"Timestamp: {result.get('timestamp') or 'Not recorded'}",
+    ]
+
+    if result.get("status") != "success":
+        lines.extend([
+            "",
+            f"No readable summary was produced. Error: {result.get('error') or 'Not recorded'}",
+        ])
+        return lines
+
+    readable = result.get("human_readable")
+    if not readable and result.get("structured_summary"):
+        readable = _format_human_readable(result["structured_summary"])
+    readable = readable or result.get("summary") or "No summary text returned."
+    lines.extend([
+        f"Input Tokens: {result.get('input_tokens') or 'Not recorded'}",
+        f"Output Tokens: {result.get('output_tokens') or 'Not recorded'}",
+        "",
+        str(readable).strip(),
+    ])
+    return lines
+
+
 def _format_folder_entry_as_text(entry: dict) -> str:
     """
     Turn one multi-provider summary entry into a plain-English report.
@@ -1655,30 +1710,43 @@ def _format_folder_entry_as_text(entry: dict) -> str:
     models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
     for provider in all_providers():
         result = models.get(provider) if isinstance(models.get(provider), dict) else _empty_model_slot()
-        lines.extend([
-            "",
-            "=" * 78,
-            f"{provider.upper()} SUMMARY",
-            "=" * 78,
-            f"Status: {result.get('status') or 'unknown'}",
-            f"Model Version: {result.get('model_version') or 'Not recorded'}",
-            f"Timestamp: {result.get('timestamp') or 'Not recorded'}",
-        ])
+        lines.extend(_format_provider_section(provider, result))
 
-        if result.get("status") != "success":
-            lines.extend([
-                "",
-                f"No readable summary was produced. Error: {result.get('error') or 'Not recorded'}",
-            ])
-            continue
+    return "\n".join(lines).rstrip() + "\n"
 
-        readable = result.get("human_readable") or result.get("summary") or "No summary text returned."
-        lines.extend([
-            f"Input Tokens: {result.get('input_tokens') or 'Not recorded'}",
-            f"Output Tokens: {result.get('output_tokens') or 'Not recorded'}",
-            "",
-            str(readable).strip(),
-        ])
+
+def _format_dev_summary_entry_as_text(entry: dict) -> str:
+    """
+    Turn one ``data/summaries.jsonl``-shaped entry (built by
+    ``_new_summary_entry``) into a plain-English report for
+    ``data/dev_summaries_jsonl/``.
+
+    This is the readable sibling of the real dev-mode ``summarize`` run: no
+    PDF is involved (see ``_format_folder_entry_as_text`` for the PDF-vs-
+    processed-text comparison version used by summarize-all), so the header
+    surfaces the manifest metadata (journal/species/study design/clinical
+    topic) that's actually available on this entry shape instead of a source
+    filename/slug that summarize's entries don't carry.
+    """
+    lines = [
+        f"DOI: {entry.get('doi') or 'Not recorded'}",
+        f"Journal: {entry.get('journal') or 'Not recorded'}",
+        f"Title: {entry.get('title') or 'Not recorded'}",
+        f"Species: {entry.get('species') or 'Not recorded'}",
+        f"Study Design: {entry.get('study_design') or 'Not recorded'}",
+        f"Clinical Topic: {entry.get('clinical_topic') or 'Not recorded'}",
+        f"Input Source: {entry.get('input_source') or 'processed'}",
+        "",
+        "This file contains one summary from each configured model provider,",
+        "picked for the dev-mode journal-random sample (see PHASE3_DEV_SAMPLE_SEED",
+        "in .env.template). It mirrors data/summaries.jsonl for this DOI in a",
+        "human-readable form; the JSONL file remains the source of truth.",
+    ]
+
+    models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
+    for provider in all_providers():
+        result = models.get(provider) if isinstance(models.get(provider), dict) else _empty_model_slot()
+        lines.extend(_format_provider_section(provider, result))
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1689,13 +1757,14 @@ def _write_folder_output(
     entry: dict,
     *,
     output_suffix: str | None = None,
+    formatter: Callable[[dict], str] = _format_folder_entry_as_text,
 ) -> Path:
     """Atomically write one paper's multi-model summary to the output folder."""
     output_dir.mkdir(parents=True, exist_ok=True)
     output_stem = f"{stem}__{output_suffix}" if output_suffix else stem
     out_path = output_dir / f"{output_stem}.txt"
     tmp_path = out_path.with_suffix(".txt.tmp")
-    tmp_path.write_text(_format_folder_entry_as_text(entry), encoding="utf-8")
+    tmp_path.write_text(formatter(entry), encoding="utf-8")
     tmp_path.replace(out_path)
     return out_path
 
@@ -1709,6 +1778,43 @@ def _load_folder_output(output_dir: Path, stem: str) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def write_dev_summary_jsonl_outputs(
+    dois: set[str],
+    *,
+    output_dir: Path,
+    input_source: str = "processed",
+    output_suffix: str | None = None,
+    summaries_path: Path | None = None,
+) -> int:
+    """
+    Render a plain-English ``.txt`` file per DOI into ``data/dev_summaries_jsonl/``.
+
+    This is the readable sibling of a dev-mode ``summarize`` run: it reads
+    back the entries ``run_realtime`` just wrote to ``data/summaries.jsonl``
+    (via ``load_existing_summaries``) for the given ``dois`` + ``input_source``,
+    and writes one file per paper so a human can sanity-check the run without
+    parsing JSON. It never modifies ``data/summaries.jsonl`` itself — that file
+    stays the single source of truth (see CLAUDE.md's Phase 3 rules).
+
+    Returns the number of files written, so the caller can print a summary.
+    """
+    existing = load_existing_summaries(summaries_path)
+    written = 0
+    for entry in existing.values():
+        if str(entry.get("doi", "")).strip() not in dois:
+            continue
+        if str(entry.get("input_source") or "processed") != input_source:
+            continue
+        stem = descriptive_stem(entry)
+        _write_folder_output(
+            output_dir, stem, entry,
+            output_suffix=output_suffix,
+            formatter=_format_dev_summary_entry_as_text,
+        )
+        written += 1
+    return written
 
 
 def _slug_from_source_stem(stem: str) -> str:
@@ -2001,9 +2107,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--guide-summary", type=Path, default=GUIDE_SUMMARY_FILE,
                         help=("Optional human-written format guide. If the file exists and "
                               "has text, it is used for structure only, never as source facts."))
+    parser.add_argument("--doi-filter", default=None,
+                        help=("Comma-separated DOIs to restrict this run to, bypassing "
+                              "--limit's sequential slicing. Set by run_phase3.py's dev-mode "
+                              "journal-stratified selection; not usually passed by hand."))
     args = parser.parse_args(argv)
 
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
+    doi_filter = (
+        {d.strip() for d in args.doi_filter.split(",") if d.strip()}
+        if args.doi_filter else None
+    )
 
     profile = resolve_mode(args.mode)
     paper_limit = args.limit if args.limit is not None else profile.paper_limit
@@ -2057,6 +2171,7 @@ def main(argv: list[str] | None = None) -> int:
         providers=providers,
         input_source=args.input_source,
         guide_summary_path=args.guide_summary,
+        doi_filter=doi_filter,
     )
     return 0
 

@@ -37,8 +37,8 @@ THE UNIT OF ANALYSIS
 --------------------
 One "item" is a (doi, input_source) pair — a paper judged from one input
 channel (cleaned text vs. direct PDF). Within an item, each provider's summary
-may have been scored by one judge (the default) or several (a jury); those judge
-scores are averaged first, so every provider contributes exactly one score per
+may have been scored by several judges (the default 3-judge jury) or a single
+judge; those judge scores are averaged first, so every provider contributes one score per
 item. Significance tests then pair providers *by item* (a paper is its own
 block), which is what makes "provider A beat provider B on the same papers"
 a valid paired comparison rather than a comparison of two independent samples.

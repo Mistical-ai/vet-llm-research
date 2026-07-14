@@ -25,7 +25,7 @@ Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alo
 | `data/processed/*.jsonl`              | Cleaned reference text the judge compares against.                         |
 | `data/evaluations.jsonl` (if exists)  | Used by `--resume` (default on).                                           |
 | `llm-sum/prompts/judge_medhelm_v1.txt` | Default vet-specific judge prompt (MedHELM-style, 5 criteria) — must contain `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`. |
-| `.env`                                | `PHASE3_MODE`, `JUDGE_MODELS` (default `openai`), `JUDGE_PROMPT_FILE`, plus the API key for whatever judges are listed. |
+| `.env`                                | `PHASE3_MODE`, `JUDGE_MODELS` (default `openai,anthropic,gemini`), `JUDGE_PROMPT_FILE`, plus the API key for whatever judges are listed. |
 
 ## Outputs
 
@@ -39,23 +39,24 @@ Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alo
 ```powershell
 python llm-sum/evaluator.py                          # uses PHASE3_MODE from .env
 python llm-sum/evaluator.py --mode single            # override
-python llm-sum/evaluator.py --judges openai,anthropic  # explicit multi-judge list
-python llm-sum/evaluator.py --jury                   # full 3-judge panel (opt-in)
+python llm-sum/evaluator.py --judges openai,anthropic  # explicit judge list (2 here)
+python llm-sum/evaluator.py --jury                   # full 3-judge panel (the default)
 python llm-sum/evaluator.py --no-resume              # re-evaluate everything
 python llm-sum/evaluator.py --limit 3                # override mode's paper_limit
 ```
 
-### Choosing the judges (default stays 1 judge)
+### Choosing the judges (default is the full 3-judge panel)
 
-The default is a single `openai` judge — cheapest, and unchanged. There are four
-ways to pick judges, in precedence order (first match wins):
+The default is the full **3-judge panel** `openai,anthropic,gemini` — evaluation
+is a real jury, not a single grader. Dial down for cost. There are four ways to
+pick judges, in precedence order (first match wins):
 
 | Control | Example | Result |
 |---------|---------|--------|
 | `--judges` (CLI) | `--judges openai,anthropic` | Exactly that list. Overrides everything below. |
 | `--jury` (CLI) | `--jury` | The full panel `openai,anthropic,gemini`. |
-| `JURY_PRESET` (`.env`) | `JURY_PRESET=panel` | `panel` → full panel; `solo` → single `openai`. |
-| `JUDGE_MODELS` (`.env`) | `JUDGE_MODELS=openai` | The list as written (default `openai`). |
+| `JURY_PRESET` (`.env`) | `JURY_PRESET=duo` | `panel` → 3 judges (default); `duo` → `openai,anthropic`; `solo` → single `openai`. |
+| `JUDGE_MODELS` (`.env`) | `JUDGE_MODELS=openai` | The list as written (default `openai,anthropic,gemini`). |
 
 `--jury` is just a shortcut for `JURY_PRESET=panel` scoped to one command. When
 two or more judges score the data, `eval-report` adds a **Reliability** section
@@ -74,16 +75,26 @@ It accepts an extra `EVAL_INPUT_MODE` setting (`.env`) / `--input-mode` flag
 (CLI) that judges those `.txt` files without changing anything about how
 judging itself works — same judge calls, same rubric, same parsing:
 
+**`--mode dev` is special:** it defaults to the `dev-jsonl` folder-driven loop
+(reads `data/dev_summaries_jsonl/`, writes `data/dev_evals_jsonl/`) **regardless
+of `EVAL_INPUT_MODE`**, and skips papers already evaluated there so the dev
+sample grows incrementally. See
+[dev_evaluation_guide.md](dev_evaluation_guide.md). Pass an explicit
+`--input-mode` to override that default for a single run.
+
 ```powershell
-python llm-sum/run_phase3.py evaluate --mode test  --input-mode dev       # mocked smoke test
-python llm-sum/run_phase3.py evaluate --mode dev   --input-mode dev       # judge data/dev_tests/summaries_txt (PHASE3_DEV_LIMIT articles)
+python llm-sum/run_phase3.py evaluate --mode dev                          # dev-jsonl loop: judge data/dev_summaries_jsonl, write data/dev_evals_jsonl
+python llm-sum/run_phase3.py evaluate --mode test  --input-mode dev       # mocked smoke test (dev_tests comparison)
+python llm-sum/run_phase3.py evaluate --mode dev   --input-mode jsonl     # override: journal-stratified data/summaries.jsonl
+python llm-sum/run_phase3.py evaluate --mode dev   --input-mode dev       # override: judge data/dev_tests/summaries_txt (PHASE3_DEV_LIMIT articles)
 python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular   # judge data/summaries_txt (full corpus, once you're ready)
 ```
 
 | `EVAL_INPUT_MODE` / `--input-mode` | Reads from |
 |---|---|
-| `jsonl` (default) | `data/summaries.jsonl` — unchanged original behaviour. |
-| `dev` | `data/dev_tests/summaries_txt/` |
+| `jsonl` (default for non-dev modes) | `data/summaries.jsonl` — unchanged original behaviour. |
+| `dev-jsonl` (default for `--mode dev`) | `data/dev_summaries_jsonl/` → judges matching `summaries.jsonl` articles → mirrors scores to `data/dev_evals_jsonl/`. Incremental (skips already-judged papers; `--no-resume` forces a full re-judge). |
+| `dev` | `data/dev_tests/summaries_txt/` (summarize-all comparison) |
 | `regular` | `data/summaries_txt/` |
 | `auto` | `dev` when `PHASE3_MODE=dev`, otherwise `regular` — so switching `PHASE3_MODE` also switches the folder. |
 

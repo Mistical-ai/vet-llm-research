@@ -79,6 +79,11 @@ SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
 DEV_TESTS_SUMMARIES_TXT_DIR = DATA_DIR / "dev_tests" / "summaries_txt"
 HUMAN_REVIEW_DIR = DATA_DIR / "human_review"
+# The zero-jargon, standalone reviewer guide (docs/booklet chapter 7). This is
+# the single source of truth for reviewer-facing instructions; export copies
+# it verbatim into every reviewer folder (see render_reviewer_guide_markdown)
+# so a reviewer handed only their reviewer_N/ folder still gets the full guide.
+REVIEWER_GUIDE_PATH = REPO_ROOT / "docs" / "booklet" / "07_human_validation_guide.md"
 # The normalized ingest output. A derived snapshot (rewritten idempotently on
 # every ingest), NOT append-only like evaluations.jsonl — re-ingesting the same
 # filled sheets must reproduce the same file, never grow it.
@@ -145,47 +150,43 @@ def _strata_group_key(row: dict[str, Any]) -> tuple[str, ...]:
     return tuple(norm(strata.get(field, "unknown")) for field in STRATIFICATION_FIELDS)
 
 
-def sample_rows_for_review(
-    rows: Iterable[dict[str, Any]], *, sample_size: int, seed: int,
-) -> list[dict[str, Any]]:
-    """Stratified sample of evaluation rows, preferring flagged-for-review rows.
+def _select_units_stratified(
+    units: list[Any], *, sample_size: int, rng: random.Random,
+    flagged_fn: Any, strata_key_fn: Any, sort_key_fn: Any,
+) -> list[Any]:
+    """Flagged-first, then stratified round-robin selection over any unit type.
 
-    1. Every deduped row with ``requires_human_review=True`` is included
-       first (deterministically shuffled and capped at ``sample_size`` if
-       there happen to be more flagged rows than the requested sample).
-    2. Remaining slots are filled round-robin across the existing strata
-       groups (species / study_design / clinical_topic / journal /
-       input_source, see ``eval_instances.STRATIFICATION_FIELDS``), so the
-       sample spans subgroups instead of being dominated by whichever
-       journal/strata combination happens to have the most rows.
+    Shared by ``sample_rows_for_review``'s two ``sample_unit`` modes: a
+    "unit" is one row in "items" mode, or one article's whole list of rows in
+    "articles" mode. ``flagged_fn``/``strata_key_fn``/``sort_key_fn`` let the
+    caller define what "flagged" and "strata" mean for its unit type, while
+    the flagged-first-then-stratified-round-robin selection algorithm itself
+    (see module-level sampler docs) stays in one place.
 
-    Deterministic for a given ``seed`` so re-running the export with the same
-    seed reproduces the same sample (useful when a reviewer sheet is lost and
-    needs regenerating).
+    1. Every unit ``flagged_fn`` marks True is included first
+       (deterministically shuffled and capped at ``sample_size`` if there are
+       more flagged units than the requested sample).
+    2. Remaining slots are filled round-robin across ``strata_key_fn``
+       groups, so the sample spans subgroups instead of being dominated by
+       whichever group happens to have the most units.
     """
-    deduped = _dedupe_rows(rows)
-    if sample_size <= 0 or not deduped:
-        return []
-
-    rng = random.Random(seed)
-
-    flagged = sorted((r for r in deduped if r.get("requires_human_review")), key=_row_key)
-    remainder = sorted((r for r in deduped if not r.get("requires_human_review")), key=_row_key)
+    flagged = sorted((u for u in units if flagged_fn(u)), key=sort_key_fn)
+    remainder = sorted((u for u in units if not flagged_fn(u)), key=sort_key_fn)
     rng.shuffle(flagged)
     rng.shuffle(remainder)
 
-    selected: list[dict[str, Any]] = flagged[:sample_size]
+    selected: list[Any] = flagged[:sample_size]
     remaining_slots = sample_size - len(selected)
     if remaining_slots <= 0:
         return selected
 
-    groups: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
-    for row in remainder:
-        groups[_strata_group_key(row)].append(row)
+    groups: dict[tuple[str, ...], list[Any]] = defaultdict(list)
+    for unit in remainder:
+        groups[strata_key_fn(unit)].append(unit)
     group_keys = sorted(groups)
     rng.shuffle(group_keys)
 
-    pool: list[dict[str, Any]] = []
+    pool: list[Any] = []
     idx = 0
     progressed = True
     while progressed and len(pool) < remaining_slots:
@@ -201,6 +202,104 @@ def sample_rows_for_review(
 
     selected.extend(pool)
     return selected
+
+
+def _interleave_article_groups(
+    groups: list[list[dict[str, Any]]], *, rng: random.Random,
+) -> list[dict[str, Any]]:
+    """Round-robin interleave each selected article's rows across the sample.
+
+    Used only by ``sample_unit="articles"``: without this, all of one
+    article's provider rows would sit consecutively in the sampled order (and
+    therefore consecutively in the rendered packet), which is exactly the
+    back-to-back comparison the blind protocol avoids (see "Why sampling can
+    reuse the same article across multiple items" in
+    docs/phase5/human_validation.md). Shuffling the article order, then
+    taking one row per article per round, guarantees two rows sharing a
+    ``doi`` are never adjacent whenever two or more articles are selected —
+    with a single selected article there is nothing to interleave with, so
+    its rows are necessarily consecutive.
+    """
+    order = list(range(len(groups)))
+    rng.shuffle(order)
+    shuffled_groups = [groups[i] for i in order]
+
+    interleaved: list[dict[str, Any]] = []
+    idx = 0
+    progressed = True
+    while progressed:
+        progressed = False
+        for group in shuffled_groups:
+            if idx < len(group):
+                interleaved.append(group[idx])
+                progressed = True
+        idx += 1
+    return interleaved
+
+
+def sample_rows_for_review(
+    rows: Iterable[dict[str, Any]], *, sample_size: int, seed: int,
+    sample_unit: str = "items",
+) -> list[dict[str, Any]]:
+    """Stratified sample of evaluation rows, preferring flagged-for-review rows.
+
+    ``sample_unit`` controls what ``sample_size`` counts:
+
+    - ``"items"`` (default) — one row (one article + one provider's summary)
+      per count. Every deduped row with ``requires_human_review=True`` is
+      included first; remaining slots are filled round-robin across the
+      existing strata groups (species / study_design / clinical_topic /
+      journal / input_source, see ``eval_instances.STRATIFICATION_FIELDS``),
+      so the sample spans subgroups instead of being dominated by whichever
+      journal/strata combination happens to have the most rows.
+    - ``"articles"`` — one distinct article (``doi``) per count, but EVERY
+      provider row found for that article is included, so a reviewer reads
+      each sampled article once and scores every provider's summary of it
+      (e.g. 5 articles x 3 providers = 15 scored items from 5 articles
+      actually read). An article is "flagged" if any of its rows is; the
+      same stratified round-robin selection runs at article granularity.
+      Sibling rows (same ``doi``) are round-robin interleaved with other
+      selected articles' rows in the returned order so they are never
+      adjacent in the rendered packet, preserving independent, non-
+      comparative scoring — see "Why sampling can reuse the same article
+      across multiple items" in docs/phase5/human_validation.md.
+
+    Deterministic for a given ``seed`` so re-running the export with the same
+    seed reproduces the same sample (useful when a reviewer sheet is lost and
+    needs regenerating).
+    """
+    if sample_unit not in ("items", "articles"):
+        raise ValueError(f"sample_unit must be 'items' or 'articles', got {sample_unit!r}")
+
+    deduped = _dedupe_rows(rows)
+    if sample_size <= 0 or not deduped:
+        return []
+
+    rng = random.Random(seed)
+
+    if sample_unit == "items":
+        return _select_units_stratified(
+            deduped, sample_size=sample_size, rng=rng,
+            flagged_fn=lambda r: bool(r.get("requires_human_review")),
+            strata_key_fn=_strata_group_key,
+            sort_key_fn=_row_key,
+        )
+
+    # sample_unit == "articles"
+    by_doi: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in deduped:
+        doi = str(row.get("doi", "")).strip()
+        if doi:
+            by_doi[doi].append(row)
+    article_groups = [sorted(rows_, key=_row_key) for rows_ in by_doi.values()]
+
+    selected_groups = _select_units_stratified(
+        article_groups, sample_size=sample_size, rng=rng,
+        flagged_fn=lambda g: any(r.get("requires_human_review") for r in g),
+        strata_key_fn=lambda g: _strata_group_key(g[0]),
+        sort_key_fn=lambda g: _row_key(g[0]),
+    )
+    return _interleave_article_groups(selected_groups, rng=rng)
 
 
 # ---------------------------------------------------------------------------
@@ -309,10 +408,20 @@ def render_packet_markdown(items: list[ReviewItem], *, reviewer_id: int) -> str:
     lines = [
         f"# Human Validation Packet — Reviewer {reviewer_id}",
         "",
+        "**For the full guide** — what each column means, a worked example, and "
+        "why everything here is blind — see `REVIEWER_GUIDE.md` in this same "
+        "folder. Read it once before you start. What follows is just a quick "
+        "reference for while you're scoring.",
+        "",
         "This packet is BLIND: each item shows only the original article text "
         "and one candidate summary. You are not told which system (or person) "
         "wrote the summary — please do not try to guess, and score each item "
         "independently of the others.",
+        "",
+        "**Some articles may appear more than once**, each time paired with a "
+        "different summary. Score every occurrence completely independently, "
+        "as if it were the first time you'd read that article — don't look "
+        "back at an earlier score for the same article.",
         "",
         f"Score each item in `scoresheet_reviewer_{reviewer_id}.csv`. Use the "
         "`item_id` heading below to find the matching row in that file.",
@@ -347,6 +456,24 @@ def render_packet_markdown(items: list[ReviewItem], *, reviewer_id: int) -> str:
         lines.append("---")
         lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def render_reviewer_guide_markdown() -> str:
+    """Read the standalone, zero-jargon reviewer guide (docs/booklet ch. 7).
+
+    Export copies this verbatim into every reviewer_N/ folder as
+    REVIEWER_GUIDE.md, so a reviewer handed only their own folder still gets
+    the full guide — not just packet.md's compact quick-reference bullets.
+    The doc file itself is the single source of truth; this function only
+    distributes it, so a future edit to the guide propagates on the next
+    export with no code change needed here.
+    """
+    if not REVIEWER_GUIDE_PATH.exists():
+        raise FileNotFoundError(
+            f"Reviewer guide not found at {REVIEWER_GUIDE_PATH}. Export cannot "
+            "produce a self-contained reviewer folder without it."
+        )
+    return REVIEWER_GUIDE_PATH.read_text(encoding="utf-8")
 
 
 def render_scoresheet_csv(items: list[ReviewItem]) -> str:
@@ -418,6 +545,7 @@ def export_human_review(
     reviewers: int = 1,
     sample_size: int = 15,
     seed: int = 42,
+    sample_unit: str = "items",
     evaluations_path: Path | None = None,
     output_dir: Path | None = None,
     summaries_path: Path | None = None,
@@ -447,7 +575,9 @@ def export_human_review(
     )
 
     rows = list(iter_evaluation_rows(resolved_evaluations))
-    sampled_rows = sample_rows_for_review(rows, sample_size=sample_size, seed=seed)
+    sampled_rows = sample_rows_for_review(
+        rows, sample_size=sample_size, seed=seed, sample_unit=sample_unit,
+    )
 
     lookup = _build_instance_lookup(resolved_summaries, resolved_txt_dir, resolved_dev_txt_dir)
     items, skipped_rows = _build_review_items(sampled_rows, lookup)
@@ -458,11 +588,14 @@ def export_human_review(
               ".txt folders may have moved or been regenerated since evaluation) and "
               "were excluded from the export.")
 
+    guide_text = render_reviewer_guide_markdown()
+
     resolved_output.mkdir(parents=True, exist_ok=True)
     reviewer_dirs: list[Path] = []
     for reviewer_id in range(1, reviewers + 1):
         reviewer_dir = resolved_output / f"reviewer_{reviewer_id}"
         reviewer_dir.mkdir(parents=True, exist_ok=True)
+        (reviewer_dir / "REVIEWER_GUIDE.md").write_text(guide_text, encoding="utf-8")
         (reviewer_dir / "packet.md").write_text(
             render_packet_markdown(items, reviewer_id=reviewer_id), encoding="utf-8",
         )
@@ -1046,6 +1179,24 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+SAMPLE_UNITS = ("items", "articles")
+DEFAULT_SAMPLE_UNIT = "items"
+
+
+def resolve_sample_unit(unit: str | None) -> str:
+    """Normalize ``sample_unit``, defaulting safely (mirrors resolve_human_validation_mode).
+
+    An unknown value falls back to the default with a warning rather than
+    raising, so a typo in .env never crashes an offline export.
+    """
+    resolved = (unit or DEFAULT_SAMPLE_UNIT).strip().lower()
+    if resolved not in SAMPLE_UNITS:
+        print(f"[human_review] WARNING: invalid sample unit {unit!r}; "
+              f"using {DEFAULT_SAMPLE_UNIT!r}. Valid: {SAMPLE_UNITS}")
+        return DEFAULT_SAMPLE_UNIT
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Phase 5 — export blind human-validation review packets "
@@ -1055,8 +1206,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="Number of independent reviewer copies to export "
                              "(default: HUMAN_REVIEWERS from .env, or 1).")
     parser.add_argument("--sample-size", type=int, default=None,
-                        help="Number of (paper, summary) items to sample "
+                        help="Number to sample, counted per --sample-unit "
                              "(default: HUMAN_REVIEW_SAMPLE_SIZE from .env, or 15).")
+    parser.add_argument("--sample-unit", choices=SAMPLE_UNITS, default=None,
+                        help="What --sample-size counts: 'items' (one (article, "
+                             "provider) pair per count, default) or 'articles' "
+                             "(one article per count, every provider's summary "
+                             "of it included -- e.g. 5 articles x 3 providers = "
+                             "15 scored items from 5 articles actually read). "
+                             "Default: HUMAN_REVIEW_SAMPLE_UNIT from .env, or 'items'.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Sampling seed (default: HUMAN_REVIEW_SEED from .env, or 42).")
     parser.add_argument("--evaluations", type=Path, default=None,
@@ -1071,11 +1229,15 @@ def main(argv: list[str] | None = None) -> int:
         else _env_int("HUMAN_REVIEW_SAMPLE_SIZE", 15)
     )
     seed = args.seed if args.seed is not None else _env_int("HUMAN_REVIEW_SEED", 42)
+    sample_unit = resolve_sample_unit(
+        args.sample_unit if args.sample_unit is not None else os.getenv("HUMAN_REVIEW_SAMPLE_UNIT")
+    )
 
     result = export_human_review(
         reviewers=reviewers,
         sample_size=sample_size,
         seed=seed,
+        sample_unit=sample_unit,
         evaluations_path=args.evaluations,
         output_dir=args.output_dir,
     )

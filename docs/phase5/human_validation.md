@@ -50,6 +50,99 @@ validate the other. Blinded assessment is a bedrock of clinical evidence for
 exactly this reason; here it is enforced structurally — the reviewer-facing
 files physically cannot contain a model name, and a test asserts it.
 
+### Why each summary is scored independently, never side-by-side
+
+Every sampled item is one article + **one** blind summary — never a
+side-by-side comparison of an article's three provider summaries at once,
+even blinded. This is a deliberate constraint, not an oversight, for four
+reasons:
+
+1. **It has to match the construct being validated.** The LLM jury
+   (`evaluator.build_judge_prompt()`) scores exactly one summary at a time,
+   with zero visibility into any sibling summary of the same article. If a
+   human instead scored three summaries together, the human would be doing a
+   fundamentally different task — **comparative/relative rating** — while the
+   jury does an **absolute/independent** one. Correlating the two would no
+   longer isolate "does the jury track human judgment"; it would conflate
+   that with "does an absolute-scoring jury track a comparative-scoring
+   human," a different and uninterpretable question.
+2. **Contrast and anchoring effects are a well-documented rating bias.**
+   Rating something in the presence of similar alternatives systematically
+   shifts the score relative to what it would have been in isolation — a
+   mediocre summary reads better next to two weak ones and worse next to two
+   strong ones. The same effect shows up in LLM-judge research comparing
+   pointwise, pairwise, and listwise judging: the scoring mode itself changes
+   the scores, independent of the content being judged. Since the jury this
+   study validates is strictly pointwise, a comparative human score would
+   contaminate the very agreement statistic the study is trying to measure
+   honestly — a spurious mismatch (or spurious match) driven by scoring mode,
+   not by whether the jury is actually right.
+3. **It leaks comparative information even without naming a provider.** The
+   reviewer guide's core promise (`docs/booklet/07_human_validation_guide.md`,
+   §2) is that a score "reflects only what's on the page in front of you."
+   Showing three summaries of the same article together lets a reviewer use
+   relative cues ("this one's clearly the weakest of the three") instead of
+   judging each summary purely against the source article — a subtler leak
+   than a model name, but a leak of the same kind the blind protocol exists
+   to close.
+4. **The pipeline's data model is 1 item = 1 score set = 1 jury score to
+   correlate against.** `_row_key()`, `unblinding_key.json`,
+   `_normalize_scoresheet_row()`, and `_human_vs_jury()`'s per-`item_id`
+   pairing all assume exactly this shape. A side-by-side design would need a
+   reshaped scoresheet, sampler, and correlation model to answer a genuinely
+   different research question — **relative preference/ranking** among
+   providers (the kind of question pairwise human-preference benchmarks like
+   AlpacaEval ask) — not the question this study needs answered, which is
+   whether the jury's *independent* score for *one* summary tracks a human's
+   *independent* score for that same summary.
+
+### Why sampling can reuse the same article across multiple items
+
+Independent scoring (above) doesn't require independent *articles*. Reading
+15 different articles to produce 15 scored items is far more reading burden
+on a volunteer reviewer than reading 5 articles and independently scoring
+all 3 providers' summaries of each — 15 scored items either way, but only 5
+articles actually read. `sample_rows_for_review(..., sample_unit="articles")`
+supports exactly this, and it is standard practice in human evaluation of
+NLG systems: reusing one source document across several independently-rated
+system outputs is how most human-evaluation protocols for summarization and
+translation work (e.g. WMT- and SummEval-style studies routinely have one
+annotator rate multiple systems' outputs against the same shared source).
+What those protocols avoid — and what this project avoids too — is
+*simultaneous, comparative* presentation of those outputs, not *reuse* of
+the source text. The distinction matters:
+
+- Each of an article's provider summaries is still sampled and scored as its
+  **own independent item**, on its own scoresheet row, with no ranking or
+  relative judgment requested — exactly the same item shape as `"items"`
+  mode, just selected differently.
+- **Sibling items (same article, different provider) are never adjacent in
+  the rendered packet.** `_interleave_article_groups()` shuffles the
+  selected articles' order with the run's seeded RNG, then takes one row per
+  article per round — so a reviewer always encounters other, unrelated
+  articles between two summaries of the same one. This breaks the
+  short-term-memory/contrast chain that side-by-side presentation was
+  rejected for in the previous section: by the time a reviewer reaches an
+  article's second summary, several unrelated items have intervened. (With
+  only one article sampled there is nothing to interleave with, so its rows
+  are necessarily consecutive — a corner case worth avoiding by sampling at
+  least a handful of articles.)
+- `packet.md`'s preamble tells the reviewer directly: score every occurrence
+  of a repeated article completely independently, as if seeing it for the
+  first time, and don't look back at an earlier score for the same article.
+- Nothing about the sampler's flagged-first-then-stratified selection logic,
+  the packet/scoresheet rendering, the un-blinding key, or the ingest/
+  correlation math changes — `sample_unit="articles"` only changes *which
+  rows get selected*, grouped and then re-flattened back into the same row
+  list shape `"items"` mode already produces.
+
+Practically: `HUMAN_REVIEW_SAMPLE_UNIT=articles` with
+`HUMAN_REVIEW_SAMPLE_SIZE` set to the number of journals (5, in this
+project's corpus) spreads the sampled articles one per journal (the existing
+journal-stratified selection already does this), each expanded to its ~3
+provider summaries — about 15 scored items from 5 articles actually read,
+instead of 15 articles for 15 items under `"items"` mode.
+
 ### Why humans score the identical 5-criterion rubric
 
 Validity requires comparing like with like. The reviewer scores the **same
@@ -159,10 +252,17 @@ or incur cost.
 ### Methods paragraph (adapt for a write-up)
 
 > To validate the LLM jury, *N* summaries were sampled (stratified by species,
-> study design, clinical topic, journal, and input source; fixed seed) and
-> scored independently by *R* blinded reviewers on the same five 1–5 criteria
-> used by the jury; reviewers saw only the source article and candidate summary,
-> never the generating model. Inter-reviewer reliability was quantified with
+> study design, clinical topic, journal, and input source; fixed seed) —
+> either as *N* independently-drawn (article, provider) pairs, or, to reduce
+> reviewer reading burden, as *K* articles with every available provider
+> summary of each included (*N* ≈ 3*K* summaries from only *K* articles
+> read). Each summary was scored independently by *R* blinded reviewers on
+> the same five 1–5 criteria used by the jury; reviewers saw only the source
+> article and candidate summary, never the generating model, and — when an
+> article's summaries were drawn together — never more than one summary of
+> the same article at a time, with sibling items interleaved apart in the
+> reading order to prevent order/contrast bias. Inter-reviewer reliability
+> was quantified with
 > Krippendorff's α (interval metric). Agreement between each reviewer and the
 > jury was assessed per reviewer with Spearman's ρ (primary) and Pearson's r,
 > and systematic bias with Bland-Altman analysis (mean difference and 95% limits
@@ -214,9 +314,21 @@ python llm-sum/run_phase3.py export-human-review --reviewers 3 --sample-size 15
 |---|---|---|
 | `--reviewers N` | `HUMAN_REVIEWERS` | 1 |
 | `--sample-size N` | `HUMAN_REVIEW_SAMPLE_SIZE` | 15 |
+| `--sample-unit {items,articles}` | `HUMAN_REVIEW_SAMPLE_UNIT` | `items` |
 | `--seed N` | `HUMAN_REVIEW_SEED` | 42 |
 | `--evaluations PATH` | — | `data/evaluations.jsonl` |
 | `--output-dir PATH` | — | `data/human_review/` |
+
+`--sample-unit articles` samples distinct articles instead of individual
+`(article, provider)` items, expanding each to every provider summary found
+for it — see "Why sampling can reuse the same article across multiple
+items" above. For example:
+
+```powershell
+python llm-sum/run_phase3.py export-human-review --sample-unit articles --sample-size 5
+# 5 articles selected (stratified across journals), every provider's summary
+# of each included -- typically ~15 scored items, 5 articles actually read.
+```
 
 All three env knobs live in `.env.template` section 19. Like `EVAL_SAMPLE_SEED`,
 keeping `HUMAN_REVIEW_SEED` fixed makes the sample reproducible — re-running
@@ -256,9 +368,12 @@ printed as a warning; nothing fails silently.
 data/human_review/
   unblinding_key.json          NEVER share this file with reviewers
   reviewer_1/
+    REVIEWER_GUIDE.md           full zero-jargon guide (copied from
+                                 docs/booklet/07_human_validation_guide.md)
     packet.md                  blind reading packet: item_id + article + summary
     scoresheet_reviewer_1.csv  blank scoresheet for reviewer 1 to fill in
   reviewer_2/
+    REVIEWER_GUIDE.md           identical content to reviewer_1's copy
     packet.md                  identical content to reviewer_1's packet
     scoresheet_reviewer_2.csv
   ...
@@ -269,6 +384,17 @@ copies. This is intentional: the ingest step (§7) needs the same items scored
 by more than one person to measure inter-reviewer agreement — the same reason
 the LLM jury needs more than one judge scoring the same item to compute
 Krippendorff's alpha (see [reliability.py](../../llm-sum/reliability.py)).
+
+### `REVIEWER_GUIDE.md` — the full guide, shipped with every reviewer folder
+
+A verbatim copy of `docs/booklet/07_human_validation_guide.md`, written into
+every `reviewer_N/` folder so a reviewer handed only their own folder (e.g.
+zipped and emailed) still gets the complete, zero-jargon guide — what each
+scoresheet column means, a worked example row, why the process is blind, and
+what to do with a repeated article — with no other file or context required.
+`packet.md`'s own preamble is deliberately kept short (a quick-reference
+recap for while scoring) and points to this file for the full explanation,
+rather than duplicating it.
 
 ### `packet.md` — what the reviewer reads
 
@@ -310,10 +436,12 @@ per export and is not regenerated per reviewer.
 ## 6. Distributing packets to real reviewers
 
 1. Run the export.
-2. Send each reviewer only their own `reviewer_N/` folder (`packet.md` +
-   `scoresheet_reviewer_N.csv`). Do **not** send `unblinding_key.json`.
-3. Ask them to fill in the CSV — one row per `item_id`, 1-5 in each numeric
-   column — and return it.
+2. Send each reviewer only their own `reviewer_N/` folder — it is now fully
+   self-contained (`REVIEWER_GUIDE.md` + `packet.md` +
+   `scoresheet_reviewer_N.csv`), nothing else needs to be separately
+   attached. Do **not** send `unblinding_key.json`.
+3. Ask them to read `REVIEWER_GUIDE.md` once, then fill in the CSV — one row
+   per `item_id`, 1-5 in each numeric column — and return it.
 4. Keep the completed CSVs **in their `reviewer_N/` folders** and
    `unblinding_key.json` together, so ingest (§7) can find both.
 

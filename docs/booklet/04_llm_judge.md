@@ -88,6 +88,13 @@ This is why the project documentation calls the blind protocol
 "non-negotiable." It isn't a preference — it's the thing that makes every
 number in the study defensible.
 
+**The human side of validation follows the identical rule.** When a
+veterinarian reviewer checks the judge's work (Chapter 7), they too see only
+one summary at a time, never several summaries of the same article side by
+side — for the same reason a comparison would bias the judge. Chapter 7
+explains why, in plain language, and what to do if the same article happens
+to come up more than once in a reviewer's packet.
+
 ---
 
 ## 2. The rubric: five things the judge scores
@@ -495,6 +502,14 @@ On disk, after scoring one paper's three summaries, you'd see three independent
 lines — one for OpenAI's summary, one for Anthropic's, one for Gemini's — each a
 complete, standalone record. Re-running evaluation skips pairs it has already
 scored, so the file grows safely and never has to be rewritten.
+
+**Trying it on a small sample first.** Before judging the whole corpus, you can
+run a *dev* loop on one random paper per journal: `evaluate --mode dev` reads the
+readable summaries in `data/dev_summaries_jsonl/`, judges those papers, and writes
+a plain-English `.txt` of the scores per paper into `data/dev_evals_jsonl/` so you
+can eyeball whether the output is good enough. Each run skips papers already done,
+so re-running grows the sample. The step-by-step is in
+[docs/phase3/dev_evaluation_guide.md](../phase3/dev_evaluation_guide.md).
 
 ---
 

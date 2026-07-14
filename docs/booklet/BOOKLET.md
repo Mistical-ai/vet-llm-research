@@ -1203,6 +1203,13 @@ This is why the project documentation calls the blind protocol
 "non-negotiable." It isn't a preference — it's the thing that makes every
 number in the study defensible.
 
+**The human side of validation follows the identical rule.** When a
+veterinarian reviewer checks the judge's work (Chapter 7), they too see only
+one summary at a time, never several summaries of the same article side by
+side — for the same reason a comparison would bias the judge. Chapter 7
+explains why, in plain language, and what to do if the same article happens
+to come up more than once in a reviewer's packet.
+
 ---
 
 ### 2. The rubric: five things the judge scores
@@ -3150,6 +3157,21 @@ Take the items one at a time, in order. For each one:
 There's no time limit and no required pace. Some items will be quick to
 score; others — especially ones where something feels a little off — may be
 worth a second read.
+
+#### You might see the same article more than once — that's okay
+
+To make the best use of your time, your reading document may sometimes pair
+the *same* article with more than one AI-written summary, appearing as
+separate, unconnected items — possibly many items apart, so you likely won't
+read them back to back. This lets us get more independent scores without
+asking you to read more articles than necessary.
+
+If that happens, treat each occurrence as if it were the very first time
+you'd seen that article. Score it purely on its own — don't flip back to
+compare it with an earlier summary of the same article, and don't let your
+impression of one summary color your score for another. Each one is asking
+the same question fresh: *judged entirely on its own, is this a summary I
+could trust?*
 
 ---
 

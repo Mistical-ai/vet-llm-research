@@ -23,11 +23,13 @@ from evaluator import BLIND_FORBIDDEN_TOKENS
 from file_paths import doi_to_slug
 import human_review
 from human_review import (
+    REVIEWER_GUIDE_PATH,
     ReviewItem,
     SCORESHEET_FIELDS,
     build_unblinding_key,
     export_human_review,
     render_packet_markdown,
+    render_reviewer_guide_markdown,
     render_scoresheet_csv,
     sample_rows_for_review,
 )
@@ -86,6 +88,28 @@ def test_scoresheet_csv_has_expected_columns_and_blank_scores() -> None:
         if field == "item_id":
             continue
         assert rows[0][field] == ""
+
+
+def test_render_reviewer_guide_markdown_returns_the_checked_in_doc() -> None:
+    content = render_reviewer_guide_markdown()
+    assert "A Guide for Veterinarian Reviewers" in content
+    assert content == REVIEWER_GUIDE_PATH.read_text(encoding="utf-8")
+
+
+def test_render_reviewer_guide_markdown_contains_no_model_identifiers() -> None:
+    content = render_reviewer_guide_markdown().lower()
+    for forbidden in BLIND_FORBIDDEN_TOKENS:
+        assert forbidden not in content, (
+            f"Reviewer guide leaked the token '{forbidden}'; the guide must stay "
+            "model-agnostic like packet.md and the scoresheet."
+        )
+
+
+def test_render_reviewer_guide_markdown_raises_clearly_when_missing(monkeypatch, tmp_path: Path) -> None:
+    import pytest
+    monkeypatch.setattr(human_review, "REVIEWER_GUIDE_PATH", tmp_path / "does_not_exist.md")
+    with pytest.raises(FileNotFoundError):
+        human_review.render_reviewer_guide_markdown()
 
 
 def test_unblinding_key_carries_identity_and_llm_scores() -> None:
@@ -170,6 +194,88 @@ def test_sampler_returns_empty_for_zero_sample_size() -> None:
     assert sample_rows_for_review(rows, sample_size=0, seed=1) == []
 
 
+def test_sampler_default_sample_unit_matches_explicit_items() -> None:
+    rows = [_row(f"10.1/{i}", "openai", journal="JVIM") for i in range(5)]
+    default = sample_rows_for_review(rows, sample_size=3, seed=42)
+    explicit = sample_rows_for_review(rows, sample_size=3, seed=42, sample_unit="items")
+    assert default == explicit
+
+
+def test_sample_rows_for_review_rejects_unknown_sample_unit() -> None:
+    import pytest
+    rows = [_row("10.1/a", "openai", journal="JVIM")]
+    with pytest.raises(ValueError):
+        sample_rows_for_review(rows, sample_size=1, seed=1, sample_unit="bogus")
+
+
+# ---------------------------------------------------------------------------
+# Sampler — sample_unit="articles" (read once, score every provider)
+# ---------------------------------------------------------------------------
+
+def _multi_provider_rows(num_articles: int, *, journal: str = "JVIM",
+                          providers: tuple[str, ...] = ("openai", "anthropic", "gemini")) -> list[dict]:
+    rows = []
+    for i in range(num_articles):
+        doi = f"10.1/article{i}"
+        rows += [_row(doi, provider, journal=journal) for provider in providers]
+    return rows
+
+
+def test_sampler_articles_mode_includes_every_provider_of_each_selected_article() -> None:
+    rows = _multi_provider_rows(5)
+    sampled = sample_rows_for_review(rows, sample_size=2, seed=42, sample_unit="articles")
+    dois_seen = {r["doi"] for r in sampled}
+    assert len(dois_seen) == 2
+    assert len(sampled) == 6  # 2 articles x 3 providers
+    for doi in dois_seen:
+        summarizers = {r["summarizer"] for r in sampled if r["doi"] == doi}
+        assert summarizers == {"openai", "anthropic", "gemini"}
+
+
+def test_sampler_articles_mode_interleaves_sibling_rows_apart() -> None:
+    rows = _multi_provider_rows(5)
+    sampled = sample_rows_for_review(rows, sample_size=5, seed=42, sample_unit="articles")
+    assert len(sampled) == 15
+    for idx in range(len(sampled) - 1):
+        assert sampled[idx]["doi"] != sampled[idx + 1]["doi"], (
+            f"Sibling rows for {sampled[idx]['doi']} landed adjacent at index {idx}; "
+            "articles mode must interleave same-article rows apart so a reviewer "
+            "never scores two summaries of the same article back to back."
+        )
+
+
+def test_sampler_articles_mode_prioritizes_flagged_articles() -> None:
+    flagged_doi = "10.1/flagged"
+    rows = [_row(flagged_doi, p, journal="JVIM", requires_review=(p == "openai"))
+            for p in ("openai", "anthropic", "gemini")]
+    rows += _multi_provider_rows(5, journal="JVIM")
+    sampled = sample_rows_for_review(rows, sample_size=1, seed=1, sample_unit="articles")
+    assert {r["doi"] for r in sampled} == {flagged_doi}
+    assert len(sampled) == 3
+
+
+def test_sampler_articles_mode_stratifies_across_journals() -> None:
+    rows = []
+    for journal in ("JVIM", "AJVR", "VRU"):
+        for i in range(10):
+            doi = f"10.1/{journal}_article{i}"
+            rows += [_row(doi, provider, journal=journal)
+                     for provider in ("openai", "anthropic", "gemini")]
+    sampled = sample_rows_for_review(rows, sample_size=6, seed=42, sample_unit="articles")
+    journals_seen = {r["strata"]["journal"] for r in sampled}
+    assert len(journals_seen) == 3, (
+        "A stratified sample of 6 articles across 3 evenly-sized journal groups "
+        f"should span all three journals, saw only {journals_seen}"
+    )
+
+
+def test_sampler_articles_mode_is_deterministic_for_a_fixed_seed() -> None:
+    rows = _multi_provider_rows(8)
+    first = sample_rows_for_review(rows, sample_size=4, seed=7, sample_unit="articles")
+    second = sample_rows_for_review(rows, sample_size=4, seed=7, sample_unit="articles")
+    assert [(r["doi"], r["summarizer"]) for r in first] == [(r["doi"], r["summarizer"]) for r in second]
+
+
 # ---------------------------------------------------------------------------
 # Full export (offline, mock corpus)
 # ---------------------------------------------------------------------------
@@ -244,13 +350,17 @@ def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatc
     assert result.skipped_rows == 0
     assert len(result.reviewer_dirs) == 2
 
+    expected_guide = REVIEWER_GUIDE_PATH.read_text(encoding="utf-8")
     for reviewer_id in (1, 2):
         reviewer_dir = output_dir / f"reviewer_{reviewer_id}"
+        guide = (reviewer_dir / "REVIEWER_GUIDE.md").read_text(encoding="utf-8")
         packet = (reviewer_dir / "packet.md").read_text(encoding="utf-8")
         scoresheet = (reviewer_dir / f"scoresheet_reviewer_{reviewer_id}.csv").read_text(encoding="utf-8")
+        assert guide == expected_guide
         assert "item_001" in packet and "item_002" in packet
         assert "Full cleaned article text for" in packet
         for forbidden in BLIND_FORBIDDEN_TOKENS:
+            assert forbidden not in guide.lower()
             assert forbidden not in packet.lower()
             assert forbidden not in scoresheet.lower()
 
@@ -258,6 +368,90 @@ def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatc
     assert set(key["items"]) == {"item_001", "item_002"}
     assert {item["doi"] for item in key["items"].values()} == {"10.1111/test.one", "10.1111/test.two"}
     assert all(item["summarizer"] == "openai" for item in key["items"].values())
+
+
+def _write_fixture_corpus_multi_provider(tmp_path: Path, monkeypatch, *, num_articles: int = 3) -> tuple[Path, Path]:
+    """Like _write_fixture_corpus, but every article has all 3 providers
+    successfully summarized and evaluated -- used to test sample_unit="articles"."""
+    processed_dir = tmp_path / "processed_multi"
+    processed_dir.mkdir()
+    monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
+
+    providers = ("openai", "anthropic", "gemini")
+    dois = [f"10.1111/test.multi{i}" for i in range(num_articles)]
+    summaries_path = tmp_path / "summaries_multi.jsonl"
+    evaluations_path = tmp_path / "evaluations_multi.jsonl"
+
+    with open(summaries_path, "w", encoding="utf-8") as f:
+        for doi in dois:
+            f.write(json.dumps({
+                "doi": doi,
+                "journal": "JVIM",
+                "models": {p: {"status": "success", "summary": f"Summary variant {i} of {doi}."}
+                           for i, p in enumerate(providers)},
+            }) + "\n")
+
+    for doi in dois:
+        slug = doi_to_slug(doi)
+        (processed_dir / f"{slug}.jsonl").write_text(
+            json.dumps({"doi": doi, "slug": slug, "text": f"Full cleaned article text for {doi}."}) + "\n",
+            encoding="utf-8",
+        )
+
+    with open(evaluations_path, "w", encoding="utf-8") as f:
+        for doi in dois:
+            for provider in providers:
+                f.write(json.dumps({
+                    "doi": doi,
+                    "summarizer": provider,
+                    "judge": "anthropic",
+                    "input_source": "processed",
+                    "rubric_version": "vet_medhelm_score_v1.0",
+                    "jury_score": 4.0,
+                    "jury_score_weighted": 4.0,
+                    "jury_score_unweighted": 4.0,
+                    "criteria_scores": {"faithfulness": {"score": 4, "reasoning": "ok"}},
+                    "requires_human_review": False,
+                    "strata": {"species": ["Canine"], "study_design": "RCT", "clinical_topic": "Cardiology",
+                              "journal": "JVIM", "input_source": "processed"},
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                }) + "\n")
+
+    return summaries_path, evaluations_path
+
+
+def test_export_human_review_articles_mode_reads_each_article_once(tmp_path: Path, monkeypatch) -> None:
+    """sample_unit="articles" with sample_size=2 should read only 2 articles
+    but export all 3 providers' summaries of each (6 items total)."""
+    summaries_path, evaluations_path = _write_fixture_corpus_multi_provider(tmp_path, monkeypatch, num_articles=3)
+    output_dir = tmp_path / "human_review_articles"
+
+    result = export_human_review(
+        reviewers=1,
+        sample_size=2,
+        sample_unit="articles",
+        seed=42,
+        evaluations_path=evaluations_path,
+        output_dir=output_dir,
+        summaries_path=summaries_path,
+        summaries_txt_dir=tmp_path / "no_summaries_txt",
+        dev_tests_summaries_txt_dir=tmp_path / "no_dev_summaries_txt",
+    )
+
+    assert result.items_exported == 6  # 2 articles x 3 providers
+
+    key = json.loads((output_dir / "unblinding_key.json").read_text(encoding="utf-8"))
+    dois = {item["doi"] for item in key["items"].values()}
+    assert len(dois) == 2
+    for doi in dois:
+        summarizers = {item["summarizer"] for item in key["items"].values() if item["doi"] == doi}
+        assert summarizers == {"openai", "anthropic", "gemini"}
+
+    reviewer_dir = output_dir / "reviewer_1"
+    assert (reviewer_dir / "REVIEWER_GUIDE.md").exists()
+    packet = (reviewer_dir / "packet.md").read_text(encoding="utf-8")
+    for forbidden in BLIND_FORBIDDEN_TOKENS:
+        assert forbidden not in packet.lower()
 
 
 def test_export_human_review_skips_rows_missing_source_text(tmp_path: Path, monkeypatch) -> None:

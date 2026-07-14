@@ -125,6 +125,10 @@ python llm-sum/run_phase3.py summarize --mode batch
 python llm-sum/run_phase3.py summarize --mode dev --resume
 python llm-sum/run_phase3.py summarize --mode single --force
 
+# Dev mode skips papers already in data/dev_summaries_jsonl/ (incremental sampling);
+# --no-skip-existing reconsiders them
+python llm-sum/run_phase3.py summarize --mode dev --no-skip-existing
+
 # Input source (default: processed)
 python llm-sum/run_phase3.py summarize --mode single --input-source processed
 python llm-sum/run_phase3.py summarize --mode single --input-source raw_text
@@ -142,6 +146,7 @@ python llm-sum/run_phase3.py summarize --mode single --guide-summary llm-sum/pro
 | `--estimate` | Print projected cost via tiktoken; no API calls. Not available for `--input-source pdf`. |
 | `--limit N` | Override mode's paper limit |
 | `--resume` | Skip (doi, model) pairs already at `status=success` |
+| `--no-skip-existing` | Dev mode only: reconsider papers already in `data/dev_summaries_jsonl/` (default: skip them so dev sampling is incremental) |
 | `--force` | Bypass interactive `yes` confirmation |
 | `--providers` | Comma-separated subset (default: all three) |
 | `--manifest PATH` | Manifest JSONL |
@@ -202,29 +207,35 @@ python llm-sum/run_phase3.py summarize-all --mode single --providers openai,gemi
 
 Blind judge over `data/summaries.jsonl`. Writes to `data/evaluations.jsonl`.
 
+`--mode dev` is special: it runs the **folder-driven dev loop** — it reads the DOIs already
+in `data/dev_summaries_jsonl/` (written by `summarize --mode dev`), judges their matching
+articles, and mirrors the scores into `data/dev_evals_jsonl/`, skipping papers already
+evaluated there. See [dev_evaluation_guide.md](dev_evaluation_guide.md) for the full loop.
+
 ```powershell
 python llm-sum/run_phase3.py evaluate --mode test
 python llm-sum/run_phase3.py evaluate --mode single
-python llm-sum/run_phase3.py evaluate --mode dev
+python llm-sum/run_phase3.py evaluate --mode dev          # folder-driven dev loop
 python llm-sum/run_phase3.py evaluate --mode dev --limit 3
 python llm-sum/run_phase3.py evaluate --mode batch
 python llm-sum/run_phase3.py evaluate --mode dev --judges openai,anthropic
 python llm-sum/run_phase3.py evaluate --mode dev --jury
-python llm-sum/run_phase3.py evaluate --mode dev --no-resume
+python llm-sum/run_phase3.py evaluate --mode dev --no-resume   # re-judge papers already done
 python llm-sum/run_phase3.py evaluate --mode dev --force
 
-# Judge summarize-all's readable .txt comparison files instead of summaries.jsonl
-python llm-sum/run_phase3.py evaluate --mode dev --input-mode dev
+# Override the dev-mode default for a single run:
+python llm-sum/run_phase3.py evaluate --mode dev --input-mode jsonl   # journal-stratified summaries.jsonl
+python llm-sum/run_phase3.py evaluate --mode dev --input-mode dev     # summarize-all dev_tests comparison
 python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular
 ```
 
 | Flag | Purpose |
 |------|---------|
 | `--limit N` | Override mode's paper limit |
-| `--judges` | Comma-separated judge provider keys. Overrides `--jury` and `JURY_PRESET`. |
-| `--jury` | Full 3-judge panel (`openai,anthropic,gemini`); same as `JURY_PRESET=panel`. |
-| `--input-mode` | `jsonl` (default), `dev`, `regular`, or `auto` — where to read summaries from. See [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate). |
-| `--no-resume` | Re-evaluate pairs already in `evaluations.jsonl` |
+| `--judges` | Comma-separated judge provider keys. Overrides `--jury` and `JURY_PRESET`. Default judges: the full 3-judge panel `openai,anthropic,gemini`. |
+| `--jury` | Full 3-judge panel (`openai,anthropic,gemini`); same as `JURY_PRESET=panel`. Presets: `panel` (3, default) / `duo` (2: `openai,anthropic`) / `solo` (1: `openai`). |
+| `--input-mode` | `jsonl` (default), `dev-jsonl`, `dev`, `regular`, or `auto` — where to read summaries from. `--mode dev` defaults to `dev-jsonl` regardless of `EVAL_INPUT_MODE`. See [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate). |
+| `--no-resume` | Re-evaluate pairs already in `evaluations.jsonl`; in dev-jsonl mode also re-includes papers already in `data/dev_evals_jsonl/` |
 | `--force` | Bypass confirmation |
 
 ### `eval-report` (always free, read-only)
