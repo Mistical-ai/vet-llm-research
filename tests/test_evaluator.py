@@ -714,7 +714,7 @@ def test_minor_hallucination_does_not_trigger_review_alone() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Readable dev-eval mirror (data/dev_evals_jsonl/)
+# Readable dev-eval mirrors (data/dev_evals_jsonl/, data/dev_detailEval_reports/)
 # ---------------------------------------------------------------------------
 
 def _fake_eval_row(doi: str, summarizer: str, judge: str, **over) -> dict:
@@ -725,15 +725,40 @@ def _fake_eval_row(doi: str, summarizer: str, judge: str, **over) -> dict:
         "input_source": "processed",
         "strata": {"journal": "jvim", "input_source": "processed"},
         "jury_score": 4,
+        "jury_score_weighted": 4.1,
+        "jury_score_unweighted": 4.0,
         "quality_score": 8,
         "hallucination_count": 0,
+        "hallucination_claims": [
+            {"claim": "The drug cured all cats.", "source_quote": "Some cats improved.",
+             "category": "unsupported_inference", "severity": "major"},
+        ],
         "requires_human_review": False,
+        "confidence_score": 5,
         "parse_method": "json",
         "judge_model_version": "gpt-5.4-test",
         "reasoning": "Solid summary.",
+        "criteria_scores": {
+            "faithfulness": {"score": 4, "reasoning": "Mostly supported."},
+            "completeness": {"score": 5, "reasoning": "Covers everything."},
+            "clinical_usefulness": {"score": 4, "reasoning": "Useful takeaways."},
+            "clarity": {"score": 5, "reasoning": "Easy to read."},
+            "safety": {"score": 3, "reasoning": "Minor overstatement."},
+        },
+        "automatic_metrics": {
+            "compression_ratio": 0.05,
+            "extractive_coverage": 0.9,
+            "section_coverage": {"covered_count": 5, "coverage_ratio": 0.83},
+            "rouge_1": 0.4, "rouge_2": 0.2, "rouge_l": 0.3,
+        },
     }
     row.update(over)
     return row
+
+
+_FAKE_MANIFEST_INDEX = {
+    "10.1/aaa": {"title": "A study of aaa in cats", "journal": "JVIM"},
+}
 
 
 def test_write_dev_eval_jsonl_outputs_writes_one_file_per_doi(
@@ -755,18 +780,25 @@ def test_write_dev_eval_jsonl_outputs_writes_one_file_per_doi(
     out_dir = tmp_path / "dev_evals_jsonl"
     written = write_dev_eval_jsonl_outputs(
         {"10.1/aaa", "10.2/bbb"}, output_dir=out_dir, evaluations_path=evaluations_path,
+        manifest_index=_FAKE_MANIFEST_INDEX,
     )
     assert written == 2
 
     aaa = (out_dir / f"{doi_to_slug('10.1/aaa')}.txt").read_text(encoding="utf-8")
     # Header begins with DOI: so run_phase3._read_dois_from_dev_folder can parse it.
     assert aaa.startswith("DOI: 10.1/aaa")
+    # Title line is sourced from the manifest index.
+    assert "Title: A study of aaa in cats" in aaa
     # Both provider sections for that DOI are present.
     assert "SUMMARIZER: openai" in aaa
     assert "SUMMARIZER: anthropic" in aaa
     assert "Requires Human Review: Yes" in aaa
     # The un-requested DOI produced no file.
     assert not (out_dir / f"{doi_to_slug('10.3/ccc')}.txt").exists()
+
+    # DOI with no manifest entry falls back to "Not recorded", not a crash.
+    bbb = (out_dir / f"{doi_to_slug('10.2/bbb')}.txt").read_text(encoding="utf-8")
+    assert "Title: Not recorded" in bbb
 
 
 def test_write_dev_eval_jsonl_outputs_overwrites_in_place(
@@ -781,6 +813,82 @@ def test_write_dev_eval_jsonl_outputs_overwrites_in_place(
         encoding="utf-8",
     )
     out_dir = tmp_path / "dev_evals_jsonl"
-    write_dev_eval_jsonl_outputs({"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path)
-    write_dev_eval_jsonl_outputs({"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path)
+    write_dev_eval_jsonl_outputs(
+        {"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path, manifest_index={},
+    )
+    write_dev_eval_jsonl_outputs(
+        {"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path, manifest_index={},
+    )
     assert len(list(out_dir.glob("*.txt"))) == 1
+
+
+def test_write_dev_detail_eval_outputs_writes_one_file_per_doi(tmp_path: Path) -> None:
+    from evaluator import write_dev_detail_eval_outputs
+    from file_paths import doi_to_slug
+
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    with open(evaluations_path, "w", encoding="utf-8") as f:
+        for row in (
+            _fake_eval_row("10.1/aaa", "openai", "openai"),
+            _fake_eval_row("10.1/aaa", "openai", "anthropic", **{
+                "criteria_scores": {
+                    "faithfulness": {"score": 2, "reasoning": "Overstates one claim."},
+                    "completeness": {"score": 4, "reasoning": "Missing limitations."},
+                    "clinical_usefulness": {"score": 3, "reasoning": "Some value."},
+                    "clarity": {"score": 4, "reasoning": "Readable."},
+                    "safety": {"score": 3, "reasoning": "Moderate risk."},
+                },
+            }),
+            _fake_eval_row("10.2/bbb", "gemini", "openai"),
+            _fake_eval_row("10.3/ccc", "openai", "openai"),  # not requested
+        ):
+            f.write(json.dumps(row) + "\n")
+
+    out_dir = tmp_path / "dev_detailEval_reports"
+    written = write_dev_detail_eval_outputs(
+        {"10.1/aaa", "10.2/bbb"}, output_dir=out_dir, evaluations_path=evaluations_path,
+        manifest_index=_FAKE_MANIFEST_INDEX,
+    )
+    assert written == 2
+
+    aaa = (out_dir / f"{doi_to_slug('10.1/aaa')}.md").read_text(encoding="utf-8")
+    # Title is the top heading.
+    assert aaa.startswith("# A study of aaa in cats")
+    assert "[10.1/aaa](https://doi.org/10.1/aaa)" in aaa
+    # All 5 plain-English criterion labels appear with their own reasoning.
+    assert "Factual Accuracy" in aaa and "Mostly supported." in aaa
+    assert "Practical Usefulness" in aaa
+    assert "Overstates one claim." in aaa  # the second judge's own reasoning
+    # Hallucination claim detail (not just a count).
+    assert "The drug cured all cats." in aaa
+    assert "Some cats improved." in aaa
+    # Cross-judge stats block appears (2 judges scored openai's summary).
+    assert "Cross-judge agreement" in aaa
+    # Both judges get their own subsection.
+    assert "### Judge: openai" in aaa
+    assert "### Judge: anthropic" in aaa
+    # The un-requested DOI produced no file.
+    assert not (out_dir / f"{doi_to_slug('10.3/ccc')}.md").exists()
+
+    # DOI with no manifest entry falls back to "Untitled -- {doi}".
+    bbb = (out_dir / f"{doi_to_slug('10.2/bbb')}.md").read_text(encoding="utf-8")
+    assert bbb.startswith("# Untitled -- 10.2/bbb")
+
+
+def test_write_dev_detail_eval_outputs_overwrites_in_place(tmp_path: Path) -> None:
+    """A re-judge writes one file per DOI keyed by slug (no timestamped dupes)."""
+    from evaluator import write_dev_detail_eval_outputs
+
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    evaluations_path.write_text(
+        json.dumps(_fake_eval_row("10.1/aaa", "openai", "openai")) + "\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "dev_detailEval_reports"
+    write_dev_detail_eval_outputs(
+        {"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path, manifest_index={},
+    )
+    write_dev_detail_eval_outputs(
+        {"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path, manifest_index={},
+    )
+    assert len(list(out_dir.glob("*.md"))) == 1

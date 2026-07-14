@@ -64,7 +64,7 @@ from models_config import compute_cost, get_model_spec  # noqa: E402
 from file_paths import doi_to_slug  # noqa: E402
 from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
-from eval_instances import EvaluationInstance, iter_evaluation_instances  # noqa: E402
+from eval_instances import EvaluationInstance, iter_evaluation_instances, load_manifest_index  # noqa: E402
 from eval_metrics import calculate_automatic_metrics  # noqa: E402
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
@@ -896,10 +896,54 @@ def append_evaluation(row: dict, path: Path | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Readable dev-eval mirror (data/dev_evals_jsonl/)
+# Readable dev-eval mirrors (data/dev_evals_jsonl/, data/dev_detailEval_reports/)
 # ---------------------------------------------------------------------------
 
-def _format_dev_eval_entry_as_text(doi: str, rows: list[dict]) -> str:
+# Plain-English display labels for the five MedHELM criteria, in report order.
+CRITERION_LABELS: dict[str, str] = {
+    "faithfulness": "Factual Accuracy",
+    "completeness": "Completeness",
+    "clinical_usefulness": "Practical Usefulness",
+    "clarity": "Clarity",
+    "safety": "Safety",
+}
+
+
+def _rows_by_doi_for(
+    dois: set[str], evaluations_path: Path | None = None,
+) -> dict[str, list[dict]]:
+    """Read data/evaluations.jsonl rows for the given DOIs, grouped by doi.
+
+    Shared read path for both readable mirrors below, so a re-judge's rows
+    are grouped identically regardless of which mirror is being written.
+    """
+    source = evaluations_path if evaluations_path is not None else EVALUATIONS_PATH
+    rows_by_doi: dict[str, list[dict]] = {}
+    for row in _iter_summaries(source):  # generic JSONL iterator, reused here
+        doi = str(row.get("doi", "")).strip()
+        if doi and doi in dois:
+            rows_by_doi.setdefault(doi, []).append(row)
+    return rows_by_doi
+
+
+def _lookup_title(doi: str, manifest_index: dict[str, dict] | None) -> str:
+    """Best-effort article title for ``doi`` from a manifest index.
+
+    ``manifest_index`` is normally ``eval_instances.load_manifest_index()``'s
+    output (keyed off the long-lived data/manifest.jsonl, not the prunable
+    data/summaries.jsonl snapshot). Collapses stray whitespace/newlines that
+    raw manifest titles sometimes carry, same reasoning as
+    ``eval_report._clean_text``.
+    """
+    if not doi or not manifest_index:
+        return ""
+    title = (manifest_index.get(doi) or {}).get("title")
+    return " ".join(str(title).split()) if title else ""
+
+
+def _format_dev_eval_entry_as_text(
+    doi: str, rows: list[dict], *, manifest_index: dict[str, dict] | None = None,
+) -> str:
     """Render one paper's judge rows into a plain-English report.
 
     The readable sibling of ``summarizer._format_dev_summary_entry_as_text``:
@@ -911,10 +955,12 @@ def _format_dev_eval_entry_as_text(doi: str, rows: list[dict]) -> str:
     strata = rows[0].get("strata") if rows and isinstance(rows[0].get("strata"), dict) else {}
     journal = str(strata.get("journal") or "Not recorded")
     input_source = str(strata.get("input_source") or rows[0].get("input_source") or "processed")
+    title = _lookup_title(doi, manifest_index)
 
     lines = [
         f"DOI: {doi or 'Not recorded'}",
         f"Journal: {journal}",
+        f"Title: {title or 'Not recorded'}",
         f"Input Source: {input_source}",
         "",
         "This file mirrors data/evaluations.jsonl for this DOI in a human-readable",
@@ -954,6 +1000,7 @@ def write_dev_eval_jsonl_outputs(
     *,
     output_dir: Path,
     evaluations_path: Path | None = None,
+    manifest_index: dict[str, dict] | None = None,
 ) -> int:
     """Render a readable ``.txt`` file per DOI into ``data/dev_evals_jsonl/``.
 
@@ -965,21 +1012,218 @@ def write_dev_eval_jsonl_outputs(
 
     One file per DOI, keyed by the DOI slug so a re-judge overwrites in place
     rather than accumulating timestamped duplicates. Returns the number of files
-    written.
+    written. ``manifest_index`` (doi -> manifest row, for the Title line) is
+    loaded from data/manifest.jsonl if not supplied.
     """
-    source = evaluations_path if evaluations_path is not None else EVALUATIONS_PATH
-    rows_by_doi: dict[str, list[dict]] = {}
-    for row in _iter_summaries(source):  # generic JSONL iterator, reused here
-        doi = str(row.get("doi", "")).strip()
-        if doi and doi in dois:
-            rows_by_doi.setdefault(doi, []).append(row)
+    if manifest_index is None:
+        manifest_index = load_manifest_index()
+
+    rows_by_doi = _rows_by_doi_for(dois, evaluations_path)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for doi, rows in rows_by_doi.items():
         out_path = output_dir / f"{doi_to_slug(doi)}.txt"
         tmp_path = out_path.with_suffix(".txt.tmp")
-        tmp_path.write_text(_format_dev_eval_entry_as_text(doi, rows), encoding="utf-8")
+        tmp_path.write_text(
+            _format_dev_eval_entry_as_text(doi, rows, manifest_index=manifest_index),
+            encoding="utf-8",
+        )
+        tmp_path.replace(out_path)
+        written += 1
+    return written
+
+
+def _format_dev_detail_eval_entry_as_markdown(
+    doi: str, rows: list[dict], *, manifest_index: dict[str, dict] | None = None,
+) -> str:
+    """Render one paper's judge rows into a detailed, skimmable Markdown report.
+
+    The deep-dive sibling of ``_format_dev_eval_entry_as_text``: shows every
+    judge's own per-criterion score AND reasoning (not just the aggregate),
+    automatic text metrics, and cross-judge agreement stats, for
+    ``data/dev_detailEval_reports/``. Visual style mirrors
+    ``eval_report._render_markdown_detail`` (title heading, DOI link, per-
+    criterion bullets, hallucination-claim phrasing), but shows every judge
+    individually instead of collapsing to one -- that per-judge view is
+    exactly what the corpus-level report defers to its separate reliability
+    section, and is the reason this sibling report exists.
+    """
+    record = (manifest_index or {}).get(doi) or {}
+    title = _lookup_title(doi, manifest_index)
+    heading = title if title else f"Untitled -- {doi or 'no DOI'}"
+
+    strata = rows[0].get("strata") if rows and isinstance(rows[0].get("strata"), dict) else {}
+    journal = strata.get("journal") or record.get("journal")
+    species = strata.get("species") or record.get("species")
+    species_str = ", ".join(species) if isinstance(species, list) else species
+    descriptors = [
+        str(d) for d in (
+            species_str,
+            strata.get("study_design") or record.get("study_design"),
+            strata.get("clinical_topic") or record.get("clinical_topic"),
+        ) if d
+    ]
+
+    lines = [
+        f"# {heading}",
+        "",
+        f"**DOI:** [{doi}](https://doi.org/{doi})" if doi else "**DOI:** unknown",
+    ]
+    if journal:
+        lines.append(f"**Journal:** {journal}")
+    if descriptors:
+        lines.append(f"**Species / Topic / Study design:** {' · '.join(descriptors)}")
+    lines.extend([
+        "",
+        "> **How to read this file:** each provider's summary is scored 1-5 on five "
+        "criteria -- **Factual Accuracy** (is it supported by the article?), "
+        "**Completeness** (does it cover the article's key points?), **Practical "
+        "Usefulness** (would a clinician find it useful?), **Clarity** (is it easy to "
+        "read?), and **Safety** (could it mislead a clinician?). \"Spread\" below is the "
+        "highest judge score minus the lowest for that item -- 0 means every judge "
+        "agreed exactly.",
+        "",
+    ])
+
+    summarizers = sorted({str(r.get("summarizer") or "?") for r in rows})
+    for summarizer in summarizers:
+        srows = [r for r in rows if str(r.get("summarizer") or "?") == summarizer]
+        lines.append(f"## {summarizer}")
+        lines.append("")
+
+        metrics = srows[0].get("automatic_metrics") or {}
+        if metrics:
+            section_coverage = metrics.get("section_coverage") or {}
+            lines.extend([
+                "**Automatic metrics** (computed once per summary; same for every judge)",
+                "",
+                "| Metric | Value |",
+                "|---|---|",
+                f"| Compression ratio | {metrics.get('compression_ratio', '-')} |",
+                f"| Extractive coverage | {metrics.get('extractive_coverage', '-')} |",
+                f"| Section coverage | {section_coverage.get('covered_count', '-')} of 6 "
+                f"({section_coverage.get('coverage_ratio', '-')}) |",
+                f"| ROUGE-1 / ROUGE-2 / ROUGE-L | {metrics.get('rouge_1', '-')} / "
+                f"{metrics.get('rouge_2', '-')} / {metrics.get('rouge_l', '-')} |",
+                "",
+            ])
+
+        agg = aggregate_jury_scores(srows)
+        lines.extend([
+            "**Cross-judge agreement** (this paper only; see `eval-report` for the "
+            "corpus-wide version)",
+            "",
+            "| | Mean | Spread | Judges |",
+            "|---|---|---|---|",
+            f"| Jury score (unweighted) | {agg.get('jury_score_unweighted_mean', '-')} | "
+            f"{agg.get('judge_disagreement_unweighted', '-')} | {agg.get('valid_judge_count', '-')} |",
+            f"| Jury score (weighted) | {agg.get('jury_score_weighted_mean', '-')} | "
+            f"{agg.get('judge_disagreement_weighted', '-')} | {agg.get('valid_judge_count', '-')} |",
+        ])
+        for criterion, label in CRITERION_LABELS.items():
+            values = [
+                r["criteria_scores"][criterion]["score"]
+                for r in srows
+                if isinstance(r.get("criteria_scores"), dict)
+                and isinstance(r["criteria_scores"].get(criterion), dict)
+                and isinstance(r["criteria_scores"][criterion].get("score"), (int, float))
+            ]
+            if len(values) < 2:
+                continue  # spread is meaningless with fewer than 2 judges
+            mean, spread = _mean_and_spread(values)
+            lines.append(f"| {label} | {mean} | {spread} | {len(values)} |")
+        lines.append("")
+
+        for row in sorted(srows, key=lambda r: str(r.get("judge") or "")):
+            judge = row.get("judge") or "?"
+            lines.append(f"### Judge: {judge}")
+            lines.append("")
+
+            criteria_scores = row.get("criteria_scores") or {}
+            lines.append("| Criterion | Score | Reasoning |")
+            lines.append("|---|---|---|")
+            for criterion, label in CRITERION_LABELS.items():
+                detail = criteria_scores.get(criterion)
+                if isinstance(detail, dict):
+                    reasoning = str(detail.get("reasoning") or "").strip() or "Not recorded"
+                    lines.append(f"| {label} | {detail.get('score', '-')}/5 | {reasoning} |")
+                else:
+                    lines.append(f"| {label} | - | Not recorded (legacy schema) |")
+            lines.append("")
+
+            overall_bits = [
+                f"weighted {row.get('jury_score_weighted', '-')}",
+                f"unweighted {row.get('jury_score_unweighted', '-')}",
+            ]
+            confidence = row.get("confidence_score")
+            if confidence is not None:
+                overall_bits.append(f"confidence {confidence}/5")
+            lines.append("**Overall score:** " + " / ".join(overall_bits))
+            if row.get("requires_human_review"):
+                lines.append("")
+                lines.append("**Flagged for human review.**")
+            lines.append("")
+
+            claims = [c for c in (row.get("hallucination_claims") or []) if isinstance(c, dict)]
+            if claims:
+                lines.append("**Hallucination claims:**")
+                for claim in claims:
+                    lines.append(
+                        f"- ({claim.get('severity', 'unknown')}) claimed "
+                        f"\"{claim.get('claim', '')}\" -- article only supports: "
+                        f"\"{claim.get('source_quote', '')}\""
+                    )
+            else:
+                lines.append("**Hallucination claims:** None")
+            lines.append("")
+
+            reasoning = str(row.get("reasoning") or "").strip() or "Not recorded"
+            lines.append(f"> {reasoning}")
+            lines.append("")
+
+    lines.extend([
+        "---",
+        "",
+        "> Corpus-wide significance tests (Wilcoxon/Friedman) and reliability "
+        "(Krippendorff's alpha) live in `eval-report`, `eval-report --publication`, "
+        "and `stats-engine` -- this file only covers this one paper. The full "
+        "candidate summary text is in `data/dev_summaries_jsonl/`.",
+    ])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_dev_detail_eval_outputs(
+    dois: set[str],
+    *,
+    output_dir: Path,
+    evaluations_path: Path | None = None,
+    manifest_index: dict[str, dict] | None = None,
+) -> int:
+    """Render a detailed Markdown file per DOI into ``data/dev_detailEval_reports/``.
+
+    The deep-dive sibling of ``write_dev_eval_jsonl_outputs``: same DOI-grouped
+    read of ``data/evaluations.jsonl`` (via ``_rows_by_doi_for``) and the same
+    atomic write-in-place-by-slug pattern, but renders every judge's full
+    per-criterion breakdown via ``_format_dev_detail_eval_entry_as_markdown``
+    instead of the aggregate-only plain-text mirror. Returns the number of
+    files written.
+    """
+    if manifest_index is None:
+        manifest_index = load_manifest_index()
+
+    rows_by_doi = _rows_by_doi_for(dois, evaluations_path)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for doi, rows in rows_by_doi.items():
+        out_path = output_dir / f"{doi_to_slug(doi)}.md"
+        tmp_path = out_path.with_suffix(".md.tmp")
+        tmp_path.write_text(
+            _format_dev_detail_eval_entry_as_markdown(doi, rows, manifest_index=manifest_index),
+            encoding="utf-8",
+        )
         tmp_path.replace(out_path)
         written += 1
     return written

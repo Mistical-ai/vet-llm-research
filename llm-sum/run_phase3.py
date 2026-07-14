@@ -90,6 +90,10 @@ DEV_SUMMARIES_JSONL_DIR = DATA_DIR / "dev_summaries_jsonl"
 # data/evaluations.jsonl stays the append-only source of truth; this is the
 # eyeball-it mirror. Distinct from data/dev_tests/ (summarize-all comparison).
 DEV_EVALS_JSONL_DIR = DATA_DIR / "dev_evals_jsonl"
+# Deep-dive sibling of DEV_EVALS_JSONL_DIR: same DOIs, but one Markdown file
+# per paper showing every judge's per-criterion scores/reasoning, automatic
+# metrics, and cross-judge agreement stats -- see write_dev_detail_eval_outputs.
+DEV_DETAIL_EVAL_REPORTS_DIR = DATA_DIR / "dev_detailEval_reports"
 SUMMARIZE_ALL_OUTPUT_SETS = ("auto", "regular", "dev-tests")
 EVAL_INPUT_MODES = ("jsonl", "auto", "dev", "regular", "dev-jsonl")
 
@@ -951,9 +955,13 @@ def _cmd_evaluate_from_dev_jsonl(
         confirm_real_judge,
         run_evaluation,
         write_dev_eval_jsonl_outputs,
+        write_dev_detail_eval_outputs,
     )
+    from eval_instances import load_manifest_index
     from utils import require_positive_budget_for_real_run
     import evaluator
+
+    manifest_index = load_manifest_index()
 
     source_dois = _read_dois_from_dev_folder(DEV_SUMMARIES_JSONL_DIR)
     print(f"[phase3:evaluate] input mode=dev-jsonl: reading dev summaries from "
@@ -1034,10 +1042,15 @@ def _cmd_evaluate_from_dev_jsonl(
                 judges=judges, resume=not args.no_resume, doi_filter=target_dois,
             )
             written = write_dev_eval_jsonl_outputs(
-                target_dois, output_dir=DEV_EVALS_JSONL_DIR,
+                target_dois, output_dir=DEV_EVALS_JSONL_DIR, manifest_index=manifest_index,
             )
             print(f"[phase3:evaluate] wrote {written} readable dev eval "
                   f"file(s) to {DEV_EVALS_JSONL_DIR}")
+            written_detail = write_dev_detail_eval_outputs(
+                target_dois, output_dir=DEV_DETAIL_EVAL_REPORTS_DIR, manifest_index=manifest_index,
+            )
+            print(f"[phase3:evaluate] wrote {written_detail} detailed dev eval "
+                  f"report(s) to {DEV_DETAIL_EVAL_REPORTS_DIR}")
             status = "completed" if counts.get("failed", 0) == 0 else "failed"
             result = 0 if status == "completed" else 1
         return result

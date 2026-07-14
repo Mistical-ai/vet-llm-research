@@ -4,12 +4,13 @@
 sample (one paper per journal) so you can eyeball quality before spending on the whole
 corpus. Everything is incremental: each run adds new papers and never re-does finished ones.
 
-The two folders this guide revolves around:
+The folders this guide revolves around:
 
 | Folder | Written by | Holds |
 | --- | --- | --- |
 | `data/dev_summaries_jsonl/` | `summarize --mode dev` | readable `.txt` of the summaries you made (one per paper) |
-| `data/dev_evals_jsonl/` | `evaluate --mode dev` | readable `.txt` of the judge scores (one per paper) |
+| `data/dev_evals_jsonl/` | `evaluate --mode dev` | readable `.txt` of the judge scores (one per paper) -- quick glance: aggregate score, hallucination count, judge reasoning |
+| `data/dev_detailEval_reports/` | `evaluate --mode dev` | readable `.md` deep-dive per paper -- title, every judge's own per-criterion score + reasoning, hallucination claim detail, automatic metrics, cross-judge agreement stats |
 
 > Don't confuse these with `data/dev_tests/` — that's the *separate* `summarize-all`
 > PDF-vs-processed-text comparison workflow, unrelated to this loop.
@@ -50,14 +51,23 @@ python llm-sum/run_phase3.py evaluate --mode dev
 Type `yes` at the safety prompt. This automatically reads the DOIs sitting in
 `data/dev_summaries_jsonl/`, finds their matching articles (reference text from `processedv2`,
 summaries from `summaries.jsonl`), runs the blind judge, appends rows to
-`data/evaluations.jsonl`, and writes one readable `.txt` per paper into a new
-`data/dev_evals_jsonl/` folder.
+`data/evaluations.jsonl`, and writes one readable file per paper into **both**
+`data/dev_evals_jsonl/` (quick-glance `.txt`) and `data/dev_detailEval_reports/`
+(deep-dive `.md`).
 
 ## Step 4 — Eyeball the scores
 
-Open the `.txt` files in `data/dev_evals_jsonl/`: each shows per-provider scores,
-hallucination counts, human-review flags, and the judge's reasoning. For an aggregate view,
-run the offline report:
+- `data/dev_evals_jsonl/*.txt` for a quick glance: per-provider aggregate scores,
+  hallucination counts, human-review flags, and the judge's overall reasoning.
+- `data/dev_detailEval_reports/*.md` when you want the full picture for one paper: the
+  article title (so you can match it back to the paper without decoding a DOI), every
+  judge's own score *and* reasoning for each of the five criteria (factual accuracy,
+  completeness, practical usefulness, clarity, safety), the individual hallucination
+  claims (not just a count), automatic text metrics, and how much the judges agreed with
+  each other on this paper. Open it in a Markdown preview -- headings and tables, not a
+  flat text dump.
+
+For an aggregate view across every judged paper, run the offline report:
 
 ```powershell
 python llm-sum/run_phase3.py eval-report --markdown
@@ -67,14 +77,17 @@ python llm-sum/run_phase3.py eval-report --markdown
 
 Just run Steps 1 and 3 again. `summarize --mode dev` skips papers already in
 `dev_summaries_jsonl/` and picks *new* ones; `evaluate --mode dev` skips papers already in
-`dev_evals_jsonl/` and judges only the new ones. Repeat until you've seen enough.
+`dev_evals_jsonl/` and judges only the new ones (and this always keeps
+`dev_detailEval_reports/` in sync with `dev_evals_jsonl/` -- same DOIs, written together).
+Repeat until you've seen enough.
 
 ## If you need to redo a paper
 
 - Re-summarize papers already done: `summarize --mode dev --no-skip-existing`.
 - Re-judge papers already done: `evaluate --mode dev --no-resume` (this re-spends on the
-  judge and rewrites the readable files).
-- Or simply delete the specific `.txt` file from the folder and re-run.
+  judge and rewrites both readable folders).
+- Or simply delete the specific file(s) from `dev_evals_jsonl/` and/or
+  `dev_detailEval_reports/` and re-run.
 
 ## Common gotchas
 

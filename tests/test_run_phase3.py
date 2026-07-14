@@ -60,6 +60,7 @@ def _wired_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Redirect every module-level path constant this wiring touches into tmp_path."""
     import evaluator
     import eval_report
+    import eval_instances
     import prepare_texts
     import run_phase3
 
@@ -73,6 +74,11 @@ def _wired_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
     monkeypatch.setattr(eval_report, "EVALUATIONS_PATH", evaluations_path)
     monkeypatch.setattr(run_phase3, "RUN_MANIFEST_DIR", tmp_path)
+    # write_dev_eval_jsonl_outputs/write_dev_detail_eval_outputs load the real
+    # manifest by default when no manifest_index is passed in; point that at
+    # tmp (nonexistent) paths too so tests never touch data/manifest.jsonl.
+    monkeypatch.setattr(eval_instances, "MANIFEST_PATH", tmp_path / "manifest.jsonl")
+    monkeypatch.setattr(eval_instances, "MANUAL_MANIFEST_PATH", tmp_path / "manual_manifest.jsonl")
 
     return {
         "summaries_path": summaries_path,
@@ -474,11 +480,13 @@ def test_read_dois_from_dev_folder_parses_headers(tmp_path: Path) -> None:
 
 
 def _wire_dev_jsonl(_wired_paths, monkeypatch, run_phase3):
-    """Point the two dev folders at tmp dirs; return (source_dir, evals_dir)."""
+    """Point the dev folders at tmp dirs; return (source_dir, evals_dir)."""
     source_dir = _wired_paths["manifest_dir"] / "dev_summaries_jsonl"
     evals_dir = _wired_paths["manifest_dir"] / "dev_evals_jsonl"
+    detail_dir = _wired_paths["manifest_dir"] / "dev_detailEval_reports"
     monkeypatch.setattr(run_phase3, "DEV_SUMMARIES_JSONL_DIR", source_dir)
     monkeypatch.setattr(run_phase3, "DEV_EVALS_JSONL_DIR", evals_dir)
+    monkeypatch.setattr(run_phase3, "DEV_DETAIL_EVAL_REPORTS_DIR", detail_dir)
     return source_dir, evals_dir
 
 
