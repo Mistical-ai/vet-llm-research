@@ -1,4 +1,4 @@
-# Chapter 6 — The Statistics Behind the Numbers
+# Chapter 7 — The Statistics Behind the Numbers
 
 **Who this chapter is for:** a technical beginner with **zero statistics
 background**. If you have ever seen a word like *Wilcoxon*, *p-value*,

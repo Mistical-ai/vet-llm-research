@@ -139,7 +139,7 @@ def test_scoresheet_csv_has_expected_columns_and_blank_scores() -> None:
 
 def test_render_reviewer_guide_markdown_returns_the_checked_in_doc() -> None:
     """render_reviewer_guide_markdown() should return the guide document
-    exactly as it's saved on disk (docs/booklet/07_human_validation_guide.md),
+    exactly as it's saved on disk (docs/booklet/08_human_validation_guide.md),
     unmodified.
     """
     content = render_reviewer_guide_markdown()

@@ -187,11 +187,11 @@ class JournalQuotaError(RuntimeError):
         )
 
 
-# The zero-jargon, standalone reviewer guide (docs/booklet chapter 7). This is
+# The zero-jargon, standalone reviewer guide (docs/booklet chapter 8). This is
 # the single source of truth for reviewer-facing instructions; export copies
 # it verbatim into every reviewer folder (see render_reviewer_guide_markdown)
 # so a reviewer handed only their humanN/ folder still gets the full guide.
-REVIEWER_GUIDE_PATH = REPO_ROOT / "docs" / "booklet" / "07_human_validation_guide.md"
+REVIEWER_GUIDE_PATH = REPO_ROOT / "docs" / "booklet" / "08_human_validation_guide.md"
 # The normalized ingest output. A derived snapshot (rewritten idempotently on
 # every ingest), NOT append-only like evaluations.jsonl — re-ingesting the same
 # filled sheets must reproduce the same file, never grow it.
@@ -1187,7 +1187,7 @@ def write_item_folders(
 
     Reviewers now read the real PDF — figures, tables, and references intact —
     rather than the stripped text the AI summarizer actually saw; see
-    ``docs/booklet/07_human_validation_guide.md`` §3 for why that's fair (and
+    ``docs/booklet/08_human_validation_guide.md`` §3 for why that's fair (and
     what a reviewer should do when a paper's key finding lives only in a
     graph/table). When ``raw_dir``/``lookup`` are omitted, or a DOI's PDF can't
     be resolved, the item folder falls back to ``article.md`` (the full cached

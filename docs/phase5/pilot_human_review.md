@@ -170,7 +170,7 @@ The AI summariser only ever saw the **extracted text** cached in
 tables, or reference list — `article.pdf` is now the primary artifact a
 reviewer reads, not a supplementary convenience, so this is a real methods
 tradeoff worth keeping in mind: a reviewer sees more than the AI did. The
-reviewer guide (`docs/booklet/07_human_validation_guide.md` §3) asks reviewers
+reviewer guide (`docs/booklet/08_human_validation_guide.md` §3) asks reviewers
 not to penalise a summary for missing a chart's purely visual detail (the AI
 never had the chance to see it), but to flag it normally if a paper's key
 finding lived only in a graph/table and the summary consequently got it wrong
@@ -213,5 +213,5 @@ and the pool-exhaustion backfill. All offline against mock fixtures.
 ## 7. Related reading
 
 - [human_validation.md](human_validation.md) — the **real** export/ingest/analysis loop this rehearses
-- [../booklet/07_human_validation_guide.md](../booklet/07_human_validation_guide.md) — the zero-jargon reviewer guide shipped in every folder
+- [../booklet/08_human_validation_guide.md](../booklet/08_human_validation_guide.md) — the zero-jargon reviewer guide shipped in every folder
 - [../phase3/medhelm_evaluation.md](../phase3/medhelm_evaluation.md) — the five-criterion jury rubric humans also score

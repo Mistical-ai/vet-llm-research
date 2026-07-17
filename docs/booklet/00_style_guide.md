@@ -1,8 +1,8 @@
 # Booklet Style Guide & Front Matter
 
 **Role of this file:** this is the one page every chapter-writing session
-reads *first*. It exists so that eight chapters, written independently across
-separate chat sessions, add up to one coherent booklet instead of eight
+reads *first*. It exists so that nine chapters, written independently across
+separate chat sessions, add up to one coherent booklet instead of nine
 documents stapled together. If you are about to write a chapter, read this
 whole file before touching source material.
 
@@ -13,17 +13,18 @@ whole file before touching source material.
 This booklet explains the veterinary-LLM research pipeline in this repository
 end to end — where the papers come from, how they become machine-readable
 text, how three AI systems summarize them, how a blind AI judge scores those
-summaries, how to read the results, the statistics behind every number, and
-how a human reviewer checks the AI judge's work.
+summaries, how to read the results, how every one of those records can be
+traced back to its source, the statistics behind every number, and how a
+human reviewer checks the AI judge's work.
 
 It is written for **two different audiences**, and every chapter should be
 clear about which one it's speaking to:
 
-- **Chapters 1-6** are for a **technical beginner** — someone comfortable
+- **Chapters 1-7** are for a **technical beginner** — someone comfortable
   running a command in a terminal and reading a config file, but who has
   never seen this specific pipeline before and has no assumed statistics
   background. Explain what things are, not just what to type.
-- **Chapter 7** is for a **non-technical veterinarian reviewer** — a domain
+- **Chapter 8** is for a **non-technical veterinarian reviewer** — a domain
   expert with zero coding background who has volunteered to score some
   AI-written summaries. It must never use code, file paths, JSONL, API, or
   pipeline jargon. It should work as a standalone printable handout.
@@ -54,8 +55,12 @@ prose unless you are explicitly explaining the legacy history.
 | **hallucination** | "error", "mistake" | A specific term: a claim in a summary not supported by the article text. Always define it this way on first use. |
 | **corpus** | "dataset", "collection" | The set of ~250 target papers this project builds and studies. |
 | **manifest** | — | `data/manifest.jsonl` — the catalogue of candidate/acquired papers, one JSON object per line. |
+| **run manifest** | — | `data/run_manifests/run_manifest_<run_id>.json` — a per-evaluation-run provenance receipt (code version, dataset hash, prompt hash, judges, settings). Shares the English word "manifest" with `data/manifest.jsonl` but is a completely different file — always disambiguate with "run" when both could be meant. Covered in chapter 6. |
+| **provenance** | "audit trail", "lineage" | The ability to prove where a piece of data came from and what produced it — which paper, code version, prompt, and model. Chapter 6's subject end to end. |
+| **slug** | — | A DOI with every `/`, `:`, and `.` replaced by `_`, making it filesystem- and API-safe (`doi_to_slug` in `src/file_paths.py`). Distinct from the human-readable "descriptive stem" filenames, which embed the slug as a suffix. |
+| **unblinding key** | "answer key" | `unblinding_key_human{N}.json` — the one file mapping a human reviewer's `item_id` values back to the real `(doi, summarizer)` pair. A sibling of, never inside, that reviewer's `humanN/` folder. |
 | **PHASE3_MODE** | "safety mode", "dry run flag" | The one env var controlling test/single/dev/batch safety behavior for Phase 3 commands. |
-| **ROUGE** | — | A secondary, word-overlap *recall* metric (ROUGE-1/2/L) for auditing, not the primary quality signal. Always spell out that the blind jury score remains primary. Introduced in chapter 6. |
+| **ROUGE** | — | A secondary, word-overlap *recall* metric (ROUGE-1/2/L) for auditing, not the primary quality signal. Always spell out that the blind jury score remains primary. Introduced in chapter 7. |
 | **cost-per-quality-point** | — | Cost to generate one summary ÷ its mean jury score (lower = better value). Reported in two flavors — real research-budget cost and a $20/month consumer-subscription cost — kept in separate columns; never conflate them. |
 
 If you introduce a new term not in this table, add a row for it when you tick
@@ -84,7 +89,7 @@ off your chapter's checklist entry, so later chapters stay consistent.
    *describe* what a command does and show *example* output, but must not
    instruct the reader to execute a paid command themselves without that
    caveat, and must never be run by an AI assistant automatically.
-5. **Chapter 7 is a dialect shift, not just a simpler chapter.** No jargon at
+5. **Chapter 8 is a dialect shift, not just a simpler chapter.** No jargon at
    all, warm and respectful tone, assume no other chapter was read.
 
 ---
@@ -99,9 +104,10 @@ off your chapter's checklist entry, so later chapters stay consistent.
 | 3 | `03_summarization.md` | Getting AI Summaries | How three LLM providers summarize each paper under identical conditions (Phase 3 summarize). |
 | 4 | `04_llm_judge.md` | The Blind AI Judge | How a blind judge scores summaries and the jury-score formula (Phase 3 evaluate). |
 | 5 | `05_reading_results.md` | Reading Your Results | What `eval-report` and the publication tables actually show. |
-| 6 | `06_statistics_explained.md` | The Statistics Behind the Numbers | Every formula (Wilcoxon, Friedman, bootstrap, Krippendorff's alpha, Cohen's Kappa, TF-IDF/cosine), taught from scratch. May be split into `06a_significance_testing.md` / `06b_reliability_and_information.md`. |
-| 7 | `07_human_validation_guide.md` | Human Validation Guide | Zero-jargon standalone handout for a veterinarian reviewer. |
-| 8 | `BOOKLET.md` | Final assembly | All chapters merged, consistency-checked, one voice. |
+| 6 | `06_data_provenance.md` | How Data Provenance Works | How every summary, score, and human review traces back to an exact paper, code version, prompt, and model — and how to use that trail to audit or reproduce a result. |
+| 7 | `07_statistics_explained.md` | The Statistics Behind the Numbers | Every formula (Wilcoxon, Friedman, bootstrap, Krippendorff's alpha, Cohen's Kappa, TF-IDF/cosine), taught from scratch. May be split into `07a_significance_testing.md` / `07b_reliability_and_information.md`. |
+| 8 | `08_human_validation_guide.md` | Human Validation Guide | Zero-jargon standalone handout for a veterinarian reviewer. |
+| 9 | `BOOKLET.md` | Final assembly | All chapters merged, consistency-checked, one voice. |
 
 ---
 
@@ -117,6 +123,7 @@ finishing any chapter.
 - [x] 3 — Getting AI Summaries (`03_summarization.md`)
 - [x] 4 — The Blind AI Judge (`04_llm_judge.md`)
 - [x] 5 — Reading Your Results (`05_reading_results.md`)
-- [x] 6 — The Statistics Behind the Numbers (`06_statistics_explained.md` — kept as a **single file**, not split; covers Wilcoxon, Friedman, Bonferroni/Holm/Benjamini-Hochberg, bootstrap CIs, Krippendorff's alpha, Cohen's Kappa, Pearson/Spearman/Bland-Altman, TF-IDF/cosine, ROUGE, and cost-per-quality-point, each with a worked example)
-- [x] 7 — Human Validation Guide (`07_human_validation_guide.md`)
-- [x] 8 — Final assembly (`BOOKLET.md`)
+- [x] 6 — How Data Provenance Works (`06_data_provenance.md` — the DOI as join key, manifest/raw_text/processed/summaries/evaluations/human_reviews lineage, run manifests, seeds, and worked audit-trail walkthroughs)
+- [x] 7 — The Statistics Behind the Numbers (`07_statistics_explained.md` — kept as a **single file**, not split; covers Wilcoxon, Friedman, Bonferroni/Holm/Benjamini-Hochberg, bootstrap CIs, Krippendorff's alpha, Cohen's Kappa, Pearson/Spearman/Bland-Altman, TF-IDF/cosine, ROUGE, and cost-per-quality-point, each with a worked example)
+- [x] 8 — Human Validation Guide (`08_human_validation_guide.md`)
+- [x] 9 — Final assembly (`BOOKLET.md`)

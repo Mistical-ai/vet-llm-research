@@ -89,9 +89,9 @@ This is why the project documentation calls the blind protocol
 number in the study defensible.
 
 **The human side of validation follows the identical rule.** When a
-veterinarian reviewer checks the judge's work (Chapter 7), they too see only
+veterinarian reviewer checks the judge's work (Chapter 8), they too see only
 one summary at a time, never several summaries of the same article side by
-side — for the same reason a comparison would bias the judge. Chapter 7
+side — for the same reason a comparison would bias the judge. Chapter 8
 explains why, in plain language, and what to do if the same article happens
 to come up more than once in a reviewer's packet.
 
@@ -201,7 +201,7 @@ just flag it, but *prove* it:
 Any **major** hallucination automatically sets a flag called
 `requires_human_review` to true. That flag is the project's tripwire for pulling
 a summary out for a human to double-check (this feeds the human-validation step
-covered in Chapter 7). It fires in three situations:
+covered in Chapter 8). It fires in three situations:
 
 1. The judge reports a **major** hallucination, **or**
 2. The judge's own **confidence is low** (a confidence rating below 3 out of 5 —
@@ -434,7 +434,7 @@ mode after a panel run never requires re-judging.
 > measure. For a proper, publishable measure of judge agreement — one that
 > corrects for the agreement you'd expect purely by chance, and copes with a
 > judge missing on some items — the project uses a statistic called
-> **Krippendorff's alpha**. That's a chapter of its own: **Chapter 6** teaches
+> **Krippendorff's alpha**. That's a chapter of its own: **Chapter 7** teaches
 > how it works and why it's the right tool. Here, just know that
 > `judge_disagreement` is the quick, intuitive companion to that deeper measure.
 
@@ -530,10 +530,11 @@ so re-running grows the sample. The step-by-step is in
 - Any **major** hallucination, low judge confidence, or an unreadable response
   flags the row for **human review**.
 - An optional **judge panel** (2–3 judges) adds a **disagreement** measure; the
-  quick version is the score spread, and Chapter 6 covers the rigorous version
+  quick version is the score spread, and Chapter 7 covers the rigorous version
   (Krippendorff's alpha).
 - Every run writes a **run manifest** — a hashed provenance receipt — so two
-  disagreeing runs can be diffed instead of guessed about.
+  disagreeing runs can be diffed instead of guessed about. Chapter 6 covers
+  run manifests, and every other provenance trail in this project, in depth.
 
 Next, **Chapter 5** takes these evaluation rows and shows you how to *read* them
 — what the reports and publication tables actually mean.

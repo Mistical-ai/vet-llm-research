@@ -9,7 +9,8 @@ closest relative to this one.
 to see your results, understand what each table and artifact is actually
 telling you, and be able to explain the two or three most important tables
 out loud without getting lost in the statistics. This chapter deliberately
-does **not** teach how the underlying math works — that's Chapter 6. Here,
+does **not** teach how the underlying math works (that's Chapter 7) or how
+to trace a number back to its exact source data (that's Chapter 6). Here,
 the goal is navigation: what am I looking at, and what does it mean?
 
 ---
@@ -117,7 +118,7 @@ provider's score breakdown, the judge's one-sentence reasoning for each
 criterion, and any hallucination claims with their quoted evidence. The
 detail file exists so you can manually open the real article and check
 whether the judge's verdict actually holds up — the same kind of check
-Chapter 7's human reviewer does, just self-directed.
+Chapter 8's human reviewer does, just self-directed.
 
 Add `--no-detail` to skip the (longer) per-article file if you only want
 the aggregate summary.
@@ -163,13 +164,13 @@ questions. Pairing is what makes "A beat B" a meaningful claim.
 
 The rest of this section walks through every table `--publication` produces,
 in plain terms — **not** how the statistics behind them work. That's
-Chapter 6; each subsection below points forward to it explicitly.
+Chapter 7; each subsection below points forward to it explicitly.
 
 #### Provider comparison
 
 One row per provider: mean jury score in **both** modes (unweighted and
 weighted), each with a **95% bootstrap confidence interval** (a range that
-likely contains the true average — Chapter 6 explains exactly what
+likely contains the true average — Chapter 7 explains exactly what
 "bootstrap" means and how the interval is built), mean cost, **cost-per-
 quality-point**, a **subscription cost-per-quality-point** (§4 below), and
 mean judge disagreement.
@@ -193,12 +194,12 @@ for the unweighted and the weighted score.
 Two things to know before you read a p-value here (a **p-value** is a
 number that roughly answers "if there were really no difference, how
 surprising would data like this be?" — smaller means more surprising, i.e.
-more evidence of a real difference; Chapter 6 teaches this from scratch):
+more evidence of a real difference; Chapter 7 teaches this from scratch):
 
 - **Use the `p (BH-adj)` column, not the raw p-value**, to call a pair
   "significant." Running several pairwise comparisons at once inflates the
   chance that *one* of them looks significant purely by luck; Benjamini-
-  Hochberg correction (Chapter 6) adjusts for that. The raw p is kept beside
+  Hochberg correction (Chapter 7) adjusts for that. The raw p is kept beside
   it for transparency only.
 - **`underpowered (n<10)`** means fewer than ten shared items stood behind
   that specific test. The p-value is still shown, but it's too unstable to
@@ -231,7 +232,7 @@ help or hurt its scores?
 
 A one-line summary of **Krippendorff's alpha** (a chance-corrected agreement
 score between judges — Chapter 4 introduces it as "the rigorous version of
-judge disagreement"; Chapter 6 teaches the actual math) — populated only
+judge disagreement"; Chapter 7 teaches the actual math) — populated only
 when a **jury** of two or more judges scored the same articles (the default).
 If `JUDGE_MODELS` is dialed down to a single judge, this reads "not available,"
 not zero.
@@ -240,7 +241,7 @@ not zero.
 
 Word count and **TF-IDF + cosine similarity** (a way of checking whether a
 summary's meaningful, specific vocabulary overlaps with the source
-abstract's — Chapter 6 has the full explanation) for every summary against
+abstract's — Chapter 7 has the full explanation) for every summary against
 its paper's own abstract. This re-runs a published 2023 benchmark (Appleby
 et al.) against this study's own three providers, banding each summary
 "high fidelity" (cosine ≥ 0.85), "moderate," or "lost key details"
@@ -251,7 +252,7 @@ et al.) against this study's own three providers, banding each summary
 One table per (provider × species / study design / journal) cell, joining
 three numbers that normally live in separate tables: **hallucination
 rate**, **mean quality**, and **Cohen's Kappa** (LLM judge vs. human
-reviewer agreement on that specific cell — see Chapter 6 for how Kappa
+reviewer agreement on that specific cell — see Chapter 7 for how Kappa
 differs from Krippendorff's alpha). This is the table that lets you ask a
 genuinely clinical question directly.
 
@@ -354,7 +355,9 @@ SVG copies.
 - **The leaderboard and four figures** repackage the same underlying
   numbers for a slide or results page rather than a methods section.
 - This chapter deliberately stayed at the "what does this table mean"
-  level. **Chapter 6** teaches every formula behind these numbers — p-values,
-  Wilcoxon, Friedman, Benjamini-Hochberg correction, bootstrap confidence
-  intervals, Krippendorff's alpha, Cohen's Kappa, and TF-IDF/cosine
-  similarity — from scratch, with worked examples.
+  level. **Chapter 6** shows you how to trace any of these rows back to the
+  exact paper, code version, prompt, and model that produced it. **Chapter 7**
+  teaches every formula behind these numbers — p-values, Wilcoxon, Friedman,
+  Benjamini-Hochberg correction, bootstrap confidence intervals,
+  Krippendorff's alpha, Cohen's Kappa, and TF-IDF/cosine similarity — from
+  scratch, with worked examples.

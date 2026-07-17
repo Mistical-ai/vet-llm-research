@@ -81,7 +81,7 @@ reasons:
    honestly — a spurious mismatch (or spurious match) driven by scoring mode,
    not by whether the jury is actually right.
 3. **It leaks comparative information even without naming a provider.** The
-   reviewer guide's core promise (`docs/booklet/07_human_validation_guide.md`,
+   reviewer guide's core promise (`docs/booklet/08_human_validation_guide.md`,
    §2) is that a score "reflects only what's on the page in front of you."
    Showing three summaries of the same article together lets a reviewer use
    relative cues ("this one's clearly the weakest of the three") instead of
@@ -420,7 +420,7 @@ data/human_review/
   unblinding_key_human2.json
   human1/
     REVIEWER_GUIDE.md            full zero-jargon guide (copied from
-                                  docs/booklet/07_human_validation_guide.md)
+                                  docs/booklet/08_human_validation_guide.md)
     packet.md                    navigation index: one row per item_id -> folder
     scoresheet_human1.xlsx       blank scoresheet (dropdowns, version-labeled rows)
     item_001/
@@ -448,7 +448,7 @@ have scored an otherwise-identical batch.
 
 ### `REVIEWER_GUIDE.md` — the full guide, shipped with every reviewer folder
 
-A verbatim copy of `docs/booklet/07_human_validation_guide.md`, written into
+A verbatim copy of `docs/booklet/08_human_validation_guide.md`, written into
 every `humanN/` folder so a reviewer handed only their own folder (e.g.
 zipped and emailed) still gets the complete, zero-jargon guide — what each
 scoresheet column means, a worked example row, why the process is blind, and
@@ -471,7 +471,7 @@ its own item folder.
 and references intact, exactly as it appeared in the journal — copied from
 `data/raw` (`write_item_folders()` in `human_review.py`). Reviewers now score
 against this real PDF rather than the stripped text the AI summarizer actually
-read; see `docs/booklet/07_human_validation_guide.md` §3 for the reviewer-facing
+read; see `docs/booklet/08_human_validation_guide.md` §3 for the reviewer-facing
 explanation of why that's fair, and what to do when a paper's key finding lives
 only in a graph/table the AI never saw. When no source PDF can be resolved for a
 DOI (moved, renamed, or never downloaded), the item folder falls back to
