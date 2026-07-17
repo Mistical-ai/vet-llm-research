@@ -6,8 +6,9 @@ Critical assertions:
     tokens (mirrors evaluator.py's blind judge prompt test).
     Sampler: rows flagged requires_human_review are prioritized; remaining
     slots are filled with a stratified, deterministic (seeded) sample.
-    Export: --reviewers N produces N independent blind copies of the SAME
-    sampled items; the un-blinding key is the only file carrying identity.
+    Export: each call writes one more humanN/ folder, exactly split across
+    the study's 5 journals; the per-reviewer un-blinding key is the only
+    file carrying identity.
     Rows whose source text can't be resolved are skipped, not fatal.
 
 IN PLAIN ENGLISH
@@ -42,6 +43,7 @@ from file_paths import doi_to_slug
 import human_review
 from human_review import (
     REVIEWER_GUIDE_PATH,
+    STUDY_JOURNALS,
     ReviewItem,
     SCORESHEET_FIELDS,
     build_unblinding_key,
@@ -410,33 +412,42 @@ def test_sampler_articles_mode_is_deterministic_for_a_fixed_seed() -> None:
 # it, and checking the folders/files it produces. "offline, mock corpus"
 # means no real data or network calls are involved, just made-up test data.
 
+# The real export always draws EXACTLY one article per one of the study's 5
+# journals per 5-article quota, so a fixture corpus for export_human_review
+# must cover all 5 -- this is that fixed DOI-per-journal mapping, reused by
+# every test below that needs a full 5-article (sample_size=5) draw.
+_FIXTURE_DOIS = [f"10.1111/test.{i}" for i in range(len(STUDY_JOURNALS))]
+
+
 def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     """Build a minimal evaluations.jsonl + summaries.jsonl/processed cache pair.
 
-    Two DOIs, one summarizer slot each, both successfully judged and joinable
-    back to real reference/candidate text via prepare_texts.PROCESSED_DIR
-    (patched here exactly as tests/test_eval_instances.py does).
+    One DOI per study journal (_FIXTURE_DOIS / STUDY_JOURNALS), one
+    summarizer slot each, all successfully judged and joinable back to real
+    reference/candidate text via prepare_texts.PROCESSED_DIR (patched here
+    exactly as tests/test_eval_instances.py does).
 
-    In plain English: this helper fakes an entire tiny "study" — two
-    articles, each already summarized (by "openai") and already judged —
+    In plain English: this helper fakes an entire tiny "study" — one article
+    per journal, each already summarized (by "openai") and already judged —
     and writes it to temporary files, so the tests below can run the real
-    export function against realistic-looking input without needing the
-    actual multi-gigabyte project data. ``tmp_path`` is pytest's built-in
-    "give me an empty scratch folder for this test" fixture.
+    export function (which always samples evenly across all 5 real study
+    journals) against realistic-looking input without needing the actual
+    multi-gigabyte project data. ``tmp_path`` is pytest's built-in "give me
+    an empty scratch folder for this test" fixture.
     """
     processed_dir = tmp_path / "processed"
     processed_dir.mkdir()
     monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
 
-    dois = ["10.1111/test.one", "10.1111/test.two"]
+    dois = _FIXTURE_DOIS
     summaries_path = tmp_path / "summaries.jsonl"
     evaluations_path = tmp_path / "evaluations.jsonl"
 
     with open(summaries_path, "w", encoding="utf-8") as f:
-        for doi in dois:
+        for doi, journal in zip(dois, STUDY_JOURNALS):
             f.write(json.dumps({
                 "doi": doi,
-                "journal": "JVIM",
+                "journal": journal,
                 "models": {"openai": {"status": "success", "summary": f"Summary of {doi}."}},
             }) + "\n")
 
@@ -448,7 +459,7 @@ def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
         )
 
     with open(evaluations_path, "w", encoding="utf-8") as f:
-        for i, doi in enumerate(dois):
+        for i, (doi, journal) in enumerate(zip(dois, STUDY_JOURNALS)):
             f.write(json.dumps({
                 "doi": doi,
                 "summarizer": "openai",
@@ -461,7 +472,7 @@ def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
                 "criteria_scores": {"faithfulness": {"score": 4, "reasoning": "ok"}},
                 "requires_human_review": i == 0,
                 "strata": {"species": ["Canine"], "study_design": "RCT", "clinical_topic": "Cardiology",
-                          "journal": "JVIM", "input_source": "processed"},
+                          "journal": journal, "input_source": "processed"},
                 "timestamp": "2026-01-01T00:00:00+00:00",
             }) + "\n")
 
@@ -469,42 +480,43 @@ def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
 
 
 def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatch) -> None:
-    """The big end-to-end check: export_human_review() with 2 reviewers over
-    the 2-article fixture corpus should produce 2 complete, correctly
-    structured reviewer folders (guide + packet + xlsx scoresheet + per-item
-    article/summary files), a matching unblinding key, and — critically —
-    none of it anywhere containing a forbidden AI-identity word.
+    """The big end-to-end check: two consecutive export_human_review() calls
+    (overlap_ratio=1.0, so human2 repeats human1's items) over the 5-journal
+    fixture corpus should each produce a complete, correctly structured
+    humanN/ folder (guide + packet + xlsx scoresheet + per-item
+    article/summary files), a matching sibling unblinding key, and —
+    critically — none of it anywhere containing a forbidden AI-identity word.
     """
     summaries_path, evaluations_path = _write_fixture_corpus(tmp_path, monkeypatch)
     output_dir = tmp_path / "human_review"
 
-    result = export_human_review(
-        reviewers=2,
-        sample_size=2,
-        seed=42,
-        evaluations_path=evaluations_path,
-        output_dir=output_dir,
+    kwargs = dict(
+        sample_size=len(STUDY_JOURNALS), overlap_ratio=1.0, seed=42,
+        evaluations_path=evaluations_path, output_dir=output_dir,
         summaries_path=summaries_path,
         summaries_txt_dir=tmp_path / "no_summaries_txt",
         dev_tests_summaries_txt_dir=tmp_path / "no_dev_summaries_txt",
     )
+    results = [export_human_review(**kwargs) for _ in range(2)]
 
-    assert result.items_exported == 2
-    assert result.skipped_rows == 0
-    assert len(result.reviewer_dirs) == 2
+    assert [r.human_number for r in results] == [1, 2]
+    for result in results:
+        assert result.items_exported == len(STUDY_JOURNALS)
+        assert result.skipped_rows == 0
 
     expected_guide = REVIEWER_GUIDE_PATH.read_text(encoding="utf-8")
-    for reviewer_id in (1, 2):
-        reviewer_dir = output_dir / f"reviewer_{reviewer_id}"
-        guide = (reviewer_dir / "REVIEWER_GUIDE.md").read_text(encoding="utf-8")
-        packet = (reviewer_dir / "packet.md").read_text(encoding="utf-8")
+    last_item_id = f"item_{len(STUDY_JOURNALS):03d}"
+    for human_number in (1, 2):
+        human_dir = output_dir / f"human{human_number}"
+        guide = (human_dir / "REVIEWER_GUIDE.md").read_text(encoding="utf-8")
+        packet = (human_dir / "packet.md").read_text(encoding="utf-8")
         # Scoresheet is now .xlsx (not .csv); the packet is a navigation index.
-        assert (reviewer_dir / f"scoresheet_reviewer_{reviewer_id}.xlsx").exists()
+        assert (human_dir / f"scoresheet_human{human_number}.xlsx").exists()
         assert guide == expected_guide
-        assert "item_001" in packet and "item_002" in packet
-        assert f"scoresheet_reviewer_{reviewer_id}.xlsx" in packet
+        assert "item_001" in packet and last_item_id in packet
+        assert f"scoresheet_human{human_number}.xlsx" in packet
         # Full article text + summaries live in per-item folders now.
-        item_dir = reviewer_dir / "item_001"
+        item_dir = human_dir / "item_001"
         article = (item_dir / "article.md").read_text(encoding="utf-8")
         summary = (item_dir / "summary.md").read_text(encoding="utf-8")
         assert "Full cleaned article text for" in article
@@ -512,20 +524,28 @@ def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatc
         for forbidden in BLIND_FORBIDDEN_TOKENS:
             assert forbidden not in blind_text
 
-    key = json.loads((output_dir / "unblinding_key.json").read_text(encoding="utf-8"))
-    assert set(key["items"]) == {"item_001", "item_002"}
-    assert {item["doi"] for item in key["items"].values()} == {"10.1111/test.one", "10.1111/test.two"}
-    assert all(item["summarizer"] == "openai" for item in key["items"].values())
+        key = json.loads(
+            (output_dir / f"unblinding_key_human{human_number}.json").read_text(encoding="utf-8")
+        )
+        assert set(key["items"]) == {f"item_{i:03d}" for i in range(1, len(STUDY_JOURNALS) + 1)}
+        assert {item["doi"] for item in key["items"].values()} == set(_FIXTURE_DOIS)
+        assert all(item["summarizer"] == "openai" for item in key["items"].values())
+
+    # overlap_ratio=1.0 -> human2 should carry every article human1 saw.
+    assert results[1].overlap_units == len(STUDY_JOURNALS)
 
 
-def _write_fixture_corpus_multi_provider(tmp_path: Path, monkeypatch, *, num_articles: int = 3) -> tuple[Path, Path]:
+def _write_fixture_corpus_multi_provider(
+    tmp_path: Path, monkeypatch, *, num_articles: int = len(STUDY_JOURNALS),
+) -> tuple[Path, Path]:
     """Like _write_fixture_corpus, but every article has all 3 providers
-    successfully summarized and evaluated -- used to test sample_unit="articles".
+    successfully summarized and evaluated -- used to test the exact
+    per-journal quota sampler with multiple providers per article.
 
-    In plain English: same idea as _write_fixture_corpus above, but each
-    fake article now has THREE AI summaries (openai, anthropic, gemini)
-    instead of just one, which is what's needed to meaningfully test the
-    "articles" sampling mode (one article, every provider's summary of it).
+    One article per study journal (cycling through STUDY_JOURNALS if
+    ``num_articles`` exceeds it), each with THREE AI summaries (openai,
+    anthropic, gemini) -- what's needed to meaningfully test "every
+    provider's summary of a sampled article is included".
     """
     processed_dir = tmp_path / "processed_multi"
     processed_dir.mkdir()
@@ -533,14 +553,15 @@ def _write_fixture_corpus_multi_provider(tmp_path: Path, monkeypatch, *, num_art
 
     providers = ("openai", "anthropic", "gemini")
     dois = [f"10.1111/test.multi{i}" for i in range(num_articles)]
+    journals = [STUDY_JOURNALS[i % len(STUDY_JOURNALS)] for i in range(num_articles)]
     summaries_path = tmp_path / "summaries_multi.jsonl"
     evaluations_path = tmp_path / "evaluations_multi.jsonl"
 
     with open(summaries_path, "w", encoding="utf-8") as f:
-        for doi in dois:
+        for doi, journal in zip(dois, journals):
             f.write(json.dumps({
                 "doi": doi,
-                "journal": "JVIM",
+                "journal": journal,
                 "models": {p: {"status": "success", "summary": f"Summary variant {i} of {doi}."}
                            for i, p in enumerate(providers)},
             }) + "\n")
@@ -553,7 +574,7 @@ def _write_fixture_corpus_multi_provider(tmp_path: Path, monkeypatch, *, num_art
         )
 
     with open(evaluations_path, "w", encoding="utf-8") as f:
-        for doi in dois:
+        for doi, journal in zip(dois, journals):
             for provider in providers:
                 f.write(json.dumps({
                     "doi": doi,
@@ -567,7 +588,7 @@ def _write_fixture_corpus_multi_provider(tmp_path: Path, monkeypatch, *, num_art
                     "criteria_scores": {"faithfulness": {"score": 4, "reasoning": "ok"}},
                     "requires_human_review": False,
                     "strata": {"species": ["Canine"], "study_design": "RCT", "clinical_topic": "Cardiology",
-                              "journal": "JVIM", "input_source": "processed"},
+                              "journal": journal, "input_source": "processed"},
                     "timestamp": "2026-01-01T00:00:00+00:00",
                 }) + "\n")
 
@@ -575,21 +596,19 @@ def _write_fixture_corpus_multi_provider(tmp_path: Path, monkeypatch, *, num_art
 
 
 def test_export_human_review_articles_mode_reads_each_article_once(tmp_path: Path, monkeypatch) -> None:
-    """sample_unit="articles" with sample_size=2 should read only 2 articles
-    but export all 3 providers' summaries of each (6 items total).
+    """sample_size=5 (1 article/journal) should read exactly 5 articles but
+    export all 3 providers' summaries of each (15 items total).
 
-    In plain English: this is the full export pipeline test for "articles"
-    mode, checking that the resulting unblinding key really does show 2
-    distinct articles, each paired with all 3 providers, and that the
-    written packet still passes the blind check.
+    In plain English: this is the full export pipeline test for the exact
+    per-journal quota, checking that the resulting unblinding key really
+    does show 5 distinct articles (one per journal), each paired with all 3
+    providers, and that the written packet still passes the blind check.
     """
-    summaries_path, evaluations_path = _write_fixture_corpus_multi_provider(tmp_path, monkeypatch, num_articles=3)
+    summaries_path, evaluations_path = _write_fixture_corpus_multi_provider(tmp_path, monkeypatch)
     output_dir = tmp_path / "human_review_articles"
 
     result = export_human_review(
-        reviewers=1,
-        sample_size=2,
-        sample_unit="articles",
+        sample_size=len(STUDY_JOURNALS),
         seed=42,
         evaluations_path=evaluations_path,
         output_dir=output_dir,
@@ -598,18 +617,20 @@ def test_export_human_review_articles_mode_reads_each_article_once(tmp_path: Pat
         dev_tests_summaries_txt_dir=tmp_path / "no_dev_summaries_txt",
     )
 
-    assert result.items_exported == 6  # 2 articles x 3 providers
+    assert result.items_exported == len(STUDY_JOURNALS) * 3  # N articles x 3 providers
 
-    key = json.loads((output_dir / "unblinding_key.json").read_text(encoding="utf-8"))
+    key = json.loads(
+        (output_dir / f"unblinding_key_human{result.human_number}.json").read_text(encoding="utf-8")
+    )
     dois = {item["doi"] for item in key["items"].values()}
-    assert len(dois) == 2
+    assert len(dois) == len(STUDY_JOURNALS)
     for doi in dois:
         summarizers = {item["summarizer"] for item in key["items"].values() if item["doi"] == doi}
         assert summarizers == {"openai", "anthropic", "gemini"}
 
-    reviewer_dir = output_dir / "reviewer_1"
-    assert (reviewer_dir / "REVIEWER_GUIDE.md").exists()
-    packet = (reviewer_dir / "packet.md").read_text(encoding="utf-8")
+    human_dir = output_dir / f"human{result.human_number}"
+    assert (human_dir / "REVIEWER_GUIDE.md").exists()
+    packet = (human_dir / "packet.md").read_text(encoding="utf-8")
     for forbidden in BLIND_FORBIDDEN_TOKENS:
         assert forbidden not in packet.lower()
 
@@ -625,7 +646,11 @@ def test_export_human_review_skips_rows_missing_source_text(tmp_path: Path, monk
     """
     summaries_path, evaluations_path = _write_fixture_corpus(tmp_path, monkeypatch)
 
-    # Add a third evaluation row for a DOI that has no matching summaries.jsonl entry.
+    # Add an extra evaluation row for a DOI with no matching summaries.jsonl
+    # entry, in the SAME journal as one of the 5 real fixture articles
+    # (STUDY_JOURNALS[0]) and flagged requires_human_review=True so the
+    # flagged-first selection deterministically picks it over that journal's
+    # real (resolvable) article for the 1/journal quota.
     with open(evaluations_path, "a", encoding="utf-8") as f:
         f.write(json.dumps({
             "doi": "10.1111/test.orphan",
@@ -635,13 +660,12 @@ def test_export_human_review_skips_rows_missing_source_text(tmp_path: Path, monk
             "rubric_version": "vet_medhelm_score_v1.0",
             "jury_score": 3.0,
             "requires_human_review": True,
-            "strata": {"journal": "JVIM", "input_source": "processed"},
+            "strata": {"journal": STUDY_JOURNALS[0], "input_source": "processed"},
             "timestamp": "2026-01-01T00:00:00+00:00",
         }) + "\n")
 
     result = export_human_review(
-        reviewers=1,
-        sample_size=3,
+        sample_size=len(STUDY_JOURNALS),
         seed=42,
         evaluations_path=evaluations_path,
         output_dir=tmp_path / "human_review",
@@ -650,20 +674,26 @@ def test_export_human_review_skips_rows_missing_source_text(tmp_path: Path, monk
         dev_tests_summaries_txt_dir=tmp_path / "no_dev_summaries_txt",
     )
 
-    assert result.items_exported == 2
+    # The orphan's journal now has 2 candidates (real + orphan); the other 4
+    # journals have exactly 1 each -> 5 articles selected total, but only 4
+    # resolve to real source text (the orphan is skipped, not fatal).
+    assert result.items_exported == len(STUDY_JOURNALS) - 1
     assert result.skipped_rows == 1
 
 
-def test_export_human_review_rejects_nonpositive_reviewers_or_sample_size(tmp_path: Path) -> None:
-    """Zero (or fewer) reviewers, or a zero sample size, should be rejected
-    immediately with a ValueError rather than silently producing an empty
-    or broken export.
+def test_export_human_review_rejects_nonpositive_or_uneven_sample_size(tmp_path: Path) -> None:
+    """A zero/negative sample size, or one that doesn't divide evenly across
+    the 5 study journals, should be rejected immediately with a ValueError
+    rather than silently producing an empty or unevenly-sampled export.
     """
     import pytest
     with pytest.raises(ValueError):
-        export_human_review(reviewers=0, evaluations_path=tmp_path / "evaluations.jsonl")
-    with pytest.raises(ValueError):
         export_human_review(sample_size=0, evaluations_path=tmp_path / "evaluations.jsonl")
+    with pytest.raises(ValueError):
+        export_human_review(sample_size=-1, evaluations_path=tmp_path / "evaluations.jsonl")
+    with pytest.raises(ValueError):
+        # 7 is not a multiple of len(STUDY_JOURNALS) == 5.
+        export_human_review(sample_size=7, evaluations_path=tmp_path / "evaluations.jsonl")
 
 
 def test_cli_main_reports_failure_when_nothing_to_export(tmp_path: Path) -> None:
@@ -733,8 +763,7 @@ def test_ingest_reads_filled_xlsx_scoresheet(tmp_path: Path, monkeypatch) -> Non
     summaries_path, evaluations_path = _write_fixture_corpus(tmp_path, monkeypatch)
     output_dir = tmp_path / "human_review"
     export_human_review(
-        reviewers=1,
-        sample_size=2,
+        sample_size=len(STUDY_JOURNALS),
         seed=42,
         evaluations_path=evaluations_path,
         output_dir=output_dir,
@@ -743,7 +772,7 @@ def test_ingest_reads_filled_xlsx_scoresheet(tmp_path: Path, monkeypatch) -> Non
         dev_tests_summaries_txt_dir=tmp_path / "no_dev_summaries_txt",
     )
 
-    sheet = output_dir / "reviewer_1" / "scoresheet_reviewer_1.xlsx"
+    sheet = output_dir / "human1" / "scoresheet_human1.xlsx"
     assert sheet.exists()
 
     col = {f: SCORESHEET_FIELDS.index(f) + 1 for f in SCORESHEET_FIELDS}
@@ -763,7 +792,7 @@ def test_ingest_reads_filled_xlsx_scoresheet(tmp_path: Path, monkeypatch) -> Non
     rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line]
     assert len(rows) == 1
     assert rows[0]["item_id"] == "item_001"
-    assert rows[0]["reviewer_id"] == "reviewer_1"
+    assert rows[0]["reviewer_id"] == "human1"
     assert rows[0]["criteria_scores"]["faithfulness"] == 4.0
     assert rows[0]["hallucination_present"] is False
     assert rows[0]["comment"] == "reads well"

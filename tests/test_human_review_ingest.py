@@ -82,13 +82,19 @@ _KEY_ITEMS = {
 }
 
 
-def _write_key(review_dir: Path) -> None:
-    """Save _KEY_ITEMS to disk as unblinding_key.json, exactly like a real
-    export would, so ingest_human_reviews() can find and load it.
+def _write_key(review_dir: Path, human_number: int = 1) -> None:
+    """Save _KEY_ITEMS to disk as unblinding_key_human{N}.json, exactly like
+    a real export would, so ingest_human_reviews() can find and load it.
+
+    Each ``humanN`` reviewer gets its OWN key file (per the real per-reviewer
+    lookup ingest now uses); tests that need several reviewers scoring the
+    SAME fake items call this once per reviewer number, each time with the
+    identical ``_KEY_ITEMS`` content, so every reviewer's ``item_001`` etc.
+    resolves to the same (doi, summarizer) identity.
     """
     review_dir.mkdir(parents=True, exist_ok=True)
-    (review_dir / "unblinding_key.json").write_text(
-        json.dumps({"reviewer_count": 2, "seed": 42, "items": _KEY_ITEMS}, indent=2),
+    (review_dir / f"unblinding_key_human{human_number}.json").write_text(
+        json.dumps({"human_number": human_number, "seed": 42, "items": _KEY_ITEMS}, indent=2),
         encoding="utf-8",
     )
 
@@ -101,9 +107,9 @@ def _write_scoresheet(review_dir: Path, reviewer_id: int, rows_by_item: dict[str
     — any column not mentioned is left blank, matching a partially-filled
     real sheet.
     """
-    reviewer_dir = review_dir / f"reviewer_{reviewer_id}"
+    reviewer_dir = review_dir / f"human{reviewer_id}"
     reviewer_dir.mkdir(parents=True, exist_ok=True)
-    path = reviewer_dir / f"scoresheet_reviewer_{reviewer_id}.csv"
+    path = reviewer_dir / f"scoresheet_human{reviewer_id}.csv"
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=SCORESHEET_FIELDS)
         writer.writeheader()
@@ -124,15 +130,16 @@ def _uniform(score: int, **extra) -> dict:
 def _full_export(tmp_path: Path, *, reviewers: int = 2) -> Path:
     """Two reviewers who both rank the items 4, 3, 5 (perfectly tracking the jury).
 
-    In plain English: builds a complete, ready-to-ingest export folder — the
-    key plus one (or more) reviewers' scoresheets, all scoring the three
-    fake items exactly the same as the AI jury did. This "perfect agreement"
+    In plain English: builds a complete, ready-to-ingest export folder — one
+    key plus one scoresheet PER reviewer (humanN/scoresheet_humanN.csv +
+    its sibling unblinding_key_human{N}.json), all scoring the three fake
+    items exactly the same as the AI jury did. This "perfect agreement"
     setup is the baseline several tests below start from.
     """
     review_dir = tmp_path / "human_review"
-    _write_key(review_dir)
     scores = {"item_001": _uniform(4), "item_002": _uniform(3), "item_003": _uniform(5)}
     for reviewer_id in range(1, reviewers + 1):
+        _write_key(review_dir, reviewer_id)
         _write_scoresheet(review_dir, reviewer_id, scores)
     return review_dir
 
@@ -156,7 +163,7 @@ def test_ingest_writes_unblinded_normalized_rows(tmp_path: Path) -> None:
     result = ingest_human_reviews(review_dir=review_dir, output_path=output)
 
     assert result.rows_written == 3
-    assert result.reviewers == ["reviewer_1"]
+    assert result.reviewers == ["human1"]
     rows = list(iter_human_review_rows(output))
     assert len(rows) == 3
     by_item = {r["item_id"]: r for r in rows}
@@ -195,7 +202,7 @@ def test_ingest_skips_blank_invalid_and_unknown_rows(tmp_path: Path) -> None:
     messages were actually produced.
     """
     review_dir = tmp_path / "human_review"
-    _write_key(review_dir)
+    _write_key(review_dir, 1)
     _write_scoresheet(review_dir, 1, {
         "item_001": _uniform(4),                       # good
         "item_002": {c: "" for c in CRITERIA},         # blank -> skipped
@@ -216,14 +223,46 @@ def test_ingest_skips_blank_invalid_and_unknown_rows(tmp_path: Path) -> None:
 
 
 def test_ingest_missing_key_raises(tmp_path: Path) -> None:
-    """Trying to ingest a folder with no unblinding_key.json at all should
-    fail clearly (FileNotFoundError) rather than silently producing an
-    empty or wrong result.
+    """Trying to ingest a folder with no unblinding_key_human*.json at all
+    should fail clearly (FileNotFoundError) rather than silently producing
+    an empty or wrong result.
     """
     empty_dir = tmp_path / "human_review"
     empty_dir.mkdir()
     with pytest.raises(FileNotFoundError):
         ingest_human_reviews(review_dir=empty_dir, output_path=tmp_path / "out.jsonl")
+
+
+def test_ingest_attributes_item_ids_per_reviewer_not_globally(tmp_path: Path) -> None:
+    """Regression: human1's item_001 and human2's item_001 identify
+    DIFFERENT (doi, summarizer) pairs (every humanN key restarts numbering
+    at item_001) -- ingest must look each scoresheet's rows up against its
+    OWN reviewer's key, never a single globally-merged {item_id: identity}
+    table, or one reviewer's scores would get silently misattributed to the
+    other reviewer's identity.
+    """
+    review_dir = tmp_path / "human_review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    key_human1 = {"item_001": _identity("10.1/human1-a", "openai", unweighted=4.0, faithfulness=4)}
+    key_human2 = {"item_001": _identity("10.1/human2-a", "anthropic", unweighted=2.0, faithfulness=2)}
+    (review_dir / "unblinding_key_human1.json").write_text(
+        json.dumps({"human_number": 1, "items": key_human1}), encoding="utf-8",
+    )
+    (review_dir / "unblinding_key_human2.json").write_text(
+        json.dumps({"human_number": 2, "items": key_human2}), encoding="utf-8",
+    )
+    _write_scoresheet(review_dir, 1, {"item_001": _uniform(5)})
+    _write_scoresheet(review_dir, 2, {"item_001": _uniform(1)})
+
+    output = tmp_path / "human_reviews.jsonl"
+    result = ingest_human_reviews(review_dir=review_dir, output_path=output)
+
+    assert result.rows_written == 2
+    rows = {(r["reviewer_id"], r["item_id"]): r for r in iter_human_review_rows(output)}
+    assert rows[("human1", "item_001")]["doi"] == "10.1/human1-a"
+    assert rows[("human1", "item_001")]["summarizer"] == "openai"
+    assert rows[("human2", "item_001")]["doi"] == "10.1/human2-a"
+    assert rows[("human2", "item_001")]["summarizer"] == "anthropic"
 
 
 def test_ingest_main_returns_error_without_key(tmp_path: Path) -> None:
@@ -264,7 +303,7 @@ def test_analyze_single_reviewer_has_correlation_but_no_agreement(tmp_path: Path
     assert analysis["inter_reviewer_agreement"]["available"] is False
     # Default mode is per_reviewer: correlation lives under by_reviewer, not
     # a single pooled block. Humans ranked 4,3,5; jury's overalls are 4,3,5.
-    overall = analysis["by_reviewer"]["reviewer_1"]["overall"]
+    overall = analysis["by_reviewer"]["human1"]["overall"]
     assert overall["n"] == 3
     assert overall["spearman"] == 1.0
     # Cohen's Kappa + percent agreement are categorical companions to Spearman:
@@ -293,7 +332,7 @@ def test_analyze_two_reviewers_reports_inter_reviewer_alpha(tmp_path: Path) -> N
     # Both reviewers gave identical scores -> perfect inter-reviewer agreement.
     assert agreement["overall"]["krippendorff_alpha"] == 1.0
     # Per-reviewer default: each reviewer has its own criterion breakdown.
-    assert set(analysis["by_reviewer"]["reviewer_1"]["per_criterion"]) == set(CRITERIA)
+    assert set(analysis["by_reviewer"]["human1"]["per_criterion"]) == set(CRITERIA)
 
 
 def test_analyze_empty_is_unavailable() -> None:
@@ -326,7 +365,8 @@ def _write_disagreeing_two_reviewers(tmp_path: Path) -> Path:
     them separate while "pooled" mode blends them together.
     """
     review_dir = tmp_path / "human_review"
-    _write_key(review_dir)
+    _write_key(review_dir, 1)
+    _write_key(review_dir, 2)
     _write_scoresheet(review_dir, 1, {"item_001": _uniform(4), "item_002": _uniform(3),
                                       "item_003": _uniform(5)})
     _write_scoresheet(review_dir, 2, {"item_001": _uniform(2), "item_002": _uniform(5),
@@ -346,8 +386,8 @@ def test_per_reviewer_mode_isolates_each_reviewer(tmp_path: Path) -> None:
     analysis = analyze_human_reviews(iter_human_review_rows(output), mode="per_reviewer")
 
     assert analysis["human_vs_jury"] is None                 # no pooled block in this mode
-    r1 = analysis["by_reviewer"]["reviewer_1"]["overall"]
-    r2 = analysis["by_reviewer"]["reviewer_2"]["overall"]
+    r1 = analysis["by_reviewer"]["human1"]["overall"]
+    r2 = analysis["by_reviewer"]["human2"]["overall"]
     assert r1["spearman"] == 1.0                              # tracks jury
     assert r2["spearman"] == -1.0                             # inverts jury, undiluted
 
@@ -379,7 +419,7 @@ def test_both_mode_reports_pooled_and_per_reviewer(tmp_path: Path) -> None:
     analysis = analyze_human_reviews(iter_human_review_rows(output), mode="both")
 
     assert analysis["human_vs_jury"] is not None
-    assert set(analysis["by_reviewer"]) == {"reviewer_1", "reviewer_2"}
+    assert set(analysis["by_reviewer"]) == {"human1", "human2"}
 
 
 def test_invalid_mode_falls_back_to_default(tmp_path: Path) -> None:
@@ -555,7 +595,7 @@ def test_analyze_reports_both_jury_modes(tmp_path: Path) -> None:
     ingest_human_reviews(review_dir=review_dir, output_path=output)
 
     # Default per_reviewer mode: read the single reviewer's block.
-    hv = analyze_human_reviews(iter_human_review_rows(output))["by_reviewer"]["reviewer_1"]
+    hv = analyze_human_reviews(iter_human_review_rows(output))["by_reviewer"]["human1"]
 
     assert "overall" in hv and "overall_weighted" in hv
     # All-4/3/5 uniform rows -> weighted and unweighted composites both track the

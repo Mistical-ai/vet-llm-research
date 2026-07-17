@@ -1151,6 +1151,78 @@ def test_evaluate_marks_manifest_failed_on_exception(_wired_paths, monkeypatch: 
 
 
 # ---------------------------------------------------------------------------
+# export-human-review CLI wiring
+# ---------------------------------------------------------------------------
+# In plain English: checks only the WIRING for the real export subcommand --
+# that it exposes --sample-size/--overlap-ratio/--seed (no --reviewers, no
+# --sample-unit; each run now writes ONE MORE humanN/ folder) and forwards
+# them unchanged to human_review.main() -- not the export logic itself,
+# which tests/test_human_review.py already covers in full.
+
+def test_export_human_review_parser_accepts_flags() -> None:
+    """The subcommand parses its flags and dispatches to the right handler."""
+    import run_phase3
+
+    parser = run_phase3.build_parser()
+    args = parser.parse_args([
+        "export-human-review", "--mode", "test",
+        "--sample-size", "10", "--overlap-ratio", "0.4", "--seed", "7",
+    ])
+    assert args.func is run_phase3.cmd_export_human_review
+    assert args.sample_size == 10
+    assert args.overlap_ratio == 0.4
+    assert args.seed == 7
+
+
+def test_cmd_export_human_review_forwards_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """cmd_export_human_review forwards every set flag to human_review.main."""
+    import run_phase3
+
+    captured: dict = {}
+
+    def _fake_main(argv):
+        captured["argv"] = argv
+        return 0
+
+    import human_review
+    monkeypatch.setattr(human_review, "main", _fake_main)
+
+    parser = run_phase3.build_parser()
+    args = parser.parse_args([
+        "export-human-review", "--mode", "test",
+        "--sample-size", "10", "--overlap-ratio", "0.4", "--seed", "7",
+    ])
+    result = args.func(args)
+
+    assert result == 0
+    assert captured["argv"] == [
+        "--sample-size", "10", "--overlap-ratio", "0.4", "--seed", "7",
+    ]
+
+
+def test_cmd_export_human_review_omits_unset_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flags left unset on the CLI are not forwarded, so human_review's own
+    .env/default fallback chain (see its --help) still applies."""
+    import run_phase3
+
+    captured: dict = {}
+
+    def _fake_main(argv):
+        captured["argv"] = argv
+        return 0
+
+    import human_review
+    monkeypatch.setattr(human_review, "main", _fake_main)
+
+    parser = run_phase3.build_parser()
+    args = parser.parse_args(["export-human-review", "--mode", "test"])
+    result = args.func(args)
+
+    assert result == 0
+    assert captured["argv"] == []
+
+
+# ---------------------------------------------------------------------------
 # export-pilot-human-review CLI wiring
 # ---------------------------------------------------------------------------
 # In plain English: pilot_human_review.py works as a standalone script, but
@@ -1168,13 +1240,11 @@ def test_export_pilot_human_review_parser_accepts_flags() -> None:
     parser = run_phase3.build_parser()
     args = parser.parse_args([
         "export-pilot-human-review", "--mode", "test",
-        "--sample-size", "5", "--overlap-ratio", "0.4",
-        "--sample-unit", "items", "--seed", "7",
+        "--sample-size", "5", "--overlap-ratio", "0.4", "--seed", "7",
     ])
     assert args.func is run_phase3.cmd_export_pilot_human_review
     assert args.sample_size == 5
     assert args.overlap_ratio == 0.4
-    assert args.sample_unit == "items"
     assert args.seed == 7
 
 
@@ -1194,15 +1264,13 @@ def test_cmd_export_pilot_human_review_forwards_flags(monkeypatch: pytest.Monkey
     parser = run_phase3.build_parser()
     args = parser.parse_args([
         "export-pilot-human-review", "--mode", "test",
-        "--sample-size", "5", "--overlap-ratio", "0.4",
-        "--sample-unit", "items", "--seed", "7",
+        "--sample-size", "5", "--overlap-ratio", "0.4", "--seed", "7",
     ])
     result = args.func(args)
 
     assert result == 0
     assert captured["argv"] == [
-        "--sample-size", "5", "--overlap-ratio", "0.4",
-        "--sample-unit", "items", "--seed", "7",
+        "--sample-size", "5", "--overlap-ratio", "0.4", "--seed", "7",
     ]
 
 

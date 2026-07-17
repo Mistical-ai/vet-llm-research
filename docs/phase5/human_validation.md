@@ -9,11 +9,14 @@ a replacement for it. See
 [medhelm_evaluation.md](../phase3/medhelm_evaluation.md) for the jury rubric
 this validates.
 
-The workflow is three commands:
+The workflow is three commands. `export-human-review` writes ONE MORE
+`humanN/` reviewer folder each time it's run (`human1/`, then `human2/`, ...,
+never touching an earlier one) — sampled EXACTLY evenly across the study's 5
+journals — so reviewers can be recruited and onboarded one at a time:
 
 ```text
-export-human-review   →   (reviewers fill CSVs)   →   ingest-human-review   →   eval-report
-   data/human_review/                                 data/human_reviews.jsonl    Human Validation section
+export-human-review   →   (a reviewer fills their humanN/.xlsx)   →   ingest-human-review   →   eval-report
+   data/human_review/humanN/                                          data/human_reviews.jsonl    Human Validation section
 ```
 
 If you only read one section, read the next one — it explains *why* every
@@ -86,8 +89,9 @@ reasons:
    than a model name, but a leak of the same kind the blind protocol exists
    to close.
 4. **The pipeline's data model is 1 item = 1 score set = 1 jury score to
-   correlate against.** `_row_key()`, `unblinding_key.json`,
-   `_normalize_scoresheet_row()`, and `_human_vs_jury()`'s per-`item_id`
+   correlate against.** `_row_key()`, the per-reviewer
+   `unblinding_key_human{N}.json` files, `_normalize_scoresheet_row()`, and
+   `_human_vs_jury()`'s per-`item_id`
    pairing all assume exactly this shape. A side-by-side design would need a
    reshaped scoresheet, sampler, and correlation model to answer a genuinely
    different research question — **relative preference/ranking** among
@@ -102,20 +106,20 @@ Independent scoring (above) doesn't require independent *articles*. Reading
 15 different articles to produce 15 scored items is far more reading burden
 on a volunteer reviewer than reading 5 articles and independently scoring
 all 3 providers' summaries of each — 15 scored items either way, but only 5
-articles actually read. `sample_rows_for_review(..., sample_unit="articles")`
-supports exactly this, and it is standard practice in human evaluation of
-NLG systems: reusing one source document across several independently-rated
-system outputs is how most human-evaluation protocols for summarization and
-translation work (e.g. WMT- and SummEval-style studies routinely have one
-annotator rate multiple systems' outputs against the same shared source).
-What those protocols avoid — and what this project avoids too — is
-*simultaneous, comparative* presentation of those outputs, not *reuse* of
-the source text. The distinction matters:
+articles actually read. The export always samples this way — one distinct
+article per count, every provider's summary of it included — and it is
+standard practice in human evaluation of NLG systems: reusing one source
+document across several independently-rated system outputs is how most
+human-evaluation protocols for summarization and translation work (e.g. WMT-
+and SummEval-style studies routinely have one annotator rate multiple
+systems' outputs against the same shared source). What those protocols
+avoid — and what this project avoids too — is *simultaneous, comparative*
+presentation of those outputs, not *reuse* of the source text. The
+distinction matters:
 
 - Each of an article's provider summaries is still sampled and scored as its
   **own independent item**, on its own scoresheet row, with no ranking or
-  relative judgment requested — exactly the same item shape as `"items"`
-  mode, just selected differently.
+  relative judgment requested.
 - **Sibling items (same article, different provider) are never adjacent in
   the rendered packet.** `_interleave_article_groups()` shuffles the
   selected articles' order with the run's seeded RNG, then takes one row per
@@ -130,18 +134,19 @@ the source text. The distinction matters:
 - `packet.md`'s preamble tells the reviewer directly: score every occurrence
   of a repeated article completely independently, as if seeing it for the
   first time, and don't look back at an earlier score for the same article.
-- Nothing about the sampler's flagged-first-then-stratified selection logic,
-  the packet/scoresheet rendering, the un-blinding key, or the ingest/
-  correlation math changes — `sample_unit="articles"` only changes *which
-  rows get selected*, grouped and then re-flattened back into the same row
-  list shape `"items"` mode already produces.
+- Nothing about the packet/scoresheet rendering, the un-blinding key, or the
+  ingest/correlation math cares whether a row came from a brand-new article
+  or one repeated across providers — sampling only changes *which rows get
+  selected*.
 
-Practically: `HUMAN_REVIEW_SAMPLE_UNIT=articles` with
-`HUMAN_REVIEW_SAMPLE_SIZE` set to the number of journals (5, in this
-project's corpus) spreads the sampled articles one per journal (the existing
-journal-stratified selection already does this), each expanded to its ~3
-provider summaries — about 15 scored items from 5 articles actually read,
-instead of 15 articles for 15 items under `"items"` mode.
+Practically: `--sample-size` is an EXACT number of articles, always split
+evenly across the study's 5 journals (`sample_articles_from_journal_quota` in
+`llm-sum/human_review.py`) — 5 -> 1/journal, 10 -> 2/journal, 25 ->
+5/journal — each expanded to its ~3 provider summaries: 15, 30, or 75 scored
+items from only 5, 10, or 25 articles actually read. If a journal's
+evaluated-article pool can't supply its exact share, the export raises
+`JournalQuotaError` naming every short journal rather than silently sampling
+unevenly (§4).
 
 ### Why humans score the identical 5-criterion rubric
 
@@ -164,7 +169,11 @@ here:
   chance, so α = 0 means "no better than coin-flips," not "0% overlap."
 - **Handles missing / unbalanced data.** Your vet scores only a *subset* of the
   summaries you score. α tolerates raters not covering every item; a simpler
-  paired measure would force you to throw away the non-overlapping rows.
+  paired measure would force you to throw away the non-overlapping rows. This
+  is also why the export doesn't need every `humanN/` folder to hold the
+  *identical* item set: the overlap ratio (§3) carries only a fraction of
+  each tester's articles into the next folder, and inter-reviewer agreement
+  is simply computed over whatever subset two reviewers happen to share.
 - **Interval metric.** The 1–5 scores are ordered numbers, so α treats a 4-vs-5
   near-miss as a *small* disagreement and a 1-vs-5 as a large one — a
   categorical agreement statistic (Cohen's κ) would score both as simply "not
@@ -285,8 +294,9 @@ no access to this repository required on their end.
 (`evaluator.build_judge_prompt()`), the files a reviewer sees carry only an
 anonymized `item_id`, the original article text, and one candidate summary —
 never which AI system (or person) wrote it. The mapping back to
-`(doi, summariser, judge, LLM scores)` lives in one file, `unblinding_key.json`,
-that is never shared with reviewers.
+`(doi, summariser, judge, LLM scores)` lives in a private key file
+**per reviewer** (`unblinding_key_human{N}.json`, one sibling per `humanN/`
+folder), that is never shared with reviewers.
 
 ---
 
@@ -299,67 +309,99 @@ manually, per the project's live-API rule).
 
 ```powershell
 python llm-sum/run_phase3.py evaluate --mode test    # mock rows, $0, for a dry run of export
-python llm-sum/run_phase3.py export-human-review --reviewers 1 --mode test
+python llm-sum/run_phase3.py export-human-review --mode test   # -> human1/
 ```
 
 ---
 
 ## 3. Running the export
 
+Each run creates the **next** `humanN/` folder and never touches the earlier
+ones — the same incremental model the pilot dry-run uses (see
+[pilot_human_review.md](pilot_human_review.md)), just scoped to the whole
+`data/evaluations.jsonl` corpus instead of the small dev pool:
+
 ```powershell
-python llm-sum/run_phase3.py export-human-review --reviewers 3 --sample-size 15
+python llm-sum/run_phase3.py export-human-review     # -> human1/
+python llm-sum/run_phase3.py export-human-review     # -> human2/  (overlap-carried + new)
+python llm-sum/run_phase3.py export-human-review     # -> human3/  (overlap-carried + new)
 ```
 
 Available through `python llm-sum/run_phase3.py export-human-review`:
 
 | Flag | Overrides | Default |
 |---|---|---|
-| `--reviewers N` | `HUMAN_REVIEWERS` | 1 |
-| `--sample-size N` (articles) | `HUMAN_REVIEW_SAMPLE_SIZE` | ask interactively, min 5 |
-| `--sample-unit {articles,items}` | `HUMAN_REVIEW_SAMPLE_UNIT` | `articles` |
+| `--sample-size N` (articles) | `HUMAN_REVIEW_SAMPLE_SIZE` | ask interactively (5/10/25 menu) |
+| `--overlap-ratio R` | `HUMAN_REVIEW_OVERLAP_RATIO` | `0.6` |
 | `--seed N` | `HUMAN_REVIEW_SEED` | 42 |
 
 `--evaluations PATH` (default `data/evaluations.jsonl`) and `--output-dir PATH`
 (default `data/human_review/`) are **not** exposed through `run_phase3.py` —
 run `python llm-sum/human_review.py` directly to override those two paths.
 
-The default sample unit is **`articles`**: `--sample-size` counts distinct
-articles (one per journal), and each is expanded to **every provider's summary
-of it** — so 5 articles → 15 scored items from 5 articles actually read (see
-"Why sampling can reuse the same article across multiple items" above). When
-`--sample-size` is omitted (and no `HUMAN_REVIEW_SAMPLE_SIZE` is set), the export
-**asks how many articles** you'll evaluate, enforcing a **minimum of 5** (one per
-journal); a non-interactive run falls back to that minimum.
+**`--sample-size` is an exact article count, always split evenly across the
+study's 5 journals** — it must be a multiple of 5 (5 -> 1/journal, 10 ->
+2/journal, 25 -> 5/journal), each article expanded to **every provider's
+summary of it** — so 5 articles → 15 scored items from 5 articles actually
+read (see "Why sampling can reuse the same article across multiple items"
+above). When `--sample-size` is omitted (and no `HUMAN_REVIEW_SAMPLE_SIZE` is
+set) at a real terminal, the export shows a short menu and **asks you to pick
+5, 10, or 25 articles**; a non-interactive run falls back to 5.
 
 ```powershell
-python llm-sum/run_phase3.py export-human-review --sample-size 5
-# 5 articles selected (stratified across journals), every provider's summary of
-# each included -> 15 scored items, ordered provider-major (article1..5 provider
-# A, then provider B, then C) so two summaries of one article are never adjacent.
+python llm-sum/run_phase3.py export-human-review --sample-size 10
+# How many articles will you evaluate? (only fires if --sample-size is omitted)
+#   1) 5 articles -> 15 summaries to read (1 per journal)
+#   2) 10 articles -> 30 summaries to read (2 per journal)
+#   3) 25 articles -> 75 summaries to read (5 per journal)
+# -> 10 articles selected, EXACTLY 2 per journal, every provider's summary of
+# each included -> 30 scored items, interleaved so two summaries of one
+# article are never adjacent.
 ```
+
+If a journal's evaluated-article pool can't supply its exact share (e.g. only
+1 evaluated Veterinary Surgery article when the quota needs 2), the export
+raises a `JournalQuotaError` naming every short journal and stops — it never
+silently samples unevenly. Run more `evaluate` first, or choose a smaller
+article count.
+
+**`--overlap-ratio` controls comparability between consecutive testers**,
+spanning three regimes (identical to the pilot's, see
+[pilot_human_review.md](pilot_human_review.md) §3 for the worked example):
+`1.0` = identical items every run, `0.0` = a fresh independent draw each run,
+`0.6` (default) = partial overlap. The carry is **journal-balanced** — the
+same fraction is carried from each journal, so the leftover "new" draw is
+always a valid per-journal count too.
 
 All three env knobs live in `.env.template` section 19. Like `EVAL_SAMPLE_SEED`,
 keeping `HUMAN_REVIEW_SEED` fixed makes the sample reproducible — re-running
 the export (e.g. to regenerate a lost reviewer sheet) selects the identical
 items.
 
-You can also run the module directly: `python llm-sum/human_review.py --reviewers 3`.
+You can also run the module directly: `python llm-sum/human_review.py --overlap-ratio 0.6`.
 
 ---
 
 ## 4. What gets sampled
 
-`sample_rows_for_review()` in `llm-sum/human_review.py`:
+`sample_articles_from_journal_quota()` / `select_incremental_rows()` in
+`llm-sum/human_review.py`:
 
-1. **Every row flagged `requires_human_review=True`** is included first (low
-   judge confidence, a malformed judge response, or any major-severity
-   hallucination claim — see `evaluator.needs_human_review()`).
-2. **Remaining slots** are filled with a stratified sample across the same
-   strata `eval_report.py` groups by — species, study design, clinical topic,
-   journal, input source (`eval_instances.STRATIFICATION_FIELDS`) — so the
-   sample doesn't skew toward whichever journal has the most rows.
+1. For the first tester (`human1`), the FULL quota is drawn fresh: exactly
+   `sample_size / 5` articles from each journal. Within a journal, any row
+   already flagged `requires_human_review=True` (low judge confidence, a
+   malformed judge response, or any major-severity hallucination claim — see
+   `evaluator.needs_human_review()`) is included first; the rest is a seeded
+   shuffle-and-take.
+2. For every later tester, a proportional fraction of the previous tester's
+   articles is carried **from each journal** (see `--overlap-ratio` above),
+   and the exact per-journal shortfall left over is drawn fresh from articles
+   the previous tester never saw.
 3. A multi-judge jury run or a rerun can leave more than one evaluation row
    for the same `(doi, summariser, input_source)`; only the latest is kept.
+4. If any journal can't supply its exact share (initial draw or the
+   leftover-after-carry draw), `JournalQuotaError` is raised naming every
+   short journal — see §3.
 
 The candidate summary and reference text for each sampled row are re-joined
 from `data/summaries.jsonl` (the default pipeline) and, as a fallback, the
@@ -374,36 +416,39 @@ printed as a warning; nothing fails silently.
 
 ```text
 data/human_review/
-  unblinding_key.json           NEVER share this file with reviewers
-  reviewer_1/
-    REVIEWER_GUIDE.md           full zero-jargon guide (copied from
-                                 docs/booklet/07_human_validation_guide.md)
-    packet.md                   navigation index: one row per item_id -> folder
-    scoresheet_reviewer_1.xlsx  blank scoresheet (dropdowns, version-labeled rows)
+  unblinding_key_human1.json     NEVER share this file with reviewers
+  unblinding_key_human2.json
+  human1/
+    REVIEWER_GUIDE.md            full zero-jargon guide (copied from
+                                  docs/booklet/07_human_validation_guide.md)
+    packet.md                    navigation index: one row per item_id -> folder
+    scoresheet_human1.xlsx       blank scoresheet (dropdowns, version-labeled rows)
     item_001/
-      article.md                the original article text
-      summary.md                one candidate summary to score against it
+      article.md                 the original article text
+      summary.md                 one candidate summary to score against it
     item_002/
       ...
-    original_articles/          matched source PDFs copied from data/raw (best-effort)
-  reviewer_2/
-    REVIEWER_GUIDE.md           identical content to reviewer_1's copy
-    packet.md                   identical content to reviewer_1's packet
-    scoresheet_reviewer_2.xlsx
+    original_articles/           matched source PDFs copied from data/raw (best-effort)
+  human2/
+    REVIEWER_GUIDE.md
+    packet.md
+    scoresheet_human2.xlsx       (overlap-carried + new items, see §3)
     item_001/ ...
   ...
 ```
 
-**Every reviewer sees the same sampled items**, exported as independent blind
-copies. This is intentional: the ingest step (§7) needs the same items scored
-by more than one person to measure inter-reviewer agreement — the same reason
-the LLM jury needs more than one judge scoring the same item to compute
-Krippendorff's alpha (see [reliability.py](../../llm-sum/reliability.py)).
+**Each `humanN/` folder is one reviewer, written by one export run** — not a
+batch of N identical copies. Comparability between reviewers comes from the
+`--overlap-ratio` carry (§3): inter-reviewer agreement (§8) is computed over
+whatever items two `humanN` folders happen to share, the same way the LLM
+jury only needs items with 2+ judges to compute Krippendorff's alpha (see
+[reliability.py](../../llm-sum/reliability.py)) — the raters don't need to
+have scored an otherwise-identical batch.
 
 ### `REVIEWER_GUIDE.md` — the full guide, shipped with every reviewer folder
 
 A verbatim copy of `docs/booklet/07_human_validation_guide.md`, written into
-every `reviewer_N/` folder so a reviewer handed only their own folder (e.g.
+every `humanN/` folder so a reviewer handed only their own folder (e.g.
 zipped and emailed) still gets the complete, zero-jargon guide — what each
 scoresheet column means, a worked example row, why the process is blind, and
 what to do with a repeated article — with no other file or context required.
@@ -426,7 +471,7 @@ candidate summary to score against it. Nothing else — no DOI, no journal, no
 model name. The same article recurs across several `item_NNN/` folders (one per
 provider's summary), each labeled with a blind-safe *version* number.
 
-### `scoresheet_reviewer_N.xlsx` — what the reviewer fills in
+### `scoresheet_humanN.xlsx` — what the reviewer fills in
 
 One blank row per `item_id` (matching the folder names), with dropdown-validated
 cells (1–5 on the criteria, yes/no on hallucination) and a frozen header. When an
@@ -449,37 +494,45 @@ jury scores (`faithfulness`, `completeness`, `clinical_usefulness`, `clarity`,
 `safety` — see `reliability.CRITERIA`), so ingest (§7) can compare human and
 jury scores criterion-by-criterion, not just on one composite number.
 
-### `unblinding_key.json` — private, never shared
+### `unblinding_key_human{N}.json` — private, never shared
 
-Maps every `item_id` back to `doi`, `summariser`, `judge`, `input_source`,
-`strata`, and the LLM jury's own scores for that item
-(`llm_jury_score`, `llm_jury_score_weighted`, `llm_jury_score_unweighted`,
-`llm_criteria_scores`). This is what the ingest step (§7) joins filled
-scoresheets against to compute human-vs-jury agreement — it is written once
-per export and is not regenerated per reviewer.
+Maps every `item_id` in ONE reviewer's `humanN/` folder back to `doi`,
+`summariser`, `judge`, `input_source`, `strata`, and the LLM jury's own
+scores for that item (`llm_jury_score`, `llm_jury_score_weighted`,
+`llm_jury_score_unweighted`, `llm_criteria_scores`). This is what the ingest
+step (§7) joins that reviewer's filled scoresheet against to compute
+human-vs-jury agreement — one key file is written per export run, as a
+sibling of the `humanN/` folder it describes.
+
+**Why per-reviewer, not one shared file:** every `humanN/` folder numbers its
+own items starting at `item_001`, so `human2`'s `item_001` and `human1`'s
+`item_001` identify two *different* (doi, summariser) pairs. Ingest always
+looks a scoresheet's rows up against its OWN reviewer's key — never a
+merged, global `item_id` table — so this can't get crossed.
 
 ---
 
 ## 6. Distributing packets to real reviewers
 
 1. Run the export.
-2. Send each reviewer only their own `reviewer_N/` folder — it is now fully
+2. Send each reviewer only their own `humanN/` folder — it is now fully
    self-contained (`REVIEWER_GUIDE.md` + `packet.md` +
-   `scoresheet_reviewer_N.xlsx` + the `item_NNN/` folders + `original_articles/`),
+   `scoresheet_humanN.xlsx` + the `item_NNN/` folders + `original_articles/`),
    nothing else needs to be separately attached. Do **not** send
-   `unblinding_key.json`.
+   `unblinding_key_human{N}.json`.
 3. Ask them to read `REVIEWER_GUIDE.md` once, then work down the packet index:
    open each `item_NNN/` folder, read `article.md` + `summary.md`, and fill that
    `item_id`'s row in the `.xlsx` — 1-5 in each numeric column — then return it.
-4. Keep the completed `.xlsx` sheets **in their `reviewer_N/` folders** and
-   `unblinding_key.json` together, so ingest (§7) can find both.
+4. Keep the completed `.xlsx` sheets **in their `humanN/` folders** and every
+   `unblinding_key_human{N}.json` together under `data/human_review/`, so
+   ingest (§7) can find both.
 
 ---
 
 ## 7. Ingesting filled scoresheets
 
-Once the reviewers return their filled scoresheets (dropped back into their
-`reviewer_N/` folders under `data/human_review/`):
+Once reviewers return their filled scoresheets (dropped back into their
+`humanN/` folders under `data/human_review/`):
 
 ```powershell
 python llm-sum/run_phase3.py ingest-human-review
@@ -492,22 +545,23 @@ python llm-sum/run_phase3.py ingest-human-review
 
 `ingest_human_reviews()` in `llm-sum/human_review.py`:
 
-1. Loads the private `unblinding_key.json` from the review directory (errors
-   clearly if it is missing — ingest cannot un-blind without it).
-2. Reads every `reviewer_*/scoresheet_reviewer_*.xlsx` (older `.csv` sheets are
+1. Loads every `unblinding_key_human*.json` sibling in the review directory,
+   one per reviewer (errors clearly if none are found — ingest cannot
+   un-blind without at least one).
+2. Reads every `human*/scoresheet_human*.xlsx` (older `.csv` sheets are
    still read, as is any loose `scoresheet_*.{xlsx,csv}` at the top level, for a
    sheet returned without its folder).
 3. For each filled row: parses the five 1-5 criteria (blank cells are allowed;
    a value outside 1-5 or non-numeric is **ignored with a warning**, never
    silently trusted), the yes/no `hallucination_present` flag, and the free
    text. A completely empty row (a not-yet-scored item) is dropped silently.
-4. Re-joins each `item_id` to the un-blinding key to recover `doi`,
-   `summariser`, `judge`, `input_source`, `strata`, and the LLM jury's own
-   scores, and writes one normalized JSONL row per `(reviewer, item)` to
-   `data/human_reviews.jsonl`.
+4. Re-joins each `item_id` to **that same reviewer's own** un-blinding key
+   (never another reviewer's) to recover `doi`, `summariser`, `judge`,
+   `input_source`, `strata`, and the LLM jury's own scores, and writes one
+   normalized JSONL row per `(reviewer, item)` to `data/human_reviews.jsonl`.
 
 `data/human_reviews.jsonl` is a **derived snapshot**, not append-only like
-`evaluations.jsonl`: re-running ingest rewrites it from the current CSVs, so
+`evaluations.jsonl`: re-running ingest rewrites it from the current sheets, so
 correcting a scoresheet and re-ingesting simply reproduces a corrected file
 (rows are sorted by `(item_id, reviewer_id)` for a stable, diffable artifact).
 
@@ -551,9 +605,9 @@ computed matters a lot:
   mixed-expertise panel "the human" becomes an average of expert and non-expert.
 - **`both`** — report both views.
 
-Reviewers are labelled by their folder (`reviewer_1`, `reviewer_2`, …); which
-one is the vet is up to you (whoever fills that folder's scoresheet). The
-report shows each reviewer's block separately in `per_reviewer`/`both`.
+Reviewers are labelled by their folder (`human1`, `human2`, …); which one is
+the vet is up to you (whoever fills that folder's scoresheet). The report
+shows each reviewer's block separately in `per_reviewer`/`both`.
 
 Both views report the pooled-overall score for **both jury modes**:
   - *Overall (unweighted)* — the MedHELM-comparable number (MedHELM's own

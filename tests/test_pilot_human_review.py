@@ -45,8 +45,13 @@ from openpyxl import load_workbook  # reads .xlsx spreadsheet files, to check th
 
 # Sample journal names and AI-provider names, reused across the fake test
 # data built by every test below (so `providers=PROVIDERS` etc. stay
-# consistent without repeating the literal lists everywhere).
-JOURNALS = ("JVIM", "AJVR", "VRU", "JFMS", "JAVMA")
+# consistent without repeating the literal lists everywhere). JOURNALS MUST
+# be the real study journals -- the pilot's sampler always draws evenly
+# across human_review.STUDY_JOURNALS internally (dev-pool scoping is its
+# only difference from the real export), so a fixture using different
+# journal names would leave every real journal short and trigger backfill
+# on every draw.
+JOURNALS = human_review.STUDY_JOURNALS
 PROVIDERS = ("openai", "anthropic", "gemini")
 
 
@@ -432,26 +437,27 @@ def _key_dois(key_path: Path) -> set[str]:
 # and 2 should be brand-new, which (since each article carries 3 AI
 # summaries) means 9 of human2's 15 items overlap with human1's and 6 don't.
 def test_pilot_overlap_shares_expected_fraction(tmp_path: Path, monkeypatch) -> None:
-    # 10 articles so human2 can carry 3 and still find 2 genuinely-new articles
-    # (with only 5 total, the pool exhausts and human2 backfills the 2 "new").
-    fx = _build_fixture(tmp_path, monkeypatch, num_articles=10)
-    r1 = _export(fx, overlap_ratio=0.6, seed=42, sample_size=5)
-    r2 = _export(fx, overlap_ratio=0.6, seed=42, sample_size=5)
+    # 8 articles/journal (40 total) so human2 can carry 3/journal and still
+    # find 2 genuinely-new articles/journal without exhausting the pool.
+    # 1 provider keeps "articles" and "items" counts identical and readable.
+    fx = _build_fixture(tmp_path, monkeypatch, num_articles=8 * len(JOURNALS), providers=("openai",))
+    r1 = _export(fx, overlap_ratio=0.6, seed=42, sample_size=25)
+    r2 = _export(fx, overlap_ratio=0.6, seed=42, sample_size=25)
 
     assert r1.human_number == 1 and r2.human_number == 2
     i1 = _key_identities(fx["output_dir"] / "unblinding_key_human1.json")
     i2 = _key_identities(fx["output_dir"] / "unblinding_key_human2.json")
-    # 5 articles x 3 providers each.
-    assert len(i1) == 15 and len(i2) == 15
-    # Overlap is now counted in ARTICLES: round(5 * 0.6) == 3 shared articles
-    # (=9 shared items), 2 genuinely new articles (=6 new items).
+    # 25 articles x 1 provider each.
+    assert len(i1) == 25 and len(i2) == 25
+    # Overlap is carried per journal: round(5/journal * 0.6) == 3 shared
+    # articles/journal (=15 shared across 5 journals), 2 new/journal (=10 new).
     d1 = _key_dois(fx["output_dir"] / "unblinding_key_human1.json")
     d2 = _key_dois(fx["output_dir"] / "unblinding_key_human2.json")
-    assert len(d1 & d2) == 3
-    assert len(d2 - d1) == 2
-    assert len(i1 & i2) == 9
-    assert len(i2 - i1) == 6
-    assert r2.overlap_units == 3
+    assert len(d1 & d2) == 15
+    assert len(d2 - d1) == 10
+    assert len(i1 & i2) == 15
+    assert len(i2 - i1) == 10
+    assert r2.overlap_units == 15
 
 
 # In plain English: the "1.0" regime — every new tester should see EXACTLY
@@ -580,20 +586,20 @@ def test_pilot_missing_pdf_warns_not_fatal(tmp_path: Path, monkeypatch, capsys) 
 
 # In plain English: what happens when the dev pool is so small that there
 # just aren't enough genuinely-new articles left to give the next tester?
-# With only 2 articles total, human1 already used both; human2 (60% overlap
-# of a sample-size-2 request) would need 1 carried + 1 truly new, but there
-# is no "new" article left. This checks the export doesn't under-fill or
-# crash — it "backfills" by reusing an already-seen article and prints a
-# clear warning explaining why, instead of silently shortchanging the tester.
+# With exactly 1 article/journal (the smallest valid quota), human1 already
+# used every article that exists; human2 asks for a fresh, non-overlapping
+# draw (ratio 0.0) but there is no "new" article left in ANY journal. This
+# checks the export doesn't under-fill or crash — it "backfills" by reusing
+# an already-seen article and prints a clear warning explaining why, instead
+# of silently shortchanging the tester.
 def test_pilot_pool_exhaustion_backfills_with_warning(tmp_path: Path, monkeypatch, capsys) -> None:
-    # Only 2 articles, 1 provider each -> 2 eligible items total. human1 takes
-    # both; human2 (ratio 0.6 -> carry 1, need 1 new) can find no genuinely-new
-    # item and must backfill.
-    fx = _build_fixture(tmp_path, monkeypatch, num_articles=2, providers=("openai",))
-    _export(fx, overlap_ratio=0.6, seed=42, sample_size=2)
+    # Exactly 1 article/journal (5 total), 1 provider each -> the smallest
+    # valid quota (sample_size=5) exactly exhausts the pool.
+    fx = _build_fixture(tmp_path, monkeypatch, num_articles=len(JOURNALS), providers=("openai",))
+    _export(fx, overlap_ratio=0.0, seed=42, sample_size=5)
     capsys.readouterr()  # drop human1 output
-    r2 = _export(fx, overlap_ratio=0.6, seed=42, sample_size=2)
+    r2 = _export(fx, overlap_ratio=0.0, seed=42, sample_size=5)
     out = capsys.readouterr().out
     assert r2 is not None
-    assert r2.items_exported == 2  # not under-filled
+    assert r2.items_exported == 5  # not under-filled
     assert "could not supply" in out and "backfilled" in out

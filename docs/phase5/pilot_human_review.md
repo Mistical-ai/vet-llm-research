@@ -25,17 +25,20 @@ summarize --mode dev  →  evaluate --mode dev  →  export-pilot-human-review
 | | `export-human-review` (real) | `export-pilot-human-review` (this) |
 |---|---|---|
 | Sampling pool | whole `data/evaluations.jsonl` corpus | only articles in `data/dev_summaries_jsonl/` |
-| Reviewers per run | all `--reviewers N` at once | **one** more `humanN/` per run, incremental |
-| Between testers | every reviewer sees the same items | **partial overlap** (configurable ratio) |
-| Output | `data/human_review/reviewer_N/` | `data/pilot_human_review/humanN/` |
+| Reviewers per run | **one** more `humanN/` per run, incremental | **one** more `humanN/` per run, incremental |
+| When a journal is too thin for its exact quota | errors (`JournalQuotaError`), never samples unevenly | backfills from other journals with a warning |
+| Output | `data/human_review/humanN/` | `data/pilot_human_review/humanN/` |
 
-Everything else is now **shared code** in `llm-sum/human_review.py`: the
-stratified sampler, the blind protocol, the un-blinding key, the reviewer guide,
-the interactive "how many articles?" prompt (minimum 5, one per journal), the
-nested per-item folder layout (`item_NNN/article.md` + `summary.md`), the
-version-labeled `.xlsx` scoresheet, and the `original_articles/` PDF copy. The
-pilot (`llm-sum/pilot_human_review.py`) only adds the dev-pool scoping,
-incremental `humanN/` folders, and the tester-overlap carry on top.
+Both commands now share the same incremental `humanN/`, exact-per-journal-quota,
+and overlap-carry machinery in `llm-sum/human_review.py` — `next_human_number`,
+`select_incremental_rows`, `sample_articles_from_journal_quota`, the blind
+protocol, the un-blinding key, the reviewer guide, the "5/10/25 articles?"
+prompt, the nested per-item folder layout (`item_NNN/article.md` +
+`summary.md`), the version-labeled `.xlsx` scoresheet, and the
+`original_articles/` PDF copy. The pilot (`llm-sum/pilot_human_review.py`)
+only adds the dev-pool scoping and the softer backfill-on-shortfall policy on
+top — appropriate for a dry-run tool whose whole point is a still-growing
+dev pool.
 
 ---
 
@@ -62,8 +65,8 @@ ones:
 
 ```powershell
 python llm-sum/run_phase3.py export-pilot-human-review     # -> human1/
-python llm-sum/run_phase3.py export-pilot-human-review     # -> human2/  (shares items with human1)
-python llm-sum/run_phase3.py export-pilot-human-review     # -> human3/  (shares items with human2)
+python llm-sum/run_phase3.py export-pilot-human-review     # -> human2/  (overlap-carried + new)
+python llm-sum/run_phase3.py export-pilot-human-review     # -> human3/  (overlap-carried + new)
 ```
 
 Available through `python llm-sum/run_phase3.py export-pilot-human-review`:
@@ -71,16 +74,16 @@ Available through `python llm-sum/run_phase3.py export-pilot-human-review`:
 | Flag | Overrides | Default |
 |---|---|---|
 | `--overlap-ratio R` | `PILOT_HUMAN_REVIEW_OVERLAP_RATIO` | `0.6` |
-| `--sample-size N` (articles) | `PILOT_HUMAN_REVIEW_SAMPLE_SIZE` | ask interactively (min 5), else one per evaluated dev article |
-| `--sample-unit {articles,items}` | `PILOT_HUMAN_REVIEW_SAMPLE_UNIT` | `articles` |
+| `--sample-size N` (articles) | `PILOT_HUMAN_REVIEW_SAMPLE_SIZE` | ask interactively (5/10/25 menu), else `5` |
 | `--seed N` | `PILOT_HUMAN_REVIEW_SEED` | `42` |
 
-The default sample unit is now **`articles`**: `--sample-size` counts distinct
-articles (one per journal), each expanded to all three providers' summaries — so
-5 articles → 15 scored items, ordered provider-major (article1..5 provider A,
-then provider B, then C). When `--sample-size` is omitted at a real terminal, the
-export **asks how many articles** you'll evaluate (minimum 5); non-interactive
-runs fall back to one article per evaluated dev article.
+`--sample-size` is an **exact article count, always split evenly across the
+study's 5 journals** — it must be a multiple of 5 (5 -> 1/journal, 10 ->
+2/journal, 25 -> 5/journal), each expanded to all three providers' summaries —
+so 5 articles → 15 scored items, interleaved so two summaries of one article
+are never adjacent. When `--sample-size` is omitted at a real terminal, the
+export shows a short menu and **asks you to pick 5, 10, or 25 articles**;
+non-interactive runs fall back to 5.
 
 The path-override flags below are **not** exposed through `run_phase3.py`
 (same as `export-human-review`) — run the module directly instead:
@@ -103,16 +106,18 @@ testers:
 - **`0.0` — a fresh, independent draw each run.** Maximises coverage; no shared
   items to compare testers on.
 - **`0.6` (default) — partial overlap.** Carry 60% of the previous tester's
-  articles, fill the rest with genuinely new ones. Worked example: with 5
-  articles, `round(5 × 0.6) = 3` are shared with the previous tester and 2 are
-  new — so the two testers share 9 of their 15 scored items. This is the
-  recommended balance: some shared articles to check testers agree on, some new
-  ones to widen coverage.
+  articles from EACH journal, fill the rest with genuinely new ones. Worked
+  example: with 5 articles (1/journal), `round(1 × 0.6) = 1` (rounds up) is
+  shared per journal and the rest is fresh — see `human_review.select_incremental_rows`
+  for how the carry stays balanced per journal so the leftover draw is always
+  a valid per-journal count too. This is the recommended balance: some shared
+  articles to check testers agree on, some new ones to widen coverage.
 
-In the default `articles` unit the carry is a whole number of **articles** (all
-three of a carried article's summaries come across together). The carried subset
-is the previous tester's first *k* articles in `item_id` order, so it is
-deterministic and reproducible.
+The carry is counted in whole **articles**, carried the same fraction from
+every journal (not just "the first k overall") — this is what guarantees the
+leftover "new" draw always splits evenly across journals too, no matter what
+`--overlap-ratio` is set to. The carried subset is deterministic and
+reproducible (the previous tester's articles in `item_id` order, per journal).
 
 ---
 
@@ -173,17 +178,18 @@ guide says this in plain language.
 
 ## 5. When the dev pool is small
 
-The pilot draws from however many dev articles you've summarized+evaluated. With
-the default `articles` unit, a 5-article dev pool gives each tester **15 scored
-items** — all three providers' summaries of each of the 5 articles, spread one
-per journal by the existing stratified sampler.
+The pilot draws from however many dev articles you've summarized+evaluated. A
+5-article request (1/journal) gives each tester **15 scored items** — all
+three providers' summaries of each of the 5 articles, exactly one per journal.
 
-The overlap carry is counted in whole **articles**. If you ask for more
-genuinely-new articles than the pool can supply (e.g. a small pool and a low
-overlap ratio, so most articles were already shown to the previous tester), the
-export **backfills** the shortfall with already-used articles and prints a clear
-warning rather than silently under-filling. Run more `summarize --mode dev` /
-`evaluate --mode dev` rounds to widen the pool.
+If a journal's dev pool can't supply its exact share (e.g. a 10-article
+request needs 2 VRU articles but only 1 has been evaluated), the pilot
+**backfills** the shortfall from other journals — possibly reusing an
+already-seen article as a last resort — and prints a clear warning rather
+than erroring or silently under-filling; this is the one place the pilot
+deliberately behaves more leniently than the real export (§1). Run more
+`summarize --mode dev` / `evaluate --mode dev` rounds to widen the thin
+journal(s).
 
 ---
 

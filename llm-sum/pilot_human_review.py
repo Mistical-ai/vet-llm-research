@@ -18,11 +18,12 @@ similarly.
 WHY THIS MODULE EXISTS
 -----------------------
 ``human_review.py`` exports the *real* blind validation packets for the study
-(all reviewer folders in one shot, plain-CSV scoresheet, sampled from the whole
-``data/evaluations.jsonl`` corpus). Before running that for real, it helps to
-*trial* the whole reviewer experience on yourself — and maybe one or two other
-testers — using just the small dev-mode sample already sitting in
-``data/dev_summaries_jsonl/``. This module is that trial harness.
+(also incremental ``humanN/`` folders, sampled evenly across the study's 5
+journals from the whole ``data/evaluations.jsonl`` corpus). Before running
+that for real, it helps to *trial* the whole reviewer experience on yourself
+— and maybe one or two other testers — using just the small dev-mode sample
+already sitting in ``data/dev_summaries_jsonl/``. This module is that trial
+harness.
 
 WHAT IT DOES DIFFERENTLY FROM THE REAL EXPORT
 ----------------------------------------------
@@ -30,16 +31,14 @@ WHAT IT DOES DIFFERENTLY FROM THE REAL EXPORT
    ``data/dev_summaries_jsonl/`` are eligible, so the pilot grows naturally as
    you run more ``summarize --mode dev`` / ``evaluate --mode dev`` rounds — no
    code change needed.
-2. **One tester per run, incremental folders.** Each run creates the *next*
-   ``humanN/`` folder inside ``data/pilot_human_review/`` and never touches the
-   earlier ones. So ``export`` → ``human1/``, run again → ``human2/``, etc.
-3. **Partial overlap between consecutive testers.** ``humanN`` shares a
-   configurable fraction of ``human(N-1)``'s items (so two testers' scores are
-   comparable) and fills the rest with genuinely new items (so coverage grows).
-   The one knob ``PILOT_HUMAN_REVIEW_OVERLAP_RATIO`` spans all three regimes:
-   ``1.0`` = identical items every run, ``0.0`` = a fresh independent draw each
-   run, in between = partial overlap (e.g. ``0.6`` → 3 shared, 2 new of 5).
-4. **Self-contained folders in the nested per-item layout.** Each ``humanN/``
+2. **Backfills instead of erroring on a thin journal.** The real export
+   refuses to guess when a journal can't supply its exact quota
+   (:class:`human_review.JournalQuotaError`); the pilot's dev pool is
+   expected to be thin early on, so it instead fills the shortfall from
+   other journals with a loud warning (``on_shortfall="backfill"``,
+   see ``human_review.sample_articles_from_journal_quota``) so the dry run
+   stays usable while the pool grows.
+3. **Self-contained folders in the nested per-item layout.** Each ``humanN/``
    folder holds the reviewer guide, a ``packet.md`` navigation index, an
    ``.xlsx`` scoresheet (dropdowns, frozen header, version-labeled rows), one
    ``item_NNN/`` subfolder per item (``article.md`` + ``summary.md``), and an
@@ -49,12 +48,15 @@ WHAT IT DOES DIFFERENTLY FROM THE REAL EXPORT
 
 WHAT IT REUSES (no duplicated logic)
 -------------------------------------
-Sampling, text join, blind rendering, and the un-blinding key all come from
-``human_review.py``; the dev-pool DOI scoping comes from
-``eval_instances.read_dois_from_dev_folder`` (the same reader
-``run_phase3.py``'s dev loop uses); the PDF lookup is
-``file_paths.resolve_existing_pdf_path``. This module only adds the pilot
-orchestration on top.
+Sampling, text join, blind rendering, the un-blinding key, and the incremental
+``humanN``/overlap-carry machinery all come from ``human_review.py`` — this
+module used to own a private copy of the incremental-folder and overlap-carry
+code, but that's now shared with the real export (see
+``human_review.select_incremental_rows``) so the two can never drift. The
+dev-pool DOI scoping comes from ``eval_instances.read_dois_from_dev_folder``
+(the same reader ``run_phase3.py``'s dev loop uses); the PDF lookup is
+``file_paths.resolve_existing_pdf_path``. This module only adds the dev-pool
+scoping and backfill-on-shortfall policy on top.
 
 THE BLIND PROTOCOL STILL HOLDS
 -------------------------------
@@ -85,26 +87,23 @@ from _bootstrap import *  # noqa: F401,F403
 import argparse  # reads command-line flags like --seed 42 (see main() below)
 import json  # reads/writes .json files (the private "unblinding key")
 import os  # reads environment variables / .env settings
-import re  # pattern-matching on text (used just below, for "human1", "human2", ...)
 import sys  # talks to the running program itself (exit codes, command-line args)
-from collections import OrderedDict  # a dict that remembers the order items were added
 from dataclasses import dataclass  # a shortcut for defining simple "data bundle" classes
 from pathlib import Path  # represents file/folder paths in an OS-independent way
-from typing import Any  # a type-hint meaning "could be any kind of value"
 
 from eval_instances import read_dois_from_dev_folder  # noqa: E402  (shared dev-pool reader)
 from eval_report import iter_evaluation_rows  # noqa: E402  (same row source as the real export)
 from human_review import (  # noqa: E402  (single source of truth for sampling/render/keys)
-    MIN_ARTICLES,
-    SAMPLE_UNITS,
+    ARTICLE_COUNT_CHOICES,
+    JournalQuotaError,
     _build_instance_lookup,
     _build_review_items,
-    _dedupe_rows,
-    _row_key,
     build_unblinding_key,
-    prompt_article_count,
-    resolve_sample_unit,
-    sample_rows_for_review,
+    load_previous_unblinding_key,
+    next_human_number,
+    prompt_article_count_choice,
+    select_incremental_rows,
+    unblinding_key_path_for,
     write_review_folder,
 )
 import human_review  # noqa: E402  (for its module-level text-source path constants)
@@ -124,258 +123,6 @@ DEFAULT_SEED = 42  # the "random seed": using the same number always reproduces 
 
 
 # ---------------------------------------------------------------------------
-# Incremental humanN folders
-# ---------------------------------------------------------------------------
-
-# A "regular expression" (regex) is a text pattern used to check whether a
-# piece of text matches a certain shape — like a very precise find tool. The
-# pattern below matches a folder name that is exactly the word "human"
-# followed by one or more digits (e.g. "human1", "human12") and remembers
-# those digits so the code can read them back out as a number.
-_HUMAN_DIR_RE = re.compile(r"^human(\d+)$")
-
-
-def _next_human_number(pilot_dir: Path) -> int:
-    """Return the next ``humanN`` number to create (max existing + 1, else 1).
-
-    In plain English: looks inside the pilot output folder, finds every
-    already-existing "humanN" folder, and figures out what number the next
-    one should be (one higher than the highest it found; 1 if there are none
-    yet). This is the mechanism behind "run it once for human1, run it again
-    for human2", etc.
-
-    Only existing ``human<digits>`` folders count; anything else in the pilot
-    directory (the private keys, a stray file) is ignored. This is what makes
-    each run add the next tester without disturbing the earlier ones.
-    """
-    highest = 0
-    # Look at every item directly inside the pilot folder (if it exists yet).
-    if pilot_dir.exists():
-        for child in pilot_dir.iterdir():
-            if child.is_dir():
-                m = _HUMAN_DIR_RE.match(child.name)
-                if m:
-                    # Keep track of the biggest humanN number seen so far.
-                    highest = max(highest, int(m.group(1)))
-    return highest + 1
-
-
-def _unblinding_key_path(pilot_dir: Path, human_number: int) -> Path:
-    """Path of the private key for tester N (sibling of the humanN/ folder).
-
-    In plain English: builds the file name/location of tester N's private
-    "answer key" (which article/summary/AI wrote what) — this file lives next
-    to, not inside, the humanN/ folder that gets handed to the tester.
-    """
-    return pilot_dir / f"unblinding_key_human{human_number}.json"
-
-
-def _load_previous_key(pilot_dir: Path, human_number: int) -> dict[str, Any] | None:
-    """Load tester ``N-1``'s private key, or None for the first tester / if absent.
-
-    In plain English: before building this run's folder, look up what the
-    *previous* tester was shown (needed to decide the overlap). Returns
-    nothing (``None``) if this is the very first tester, or if the previous
-    tester's key file is missing or unreadable.
-    """
-    if human_number <= 1:
-        return None
-    prev_path = _unblinding_key_path(pilot_dir, human_number - 1)
-    if not prev_path.exists():
-        return None
-    # "try/except" means: attempt the risky step (reading and parsing the
-    # file), and if it fails in one of the listed ways, don't crash — just
-    # fall through to the recovery code instead (here, treat it as missing).
-    try:
-        return json.loads(prev_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Partial-overlap unit selection
-# ---------------------------------------------------------------------------
-# In plain English: this whole section works out which items the NEXT tester
-# should see, given what the PREVIOUS tester already saw and the overlap
-# ratio setting. A "unit" is just "one countable thing" — either one
-# (article, AI) pairing (in "items" mode) or one whole article with all of
-# its AI summaries bundled together (in "articles" mode, the default).
-
-def _identity_from_key_item(item: dict[str, Any]) -> tuple[str, str, str]:
-    """The (doi, summarizer, input_source) identity stored for one key item.
-
-    In plain English: reads one entry out of a saved answer-key file and pulls
-    out the three pieces of information that uniquely identify it — which
-    article (doi), which AI wrote the summary, and which text version was
-    used. A "tuple" here (the ``(a, b, c)`` return value) is just a small,
-    fixed-size, ordered bundle of values.
-
-    Matches ``human_review._row_key`` so a previous export's items can be joined
-    back to the current eligible evaluation rows.
-    """
-    return (
-        str(item.get("doi", "")).strip(),
-        str(item.get("summarizer", "")).strip(),
-        str(item.get("input_source") or "processed"),
-    )
-
-
-def _ordered_previous_units(
-    previous_key: dict[str, Any], sample_unit: str,
-) -> list[list[tuple[str, str, str]]]:
-    """Previous export's selection units, in deterministic item_id order.
-
-    In plain English: rebuilds the previous tester's list of "units" (see
-    the section note above) in the same reliable order they were shown in,
-    so this run can deterministically pick "the first K of them" to carry
-    forward.
-
-    A "unit" is what ``sample_size`` counts: one row in ``items`` mode, one
-    whole article (all its provider rows) in ``articles`` mode. Returned as a
-    list of identity-lists so the overlap carry works identically for both
-    modes. Sorting by ``item_id`` (``item_001`` < ``item_002`` …) makes the
-    carried subset reproducible regardless of dict/file iteration order.
-    """
-    items = previous_key.get("items") or {}
-    # A dict (dictionary) stores values under named keys, like a lookup table.
-    # `sorted(items.keys())` puts the keys (item_001, item_002, ...) in text
-    # order; the square-bracket expression below is a "list comprehension" —
-    # a compact way of building a new list by looping over another one.
-    ordered = [items[k] for k in sorted(items.keys())]
-    identities = [_identity_from_key_item(it) for it in ordered]
-
-    if sample_unit == "articles":
-        # Group the identities by article (doi), keeping the order each
-        # article was first seen in, so every AI's summary of the same
-        # article travels together as one "unit".
-        groups: "OrderedDict[str, list[tuple[str, str, str]]]" = OrderedDict()
-        for idt in identities:
-            groups.setdefault(idt[0], []).append(idt)  # group by doi, first-seen order
-        return [list(v) for v in groups.values()]
-    # "items" mode: every row is already its own one-item unit.
-    return [[idt] for idt in identities]
-
-
-def _count_units(rows: list[dict[str, Any]], sample_unit: str) -> int:
-    """Count selection units in a row list (distinct articles, or plain rows).
-
-    In plain English: answers "how many units is this?" — counts distinct
-    articles in "articles" mode, or simply counts the rows in "items" mode.
-    """
-    if sample_unit == "articles":
-        return len({_row_key(r)[0] for r in rows})
-    return len(rows)
-
-
-# The lone `*,` in a function's parameter list below is a Python convention
-# meaning "everything after this must be passed by name" (e.g.
-# `sample_size=5`, not just `5`) rather than by position — it just makes
-# calls to the function harder to get wrong by accident, it doesn't change
-# what the function does.
-def _select_pilot_rows(
-    eligible_rows: list[dict[str, Any]],
-    *,
-    human_number: int,
-    sample_size: int,
-    seed: int,
-    overlap_ratio: float,
-    sample_unit: str,
-    previous_key: dict[str, Any] | None,
-) -> tuple[list[dict[str, Any]], int]:
-    """Choose this tester's rows: carry an overlap fraction, fill with new items.
-
-    In plain English: this is the heart of the "partial overlap" feature. It
-    decides, for the tester about to be created, exactly which articles/AI
-    summaries they'll be shown — a slice repeated from the previous tester
-    (so their scores can be compared), plus a slice of brand-new items (so
-    coverage keeps growing). It returns two things: the chosen rows, and how
-    many "units" (articles or items, depending on ``sample_unit``) were
-    repeated from the previous tester.
-
-    Returns ``(selected_rows, overlap_units)`` where ``overlap_units`` is how
-    many selection units were carried over from the previous tester (0 for the
-    first tester or when ``overlap_ratio`` rounds to 0). See the module
-    docstring for the three regimes ``overlap_ratio`` spans.
-    """
-    # Remove duplicate rows first (keeping only the latest one per item) so
-    # the counting/sampling below isn't thrown off by leftover duplicates.
-    deduped = _dedupe_rows(eligible_rows)
-    if sample_size <= 0 or not deduped:
-        return [], 0
-
-    # --- Case 1: this is the very first tester (no one to overlap with) ---
-    # In plain English: human1 has no predecessor, so just draw a normal
-    # stratified sample from scratch — nothing is "carried over".
-    if human_number <= 1 or not previous_key:
-        selected = sample_rows_for_review(
-            deduped, sample_size=sample_size, seed=seed, sample_unit=sample_unit,
-        )
-        return selected, 0
-
-    # --- Case 2: a later tester — figure out the carried + new split ---
-    # A quick lookup table from each row's identity back to the full row, so
-    # once we know WHICH items to carry, we can fetch their full data fast.
-    by_key = {_row_key(r): r for r in deduped}
-    prev_units = _ordered_previous_units(previous_key, sample_unit)
-    all_prev_identities = {idt for unit in prev_units for idt in unit}
-
-    # How many units to carry over, based on the overlap ratio (e.g. 0.6 of
-    # 5 articles rounds to 3). Clamped so it never asks for more than exists
-    # or more than the sample itself.
-    overlap_count = round(sample_size * overlap_ratio)
-    overlap_count = max(0, min(overlap_count, sample_size, len(prev_units)))
-
-    # Take the first `overlap_count` units the previous tester saw (in their
-    # stable order) and look up each one's full row data.
-    carried_units = prev_units[:overlap_count]
-    carried_rows: list[dict[str, Any]] = []
-    for unit in carried_units:
-        for idt in unit:
-            row = by_key.get(idt)
-            if row is not None:
-                carried_rows.append(row)
-    carried_unit_count = _count_units(carried_rows, sample_unit)
-
-    # The "new" items must be genuinely new to this tester: exclude everything
-    # tester N-1 saw, not just the carried subset.
-    remaining_pool = [r for r in deduped if _row_key(r) not in all_prev_identities]
-    new_units_needed = sample_size - carried_unit_count
-    new_picks: list[dict[str, Any]] = []
-    if new_units_needed > 0:
-        new_picks = sample_rows_for_review(
-            remaining_pool, sample_size=new_units_needed,
-            seed=seed + human_number, sample_unit=sample_unit,
-        )
-
-    selected = carried_rows + new_picks
-
-    # --- Fallback: not enough fresh material was available ---
-    # Pool-exhaustion fallback: the dev pool may not have grown enough to supply
-    # all the fresh items requested. Rather than silently under-fill, backfill
-    # from the remaining eligible items (which may reuse previously-seen ones)
-    # and say so loudly.
-    if _count_units(selected, sample_unit) < sample_size:
-        chosen = {_row_key(r) for r in selected}
-        leftover = [r for r in deduped if _row_key(r) not in chosen]
-        shortfall = sample_size - _count_units(selected, sample_unit)
-        backfill = sample_rows_for_review(
-            leftover, sample_size=shortfall,
-            seed=seed + human_number + 10_000, sample_unit=sample_unit,
-        )
-        if backfill:
-            print(
-                f"[pilot_human_review] WARNING: the dev pool could not supply "
-                f"{shortfall} fully-new item(s) for human{human_number}; backfilled "
-                "with already-used item(s). Run more 'summarize --mode dev' / "
-                "'evaluate --mode dev' rounds to widen the pool, or lower the "
-                "sample size / overlap ratio."
-            )
-            selected += backfill
-
-    return selected, carried_unit_count
-
-
-# ---------------------------------------------------------------------------
 # Export entry point
 # ---------------------------------------------------------------------------
 
@@ -391,9 +138,9 @@ class PilotExportResult:
     human_number: int  # which tester this was (1, 2, 3, ...)
     human_dir: Path  # folder that was written, e.g. data/pilot_human_review/human1
     unblinding_key_path: Path  # where the private answer key was saved
-    sample_size: int  # how many articles/items were requested
+    sample_size: int  # how many articles were requested
     items_exported: int  # how many (article, AI) items actually ended up in the folder
-    overlap_units: int  # how many were repeated from the previous tester
+    overlap_units: int  # how many articles were repeated from the previous tester
     pdfs_copied: int  # how many source PDFs were successfully copied in
     pdfs_missing: list[str]  # DOIs whose PDF could not be found
     skipped_rows: int  # sampled rows that couldn't be matched to source text
@@ -404,7 +151,6 @@ def export_pilot_human_review(
     sample_size: int | None = None,
     overlap_ratio: float = DEFAULT_OVERLAP_RATIO,
     seed: int = DEFAULT_SEED,
-    sample_unit: str = "articles",
     evaluations_path: Path | None = None,
     dev_summaries_dir: Path | None = None,
     raw_dir: Path | None = None,
@@ -416,13 +162,18 @@ def export_pilot_human_review(
     command-line tool (``main()`` below) calls. Step by step, it: (1) finds
     which articles are eligible, (2) finds their scores, (3) works out how
     many to sample, (4) picks this tester's items (with overlap carried from
-    the previous tester), (5) fetches the actual article/summary text, (6)
-    writes out the humanN/ folder and the private answer key, then reports
-    back a summary of what happened.
+    the previous tester, balanced per journal — see
+    ``human_review.select_incremental_rows``), (5) fetches the actual
+    article/summary text, (6) writes out the humanN/ folder and the private
+    answer key, then reports back a summary of what happened.
 
     Returns the :class:`PilotExportResult`, or ``None`` when there is nothing to
     export (no eligible evaluated dev articles) — the CLI turns ``None`` into a
     non-zero exit, mirroring ``human_review.main``'s empty-export handling.
+    May raise :class:`human_review.JournalQuotaError` if even the FIRST tester's
+    dev pool can't supply the requested per-journal quota — ``main()`` catches
+    it and prints a friendly message (later testers fall back to a backfill
+    warning instead, see the module docstring).
     """
     # If the caller didn't supply a particular path/setting, fall back to the
     # project-standard default location defined near the top of this file.
@@ -470,34 +221,32 @@ def export_pilot_human_review(
               f"summaries in {resolved_dev_dir}.")
         return None
 
-    # --- Step 3: how many articles/items should this tester be given? ---
-    # In plain English: if the caller didn't ask for a specific number, the
-    # default is "one item per evaluated dev article" — i.e. use the whole
-    # eligible pool.
-    # 3. Resolve the sample size. Default: one item per *evaluated* dev article
-    # (an unevaluated dev DOI is not samplable, so it must not inflate the target
-    # or the sampler would pull an extra provider-item off an evaluated article).
-    evaluated_dois = {str(r.get("doi", "")).strip() for r in eligible_rows}
+    # --- Step 3: how many articles should this tester be given? ---
+    # In plain English: if the caller didn't ask for a specific number, fall
+    # back to the smallest of the 5/10/25 choices — the same default the
+    # interactive prompt itself falls back to when there's no one to ask.
+    # 3. Resolve the sample size.
     resolved_sample_size = (
-        sample_size if sample_size and sample_size > 0 else len(evaluated_dois)
+        sample_size if sample_size and sample_size > 0 else ARTICLE_COUNT_CHOICES[0]
     )
 
     # --- Step 4: which tester number is this, and what do they carry over? ---
     # In plain English: check the output folder to see what the next humanN
     # number should be, load the previous tester's answer key (if any), and
-    # use the overlap logic from earlier in this file to pick this tester's
-    # exact set of items.
+    # use the shared incremental-carry logic to pick this tester's exact set
+    # of items — a journal-balanced fraction carried over, backfilled from
+    # other journals (with a warning) if a journal's dev pool is too thin.
     # 4. Figure out which tester this run is, and carry the overlap.
-    human_number = _next_human_number(resolved_output)
-    previous_key = _load_previous_key(resolved_output, human_number)
-    selected_rows, overlap_units = _select_pilot_rows(
+    human_number = next_human_number(resolved_output)
+    previous_key = load_previous_unblinding_key(resolved_output, human_number)
+    selected_rows, overlap_units = select_incremental_rows(
         eligible_rows,
         human_number=human_number,
         sample_size=resolved_sample_size,
         seed=seed,
         overlap_ratio=overlap_ratio,
-        sample_unit=sample_unit,
         previous_key=previous_key,
+        on_shortfall="backfill",
     )
 
     # --- Step 5: fetch the actual article text and AI summary for each pick ---
@@ -548,7 +297,7 @@ def export_pilot_human_review(
     # which AI, and what the LLM judges scored for each item_id — this is
     # what lets the researcher (not the tester) later work out who wrote
     # what. It's saved next to, not inside, the humanN/ folder.
-    # 8. Write the private un-blinding key (sibling of the folder, never inside).
+    # 7. Write the private un-blinding key (sibling of the folder, never inside).
     key = build_unblinding_key(
         items, seed=seed, sample_size=resolved_sample_size, reviewer_count=1,
     )
@@ -558,15 +307,15 @@ def export_pilot_human_review(
     key["human_number"] = human_number
     key["overlap_units"] = overlap_units
     key["overlap_ratio"] = overlap_ratio
-    key["sample_unit"] = sample_unit
-    key_path = _unblinding_key_path(resolved_output, human_number)
+    key["sample_unit"] = "articles"
+    key_path = unblinding_key_path_for(resolved_output, human_number)
     key_path.write_text(json.dumps(key, indent=2, ensure_ascii=False), encoding="utf-8")
 
     # Print a short human-readable summary to the terminal so whoever ran the
     # command can see what just happened, and a loud reminder not to leak the
     # private key file.
     print(f"[pilot_human_review] exported human{human_number} ({len(items)} item(s), "
-          f"{overlap_units} carried from human{human_number - 1 if human_number > 1 else '-'}, "
+          f"{overlap_units} article(s) carried from human{human_number - 1 if human_number > 1 else '-'}, "
           f"{len(copied)} PDF(s) copied) to {human_dir}")
     print(f"[pilot_human_review] private key -> {key_path} — DO NOT hand this to a tester.")
 
@@ -660,20 +409,15 @@ def main(argv: list[str] | None = None) -> int:
     # flag (e.g. --seed) that a user can type after the script name. The
     # `help=` text is what shows up if someone runs the script with --help.
     parser.add_argument("--sample-size", type=int, default=None,
-                        help="Items to sample per --sample-unit (default: "
-                             "PILOT_HUMAN_REVIEW_SAMPLE_SIZE from .env, or one "
-                             "item per evaluated dev article).")
+                        help="Articles to sample (must be a multiple of the number "
+                             "of study journals, e.g. 5/10/25). Default: "
+                             "PILOT_HUMAN_REVIEW_SAMPLE_SIZE from .env, or an "
+                             "interactive 5/10/25 prompt at a real terminal.")
     parser.add_argument("--overlap-ratio", type=float, default=None,
-                        help="Fraction of the previous tester's items to carry "
+                        help="Fraction of the previous tester's articles to carry "
                              "over (default: PILOT_HUMAN_REVIEW_OVERLAP_RATIO, or "
                              "0.6). 1.0 = identical items every run, 0.0 = a fresh "
                              "draw each run.")
-    parser.add_argument("--sample-unit", choices=SAMPLE_UNITS, default=None,
-                        help="What --sample-size counts: 'articles' (default; one "
-                             "article, every provider summary of it included -- "
-                             "5 articles x 3 providers = 15 items) or 'items' (one "
-                             "(article, provider) pair). Default: "
-                             "PILOT_HUMAN_REVIEW_SAMPLE_UNIT from .env, or 'articles'.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Base sampling seed (default: PILOT_HUMAN_REVIEW_SEED "
                              "from .env, or 42).")
@@ -697,46 +441,44 @@ def main(argv: list[str] | None = None) -> int:
         else _env_float("PILOT_HUMAN_REVIEW_OVERLAP_RATIO", DEFAULT_OVERLAP_RATIO)
     )
     seed = args.seed if args.seed is not None else _env_int("PILOT_HUMAN_REVIEW_SEED", DEFAULT_SEED)
-    sample_unit = resolve_sample_unit(
-        args.sample_unit if args.sample_unit is not None
-        else os.getenv("PILOT_HUMAN_REVIEW_SAMPLE_UNIT")
-    )
 
     # --- Work out the sample size, with a friendly fallback chain ---
     # In plain English: use the typed --sample-size if given; otherwise the
     # .env setting if given; otherwise, IF a real person is sitting at a
-    # terminal (not a script/CI run), ask them interactively how many
-    # articles they'll evaluate; otherwise leave it at 0, which tells
-    # export_pilot_human_review() to fall back to its own natural default
-    # (one item per evaluated dev article) instead of getting stuck waiting
-    # for input that will never come.
+    # terminal (not a script/CI run), ask them to pick 5/10/25; otherwise
+    # leave it at 0, which tells export_pilot_human_review() to fall back to
+    # the smallest choice instead of getting stuck waiting for input that
+    # will never come.
     # Sample size precedence: --sample-size > PILOT_HUMAN_REVIEW_SAMPLE_SIZE >
-    # interactive prompt (min MIN_ARTICLES, articles unit, only at a real
-    # terminal) > 0. A 0 lets export_pilot_human_review resolve the natural
-    # default (one item per evaluated dev article), so scripted/CI runs keep
-    # their previous behaviour and never block on input.
+    # interactive 5/10/25 prompt (only at a real terminal) > 0.
     env_sample_size = _env_int("PILOT_HUMAN_REVIEW_SAMPLE_SIZE", 0)
     if args.sample_size is not None:
         sample_size = args.sample_size
     elif env_sample_size > 0:
         sample_size = env_sample_size
-    elif sample_unit == "articles" and sys.stdin.isatty():
-        sample_size = prompt_article_count(MIN_ARTICLES)
+    elif sys.stdin.isatty():
+        sample_size = prompt_article_count_choice(ARTICLE_COUNT_CHOICES[0])
     else:
         sample_size = 0
 
     # With every setting resolved, hand off to the main export function —
     # this is the line that actually does the work.
-    result = export_pilot_human_review(
-        sample_size=sample_size,
-        overlap_ratio=overlap_ratio,
-        seed=seed,
-        sample_unit=sample_unit,
-        evaluations_path=args.evaluations,
-        dev_summaries_dir=args.dev_summaries_dir,
-        raw_dir=args.raw_dir,
-        output_dir=args.output_dir,
-    )
+    try:
+        result = export_pilot_human_review(
+            sample_size=sample_size,
+            overlap_ratio=overlap_ratio,
+            seed=seed,
+            evaluations_path=args.evaluations,
+            dev_summaries_dir=args.dev_summaries_dir,
+            raw_dir=args.raw_dir,
+            output_dir=args.output_dir,
+        )
+    except JournalQuotaError as exc:
+        # The dev pool can't supply this tester's per-journal quota even with
+        # backfill (only reachable when the FIRST tester's fresh draw itself
+        # comes up short) — report it plainly instead of a raw traceback.
+        print(f"[pilot_human_review] {exc}")
+        return 1
     # A command-line program signals success/failure with a number: 0 means
     # "everything worked", any non-zero number means "something went wrong".
     return 0 if result is not None else 1

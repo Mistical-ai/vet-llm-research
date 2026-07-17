@@ -49,7 +49,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from human_review import SAMPLE_UNITS  # noqa: E402
 from models_config import all_providers, get_model_spec  # noqa: E402
 from phase3_mode import resolve_mode, VALID_MODES  # noqa: E402
 from run_manifest import (  # noqa: E402
@@ -1305,7 +1304,8 @@ def cmd_stats_engine(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_export_human_review(args: argparse.Namespace) -> int:
-    """Sample + export blind human-review packets from data/evaluations.jsonl.
+    """Export ONE MORE blind human-review reviewer folder (humanN/) from
+    data/evaluations.jsonl.
 
     Offline only — no API calls are made. The mode banner is printed only for
     consistency with the other subcommands (same rationale as cmd_extract).
@@ -1314,12 +1314,10 @@ def cmd_export_human_review(args: argparse.Namespace) -> int:
     from human_review import main as human_review_main
 
     delegate: list[str] = []
-    if args.reviewers is not None:
-        delegate += ["--reviewers", str(args.reviewers)]
     if args.sample_size is not None:
         delegate += ["--sample-size", str(args.sample_size)]
-    if args.sample_unit is not None:
-        delegate += ["--sample-unit", args.sample_unit]
+    if args.overlap_ratio is not None:
+        delegate += ["--overlap-ratio", str(args.overlap_ratio)]
     if args.seed is not None:
         delegate += ["--seed", str(args.seed)]
     return human_review_main(delegate)
@@ -1357,8 +1355,6 @@ def cmd_export_pilot_human_review(args: argparse.Namespace) -> int:
         delegate += ["--sample-size", str(args.sample_size)]
     if args.overlap_ratio is not None:
         delegate += ["--overlap-ratio", str(args.overlap_ratio)]
-    if args.sample_unit is not None:
-        delegate += ["--sample-unit", args.sample_unit]
     if args.seed is not None:
         delegate += ["--seed", str(args.seed)]
     return pilot_human_review_main(delegate)
@@ -1740,22 +1736,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_human = sub.add_parser(
         "export-human-review",
-        help="Export blind human-validation review packets from data/evaluations.jsonl.",
+        help="Export ONE MORE blind human-validation reviewer folder (humanN/) "
+             "from data/evaluations.jsonl.",
     )
     _add_mode_arg(p_human)
-    p_human.add_argument("--reviewers", type=int, default=None,
-                         help="Number of independent reviewer copies to export "
-                              "(default: HUMAN_REVIEWERS from .env, or 1).")
     p_human.add_argument("--sample-size", type=int, default=None,
-                         help="Number to sample, counted per --sample-unit "
-                              "(default: HUMAN_REVIEW_SAMPLE_SIZE from .env, or 15).")
-    p_human.add_argument("--sample-unit", choices=SAMPLE_UNITS, default=None,
-                         help="What --sample-size counts: 'items' (one (article, "
-                              "provider) pair per count, default) or 'articles' "
-                              "(one article per count, every provider's summary "
-                              "of it included -- e.g. 5 articles x 3 providers = "
-                              "15 scored items from 5 articles actually read). "
-                              "Default: HUMAN_REVIEW_SAMPLE_UNIT from .env, or 'items'.")
+                         help="Articles to sample (must be a multiple of the number "
+                              "of study journals, e.g. 5/10/25). Default: "
+                              "HUMAN_REVIEW_SAMPLE_SIZE from .env, or an interactive "
+                              "5/10/25 prompt at a real terminal.")
+    p_human.add_argument("--overlap-ratio", type=float, default=None,
+                         help="Fraction of the previous tester's articles to carry "
+                              "over, balanced per journal (default: "
+                              "HUMAN_REVIEW_OVERLAP_RATIO, or 0.6). 1.0 = identical "
+                              "items every run, 0.0 = a fresh draw each run.")
     p_human.add_argument("--seed", type=int, default=None,
                          help="Sampling seed (default: HUMAN_REVIEW_SEED from .env, or 42).")
     p_human.set_defaults(func=cmd_export_human_review)
@@ -1766,8 +1760,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_mode_arg(p_ingest)
     p_ingest.add_argument("--review-dir", type=Path, default=None,
-                          help="Export directory with reviewer_*/ folders and "
-                               "unblinding_key.json (default: data/human_review/).")
+                          help="Export directory with humanN/ folders and their "
+                               "sibling unblinding_key_human*.json files "
+                               "(default: data/human_review/).")
     p_ingest.add_argument("--output", type=Path, default=None,
                           help="Normalized JSONL output path "
                                "(default: data/human_reviews.jsonl).")
@@ -1780,19 +1775,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_mode_arg(p_pilot)
     p_pilot.add_argument("--sample-size", type=int, default=None,
-                         help="Items to sample per --sample-unit (default: "
-                              "PILOT_HUMAN_REVIEW_SAMPLE_SIZE from .env, or one "
-                              "item per evaluated dev article).")
+                         help="Articles to sample (must be a multiple of the number "
+                              "of study journals, e.g. 5/10/25). Default: "
+                              "PILOT_HUMAN_REVIEW_SAMPLE_SIZE from .env, or an "
+                              "interactive 5/10/25 prompt at a real terminal.")
     p_pilot.add_argument("--overlap-ratio", type=float, default=None,
-                         help="Fraction of the previous tester's items to carry "
+                         help="Fraction of the previous tester's articles to carry "
                               "over (default: PILOT_HUMAN_REVIEW_OVERLAP_RATIO, or "
                               "0.6). 1.0 = identical items every run, 0.0 = a fresh "
                               "draw each run.")
-    p_pilot.add_argument("--sample-unit", choices=SAMPLE_UNITS, default=None,
-                         help="What --sample-size counts: 'articles' (default; one "
-                              "article, every provider summary of it included) or "
-                              "'items' (one (article, provider) pair). Default: "
-                              "PILOT_HUMAN_REVIEW_SAMPLE_UNIT from .env, or 'articles'.")
     p_pilot.add_argument("--seed", type=int, default=None,
                          help="Base sampling seed (default: PILOT_HUMAN_REVIEW_SEED "
                               "from .env, or 42).")
