@@ -8,6 +8,15 @@ Critical assertions:
     Analysis: inter-reviewer agreement appears only with >= 2 reviewers, but
     human-vs-jury correlation is reported even for a lone reviewer.
     All offline — no API is touched.
+
+IN PLAIN ENGLISH
+-----------------
+This file tests the SECOND half of human_review.py: reading a reviewer's
+filled-in scoresheet back in (ingest), and then computing whether reviewers
+agreed with each other and with the AI jury (analysis). Like
+test_human_review.py, every test here builds small fake data by hand, runs
+real human_review.py functions against it, and checks the results with
+``assert`` statements — no real reviewers, articles, or AI calls involved.
 """
 
 from __future__ import annotations
@@ -32,9 +41,20 @@ from human_review import (
 # ---------------------------------------------------------------------------
 # Fixture: a completed export directory (key + filled reviewer scoresheets)
 # ---------------------------------------------------------------------------
+# In plain English: the three small helper functions below (not tests
+# themselves — none start with "test_") build a fake, already-finished
+# human-review export: a private unblinding_key.json plus one or more
+# already-filled-in scoresheet CSVs, saved into a temporary folder. Every
+# real test further down calls one of these to get a ready-made starting
+# point instead of repeating the setup each time.
 
 def _identity(doi: str, summarizer: str, *, unweighted: float, faithfulness: int) -> dict:
-    """One un-blinding-key entry with the LLM jury's own scores for the item."""
+    """One un-blinding-key entry with the LLM jury's own scores for the item.
+
+    In plain English: builds one fake entry of the "answer key" — as if
+    export_human_review had already run and recorded that a given item is
+    really (doi, summarizer), with the AI jury having given it some score.
+    """
     return {
         "doi": doi,
         "summarizer": summarizer,
@@ -52,6 +72,9 @@ def _identity(doi: str, summarizer: str, *, unweighted: float, faithfulness: int
 
 
 # item_id -> (doi, summarizer, llm unweighted overall, llm faithfulness score)
+# In plain English: three fake reviewable items, each already "un-blinded"
+# to a different AI provider, each with a different jury score (4, 3, 5) —
+# used throughout this file as the shared fake answer key.
 _KEY_ITEMS = {
     "item_001": _identity("10.1/d1", "openai", unweighted=4.0, faithfulness=4),
     "item_002": _identity("10.1/d2", "anthropic", unweighted=3.0, faithfulness=3),
@@ -60,6 +83,9 @@ _KEY_ITEMS = {
 
 
 def _write_key(review_dir: Path) -> None:
+    """Save _KEY_ITEMS to disk as unblinding_key.json, exactly like a real
+    export would, so ingest_human_reviews() can find and load it.
+    """
     review_dir.mkdir(parents=True, exist_ok=True)
     (review_dir / "unblinding_key.json").write_text(
         json.dumps({"reviewer_count": 2, "seed": 42, "items": _KEY_ITEMS}, indent=2),
@@ -68,6 +94,13 @@ def _write_key(review_dir: Path) -> None:
 
 
 def _write_scoresheet(review_dir: Path, reviewer_id: int, rows_by_item: dict[str, dict]) -> None:
+    """Write a fake "filled-in" scoresheet CSV for one reviewer, as if they
+    had opened their Excel file and typed the given scores/notes for each
+    item_id. ``rows_by_item`` maps an item_id to a dict of column ->
+    value overrides (e.g. {"faithfulness": 4, "comment": "..."})
+    — any column not mentioned is left blank, matching a partially-filled
+    real sheet.
+    """
     reviewer_dir = review_dir / f"reviewer_{reviewer_id}"
     reviewer_dir.mkdir(parents=True, exist_ok=True)
     path = reviewer_dir / f"scoresheet_reviewer_{reviewer_id}.csv"
@@ -89,7 +122,13 @@ def _uniform(score: int, **extra) -> dict:
 
 
 def _full_export(tmp_path: Path, *, reviewers: int = 2) -> Path:
-    """Two reviewers who both rank the items 4, 3, 5 (perfectly tracking the jury)."""
+    """Two reviewers who both rank the items 4, 3, 5 (perfectly tracking the jury).
+
+    In plain English: builds a complete, ready-to-ingest export folder — the
+    key plus one (or more) reviewers' scoresheets, all scoring the three
+    fake items exactly the same as the AI jury did. This "perfect agreement"
+    setup is the baseline several tests below start from.
+    """
     review_dir = tmp_path / "human_review"
     _write_key(review_dir)
     scores = {"item_001": _uniform(4), "item_002": _uniform(3), "item_003": _uniform(5)}
@@ -101,8 +140,16 @@ def _full_export(tmp_path: Path, *, reviewers: int = 2) -> Path:
 # ---------------------------------------------------------------------------
 # Ingest
 # ---------------------------------------------------------------------------
+# In plain English: this section tests ingest_human_reviews() itself — does
+# it correctly read scoresheets back in, un-blind them using the key, skip
+# what should be skipped, and behave safely when run more than once?
 
 def test_ingest_writes_unblinded_normalized_rows(tmp_path: Path) -> None:
+    """After ingesting one reviewer's filled sheet, human_reviews.jsonl
+    should contain one row per scored item, each carrying the real identity
+    (doi, summarizer) looked up from the key, the reviewer's own average
+    score, and the AI jury's own score for later comparison.
+    """
     review_dir = _full_export(tmp_path, reviewers=1)
     output = tmp_path / "human_reviews.jsonl"
 
@@ -123,6 +170,10 @@ def test_ingest_writes_unblinded_normalized_rows(tmp_path: Path) -> None:
 
 
 def test_ingest_is_idempotent(tmp_path: Path) -> None:
+    """Running ingest twice on the exact same input files should produce a
+    byte-for-byte identical output file both times — the file is fully
+    rewritten each run, never appended to.
+    """
     review_dir = _full_export(tmp_path, reviewers=2)
     output = tmp_path / "human_reviews.jsonl"
 
@@ -136,6 +187,13 @@ def test_ingest_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_ingest_skips_blank_invalid_and_unknown_rows(tmp_path: Path) -> None:
+    """Exercises all three "drop this row" cases in one go: a fully blank
+    row (not-yet-scored, dropped silently), a row with one invalid score
+    (9 is out of the 1-5 range — that one cell is dropped but the rest of
+    the row is kept), and a row for an item_id that isn't in the key
+    (dropped with a warning). Also checks that the expected warning
+    messages were actually produced.
+    """
     review_dir = tmp_path / "human_review"
     _write_key(review_dir)
     _write_scoresheet(review_dir, 1, {
@@ -158,6 +216,10 @@ def test_ingest_skips_blank_invalid_and_unknown_rows(tmp_path: Path) -> None:
 
 
 def test_ingest_missing_key_raises(tmp_path: Path) -> None:
+    """Trying to ingest a folder with no unblinding_key.json at all should
+    fail clearly (FileNotFoundError) rather than silently producing an
+    empty or wrong result.
+    """
     empty_dir = tmp_path / "human_review"
     empty_dir.mkdir()
     with pytest.raises(FileNotFoundError):
@@ -165,6 +227,10 @@ def test_ingest_missing_key_raises(tmp_path: Path) -> None:
 
 
 def test_ingest_main_returns_error_without_key(tmp_path: Path) -> None:
+    """Same missing-key scenario as above, but through the command-line
+    entry point (ingest_main) — it should report failure via exit code 1
+    instead of letting the exception escape uncaught.
+    """
     empty_dir = tmp_path / "human_review"
     empty_dir.mkdir()
     exit_code = ingest_main(["--review-dir", str(empty_dir), "--output", str(tmp_path / "out.jsonl")])
@@ -174,8 +240,17 @@ def test_ingest_main_returns_error_without_key(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
+# In plain English: this section tests analyze_human_reviews() — the
+# function that turns the ingested rows into the actual "do humans agree
+# with each other / with the AI jury?" statistics.
 
 def test_analyze_single_reviewer_has_correlation_but_no_agreement(tmp_path: Path) -> None:
+    """With only one reviewer, there's no second person to check agreement
+    against (inter_reviewer_agreement stays unavailable), but human-vs-jury
+    correlation should still be fully computed. Since this reviewer's scores
+    (4,3,5) exactly match the jury's, every agreement statistic should come
+    out "perfect" (1.0).
+    """
     review_dir = _full_export(tmp_path, reviewers=1)
     output = tmp_path / "human_reviews.jsonl"
     ingest_human_reviews(review_dir=review_dir, output_path=output)
@@ -199,6 +274,11 @@ def test_analyze_single_reviewer_has_correlation_but_no_agreement(tmp_path: Path
 
 
 def test_analyze_two_reviewers_reports_inter_reviewer_alpha(tmp_path: Path) -> None:
+    """With two reviewers who scored identically, inter-reviewer agreement
+    (Krippendorff's alpha) should now be computable and come out perfect
+    (1.0), and each reviewer should still get their own per-criterion
+    breakdown.
+    """
     review_dir = _full_export(tmp_path, reviewers=2)
     output = tmp_path / "human_reviews.jsonl"
     ingest_human_reviews(review_dir=review_dir, output_path=output)
@@ -217,6 +297,10 @@ def test_analyze_two_reviewers_reports_inter_reviewer_alpha(tmp_path: Path) -> N
 
 
 def test_analyze_empty_is_unavailable() -> None:
+    """Analyzing an empty list of rows (nothing ingested yet) should report
+    itself as unavailable with a helpful, human-readable reason, rather than
+    crashing.
+    """
     analysis = analyze_human_reviews([])
     assert analysis["available"] is False
     assert "human_reviews.jsonl" in analysis["reason"]
@@ -225,9 +309,22 @@ def test_analyze_empty_is_unavailable() -> None:
 # ---------------------------------------------------------------------------
 # Validation mode switch: per_reviewer (default) vs pooled vs both
 # ---------------------------------------------------------------------------
+# In plain English: analyze_human_reviews() can report human-vs-jury
+# correlation in different ways — one number per reviewer ("per_reviewer"),
+# one number averaged across all reviewers ("pooled"), or both at once. This
+# section proves those modes genuinely behave differently, using a
+# deliberately disagreeing pair of fake reviewers so the difference is
+# obvious in the numbers.
 
 def _write_disagreeing_two_reviewers(tmp_path: Path) -> Path:
-    """Reviewer 1 tracks the jury (4,3,5); reviewer 2 inverts it (2,5,1)."""
+    """Reviewer 1 tracks the jury (4,3,5); reviewer 2 inverts it (2,5,1).
+
+    In plain English: builds a fixture where the two reviewers actively
+    disagree with each other — one matches the AI jury's ranking exactly,
+    the other ranks the same three items in the opposite order. This is
+    what makes it possible to prove, below, that "per_reviewer" mode keeps
+    them separate while "pooled" mode blends them together.
+    """
     review_dir = tmp_path / "human_review"
     _write_key(review_dir)
     _write_scoresheet(review_dir, 1, {"item_001": _uniform(4), "item_002": _uniform(3),
@@ -256,6 +353,11 @@ def test_per_reviewer_mode_isolates_each_reviewer(tmp_path: Path) -> None:
 
 
 def test_pooled_mode_averages_reviewers(tmp_path: Path) -> None:
+    """In "pooled" mode, the disagreeing reviewers' scores get averaged
+    together per item BEFORE correlating with the jury — which washes out
+    reviewer 1's perfect agreement, so the pooled correlation is no longer
+    a perfect 1.0. There's also no by_reviewer breakdown in this mode.
+    """
     output = tmp_path / "human_reviews.jsonl"
     ingest_human_reviews(review_dir=_write_disagreeing_two_reviewers(tmp_path), output_path=output)
 
@@ -268,6 +370,9 @@ def test_pooled_mode_averages_reviewers(tmp_path: Path) -> None:
 
 
 def test_both_mode_reports_pooled_and_per_reviewer(tmp_path: Path) -> None:
+    """"both" mode should include BOTH the pooled human_vs_jury block AND a
+    by_reviewer breakdown for every reviewer, at the same time.
+    """
     output = tmp_path / "human_reviews.jsonl"
     ingest_human_reviews(review_dir=_full_export(tmp_path, reviewers=2), output_path=output)
 
@@ -278,6 +383,9 @@ def test_both_mode_reports_pooled_and_per_reviewer(tmp_path: Path) -> None:
 
 
 def test_invalid_mode_falls_back_to_default(tmp_path: Path) -> None:
+    """Passing a made-up mode string ("bogus") should not crash — it should
+    silently fall back to the safe default ("per_reviewer").
+    """
     output = tmp_path / "human_reviews.jsonl"
     ingest_human_reviews(review_dir=_full_export(tmp_path, reviewers=1), output_path=output)
 
@@ -289,14 +397,28 @@ def test_invalid_mode_falls_back_to_default(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Correlation primitives (reused from reliability.py)
 # ---------------------------------------------------------------------------
+# In plain English: these tests don't touch human_review.py directly at all
+# — they check the underlying statistics building blocks (imported from
+# reliability.py) that human_review.py's correlation code depends on, using
+# simple hand-checkable number sequences.
 
 def test_pearson_perfect_and_degenerate() -> None:
+    """Pearson correlation of a perfectly straight-line relationship should
+    be exactly 1.0; it should be undefined (None) when one list has no
+    variance at all (every value the same) or when there are fewer than 2
+    data points to compare.
+    """
     assert reliability.pearson([1, 2, 3], [2, 4, 6]) == 1.0
     assert reliability.pearson([1, 1, 1], [2, 4, 6]) is None  # no variance
     assert reliability.pearson([1], [2]) is None              # < 2 points
 
 
 def test_spearman_is_rank_based() -> None:
+    """Spearman correlation only cares about RANK ORDER, not the exact
+    numeric relationship — so a curved-but-always-increasing relationship
+    (y = x^2) scores a perfect 1.0 under Spearman even though it's not a
+    straight line (so Pearson scores less than 1.0 for the same data).
+    """
     # Monotonic-but-nonlinear -> Pearson < 1 while Spearman == 1.
     xs = [1, 2, 3, 4]
     ys = [1, 4, 9, 16]
@@ -305,6 +427,12 @@ def test_spearman_is_rank_based() -> None:
 
 
 def test_correlation_p_values_from_scipy() -> None:
+    """A "p-value" is a standard statistics measure of how likely a result
+    is to have happened by pure chance — small is "probably not a fluke".
+    Checks that a strong, real correlation gets a small p-value, and that
+    the same degenerate cases that make the coefficient itself undefined
+    (no variance, too few points) also make the p-value undefined.
+    """
     # A strong correlation over enough points is significant (small p); the
     # degenerate cases that make the coefficient None make the p-value None too.
     strong_x = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -339,9 +467,23 @@ def test_bland_altman_reports_bias() -> None:
 # ---------------------------------------------------------------------------
 # Research-grade guards: small-sample verdict + both jury modes validated
 # ---------------------------------------------------------------------------
+# In plain English: this last section checks two "don't fool yourself"
+# safety nets that keep the study's conclusions honest — refusing to call a
+# tiny sample "proof", and making sure the human-vs-jury check covers BOTH
+# ways the jury's score can be computed (plain average and clinical-risk-
+# weighted), not just one.
 
 def test_small_sample_correlation_withholds_verdict() -> None:
-    """A perfect r on too few items must NOT be reported as validation."""
+    """A perfect r on too few items must NOT be reported as validation.
+
+    In plain English: getting a "perfect" correlation from only 3 data
+    points is easy to happen by pure luck — it doesn't actually prove
+    anything. This checks that reliability.interpret_correlation() knows
+    that and labels a too-small sample "Underpowered" instead of boasting
+    about the number, even when the number itself (1.0) looks perfect.
+    Once there are enough data points (reliability.MIN_CORRELATION_N), the
+    same perfect score IS allowed to be called a genuinely strong result.
+    """
     assert reliability.MIN_CORRELATION_N > 2
     underpowered = reliability.interpret_correlation(1.0, n=3)
     assert "Underpowered" in underpowered
@@ -351,7 +493,14 @@ def test_small_sample_correlation_withholds_verdict() -> None:
 
 
 def test_weighted_human_composite_matches_jury_formula(tmp_path: Path) -> None:
-    """A fully-filled row's weighted composite equals the jury's own formula."""
+    """A fully-filled row's weighted composite equals the jury's own formula.
+
+    In plain English: when a reviewer has filled in all five criteria, the
+    human "weighted" overall score human_review.py computes should use the
+    EXACT SAME formula (calculate_jury_score with MEDHELM_CRITERION_WEIGHTS)
+    the AI jury itself uses — checked here by computing the expected value
+    independently and comparing it to what ingest actually produced.
+    """
     from evaluator import MEDHELM_CRITERION_WEIGHTS, calculate_jury_score
 
     review_dir = tmp_path / "human_review"
@@ -370,7 +519,15 @@ def test_weighted_human_composite_matches_jury_formula(tmp_path: Path) -> None:
 
 
 def test_partial_row_has_no_weighted_composite(tmp_path: Path) -> None:
-    """A missing criterion must not deflate the weighted composite -> None."""
+    """A missing criterion must not deflate the weighted composite -> None.
+
+    In plain English: if a reviewer leaves even one of the five criteria
+    blank, the weighted overall score must come back as ``None`` (unknown)
+    rather than quietly averaging only the criteria that WERE filled in —
+    which would unfairly make an incomplete row look worse (or better) than
+    it really is. The plain (unweighted) average, by contrast, is fine to
+    compute from just the criteria that were actually filled in.
+    """
     review_dir = tmp_path / "human_review"
     _write_key(review_dir)
     partial = {c: 4 for c in CRITERIA if c != "safety"}  # safety left blank
@@ -385,7 +542,14 @@ def test_partial_row_has_no_weighted_composite(tmp_path: Path) -> None:
 
 
 def test_analyze_reports_both_jury_modes(tmp_path: Path) -> None:
-    """Both the unweighted (MedHELM) and weighted overall correlations appear."""
+    """Both the unweighted (MedHELM) and weighted overall correlations appear.
+
+    In plain English: analyze_human_reviews() should report correlation
+    against BOTH ways the AI jury's overall score can be computed — the
+    plain average ("overall") and the clinical-risk-weighted version
+    ("overall_weighted") — so neither version of the jury score goes
+    unchecked against the human reviewer.
+    """
     review_dir = _full_export(tmp_path, reviewers=1)
     output = tmp_path / "human_reviews.jsonl"
     ingest_human_reviews(review_dir=review_dir, output_path=output)

@@ -2,7 +2,7 @@
 
 ## What it does
 
-For each paper in `data/manifest.jsonl`, sends the paper to **three LLMs** (OpenAI, Anthropic, Gemini) with identical prompts, identical temperature/seed, and identical max-output budget. By default it uses cleaned body text from `data/processed/`. For small comparison runs, `--input-source raw_text` sends the raw extracted JSONL from `data/raw_text/`, and `--input-source pdf` sends the original PDF from `data/raw/` directly to each provider's PDF API.
+For each paper in `data/manifest.jsonl`, sends the paper to **three LLMs** (OpenAI, Anthropic, Gemini) with identical prompts, identical temperature/seed, and identical max-output budget. By default it uses cleaned body text from `data/processed/` (folder name configurable via `PROCESSED_DIR_NAME`; ships as `processedv2` by default). For small comparison runs, `--input-source raw_text` sends the raw extracted JSONL from `data/raw_text/`, and `--input-source pdf` sends the original PDF from `data/raw/` directly to each provider's PDF API.
 
 Real-time summarisation now uses a single Pydantic schema, `VeterinarySummary`, across all three providers. OpenAI uses native parsed completions, Gemini uses native JSON schema output, and Anthropic uses a forced tool call. Each model slot stores both:
 
@@ -70,8 +70,8 @@ Two paths inside the same script:
 | Path                          | Schema                                                                                  |
 |-------------------------------|-----------------------------------------------------------------------------------------|
 | `data/summaries.jsonl`        | One row per paper/input source. Each `models.<provider>` slot: `status`, `summary`, `structured_summary`, `input_tokens`, `output_tokens`, `model_version`, optional `system_fingerprint`, `timestamp`. |
-| `data/summaries_pdf/*.txt`    | Readable `summarize-all` reports for raw PDFs; one file per matched article source. |
-| `data/summaries_txt/*.txt`    | Readable `summarize-all` reports for processed JSONL text; one file per matched article source. |
+| `data/summaries_pdf/*.txt`    | Readable `summarize-all` reports for raw PDFs (`single`/`test`); one file per matched article source. `dev` mode writes to `data/dev_tests/summaries_pdf/*.txt` instead. |
+| `data/summaries_txt/*.txt`    | Readable `summarize-all` reports for processed JSONL text (`single`/`test`); one file per matched article source. `dev` mode writes to `data/dev_tests/summaries_txt/*.txt` instead. |
 | `data/batch_jobs.jsonl`       | One row per submitted batch job (only in `batch` mode).                                 |
 | `data/error_log.jsonl`        | Any retry-exhausted failure.                                                            |
 
@@ -111,7 +111,7 @@ Use this when you want all LLM summaries to follow your preferred structure whil
 |----------|---------------------------------------------------------------------------------|
 | `test`   | All API calls return deterministic `_mock_summary(...)` dicts. Output schema is identical to live runs so downstream code never branches. No spend. |
 | `single` | 1 paper, real-time, 3 providers → 3 API calls. For `summarize-all`, 1 matched PDF/JSONL pair → 6 summaries. Prompts for `yes` before the first call. |
-| `dev`    | `PHASE3_DEV_LIMIT` papers for normal `summarize`; for `summarize-all`, the default is also 1 matched PDF/JSONL pair → 6 summaries unless `--limit N` is passed. Same confirm prompt. Budget-guarded. |
+| `dev`    | `PHASE3_DEV_LIMIT` papers for normal `summarize`; for `summarize-all`, the default is also 1 matched PDF/JSONL pair → 6 summaries unless `--limit N` is passed, written to `data/dev_tests/summaries_pdf/` and `data/dev_tests/summaries_txt/` instead of the top-level folders. Same confirm prompt. Budget-guarded. |
 | `batch`  | Full corpus. Builds and submits OpenAI + Anthropic batch JSONL; Gemini still goes through real-time in the same run. Confirm prompt required. |
 
 PDF-vs-JSONL comparison workflow for one matched DOI/title:

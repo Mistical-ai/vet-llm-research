@@ -4,7 +4,9 @@
 > the hallucination taxonomy, and the jury-score math — it is the source of
 > truth for "what is scored and how." For CLI usage and file paths, see the
 > operator how-to: [evaluator.md](evaluator.md). For the superseded rubric
-> this one replaced, see the [legacy reference](judge_and_rubric.md).
+> this one replaced, see the [legacy reference](judge_and_rubric.md). To read
+> one paper's actual judge output field-by-field, see
+> [reading_detail_eval_reports.md](reading_detail_eval_reports.md).
 
 ## Purpose
 
@@ -406,18 +408,18 @@ trustworthy:
   aggregated.
 - `valid_judge_count`: how many judges produced usable scores.
 
-Default evaluation uses one judge to control cost. `JUDGE_MODELS` supports a
-1 → 2 → 3 judge escalation path, each step a one-line `.env` change with no
-code changes needed:
+Default evaluation uses the full 3-judge panel (`JUDGE_MODELS=openai,anthropic,gemini`),
+matching stock MedHELM's default jury panel size (GPT-4o, Llama-3.3-70B,
+Claude-3.7-Sonnet in the Stanford implementation; this project uses its three
+existing provider integrations instead). `JUDGE_MODELS` can be dialed down to
+fewer judges to control cost, each step a one-line `.env` change with no code
+changes needed:
 
-- `JUDGE_MODELS=openai` — default, cheapest, one judge.
-- `JUDGE_MODELS=openai,anthropic` — two judges, enables `judge_disagreement`.
-- `JUDGE_MODELS=openai,anthropic,gemini` — three judges, matching stock
-  MedHELM's default jury panel size (GPT-4o, Llama-3.3-70B, Claude-3.7-Sonnet
-  in the Stanford implementation; this project uses its three existing
-  provider integrations instead).
+- `JUDGE_MODELS=openai,anthropic,gemini` — default, three judges.
+- `JUDGE_MODELS=openai,anthropic` — two judges, still enables `judge_disagreement`.
+- `JUDGE_MODELS=openai` — cheapest, one judge, no `judge_disagreement`.
 
-Each step roughly multiplies judge-call cost by the number of judges.
+Each step down roughly divides judge-call cost by the number of judges removed.
 
 ### One-step panel switch
 
@@ -430,8 +432,8 @@ shortcut. All three of these select the same `openai,anthropic,gemini` jury:
 - The explicit `JUDGE_MODELS=openai,anthropic,gemini`.
 
 Precedence is: an explicit `--judges` list beats `--jury`, which beats
-`JURY_PRESET`, which beats `JUDGE_MODELS`. The 1-judge default is unchanged when
-none of these is set.
+`JURY_PRESET`, which beats `JUDGE_MODELS`. The 3-judge panel default is unchanged
+when none of these is set.
 
 ### Cross-judge aggregation
 

@@ -19,8 +19,8 @@ The folders this guide revolves around:
 
 ## Before you start (one-time checks)
 
-1. Your `.env` has valid API keys and a budget (`BUDGET_USD` / budget guard) large enough for
-   a few papers.
+1. Your `.env` has valid API keys and a budget (`BUDGET_HARD_STOP` / budget guard) large enough
+   for a few papers.
 2. Processed text exists: `data/processedv2/*.jsonl` is populated. If not, run
    `python llm-sum/run_phase3.py extract` first.
 3. `data/manifest.jsonl` has `journal` fields (needed for the one-per-journal pick).
@@ -55,6 +55,14 @@ summaries from `summaries.jsonl`), runs the blind judge, appends rows to
 `data/dev_evals_jsonl/` (quick-glance `.txt`) and `data/dev_detailEval_reports/`
 (deep-dive `.md`).
 
+**Capped and journal-balanced per run:** if more papers are pending (summarized but not yet
+judged) than `PHASE3_DEV_LIMIT` (default 5, or `--limit N`), this run judges only that many —
+picked evenly across journals, one per journal per round — and prints a "Dev-mode
+journal-stratified sampling" table showing exactly which DOIs were picked and how many were
+deferred. Deferred papers aren't lost; they're simply still pending, so the next
+`evaluate --mode dev` run reconsiders them (see Step 5). `--no-resume` ignores this cap and
+always re-judges every paper in `data/dev_summaries_jsonl/`.
+
 ## Step 4 — Eyeball the scores
 
 - `data/dev_evals_jsonl/*.txt` for a quick glance: per-provider aggregate scores,
@@ -65,7 +73,10 @@ summaries from `summaries.jsonl`), runs the blind judge, appends rows to
   completeness, practical usefulness, clarity, safety), the individual hallucination
   claims (not just a count), automatic text metrics, and how much the judges agreed with
   each other on this paper. Open it in a Markdown preview -- headings and tables, not a
-  flat text dump.
+  flat text dump. **New to these files?**
+  [reading_detail_eval_reports.md](reading_detail_eval_reports.md) walks through one
+  real example top to bottom, explains what every number means, and shows how to set up
+  the Markdown preview in VS Code.
 
 For an aggregate view across every judged paper, run the offline report:
 
@@ -77,9 +88,11 @@ python llm-sum/run_phase3.py eval-report --markdown
 
 Just run Steps 1 and 3 again. `summarize --mode dev` skips papers already in
 `dev_summaries_jsonl/` and picks *new* ones; `evaluate --mode dev` skips papers already in
-`dev_evals_jsonl/` and judges only the new ones (and this always keeps
-`dev_detailEval_reports/` in sync with `dev_evals_jsonl/` -- same DOIs, written together).
-Repeat until you've seen enough.
+`dev_evals_jsonl/` and judges up to `PHASE3_DEV_LIMIT` of the rest, journal-balanced (and this
+always keeps `dev_detailEval_reports/` in sync with `dev_evals_jsonl/` -- same DOIs, written
+together). If Step 3 deferred some papers because the pending pool was bigger than the cap,
+running it again picks up wherever it left off — no need to track which ones by hand. Repeat
+until you've seen enough.
 
 ## If you need to redo a paper
 

@@ -14,9 +14,9 @@ Prerequisite: run `extract` first so `data/processed/` exists.
 |--------------|--------|
 | Matching | Finds article stems present in both `data/raw/*.pdf` and `data/processed/*.jsonl` |
 | Default in `single` / `dev` | 1 matched pair → **6 summaries** (3 providers × 2 source types) |
-| PDF summaries | `data/summaries_pdf/<stem>.txt` — OpenAI, Anthropic, Gemini on the raw PDF |
-| JSONL summaries | `data/summaries_txt/<stem>.txt` — same 3 providers on processed text |
-| Dev mode | Same default: `python llm-sum/run_phase3.py summarize-all --mode dev` |
+| PDF summaries (`single`/`test`) | `data/summaries_pdf/<stem>.txt` — OpenAI, Anthropic, Gemini on the raw PDF |
+| JSONL summaries (`single`/`test`) | `data/summaries_txt/<stem>.txt` — same 3 providers on processed text |
+| Dev mode | Same 1-matched-pair default, but outputs go to `data/dev_tests/summaries_pdf/<stem>.txt` and `data/dev_tests/summaries_txt/<stem>.txt` instead: `python llm-sum/run_phase3.py summarize-all --mode dev` |
 | Free mock | `python llm-sum/run_phase3.py summarize-all --mode test` |
 | More articles | Add `--limit N` for N matched pairs (N × 6 summaries) |
 
@@ -26,16 +26,21 @@ Type `yes` at the confirmation prompt for paid modes (`single`, `dev`).
 
 ## What it does
 
-The Phase 3 orchestrator CLI. One entry point with seven subcommands; every subcommand prints the active `PHASE3_MODE` banner before doing anything so you cannot run a paid call without seeing the mode first.
+The Phase 3 orchestrator CLI. One entry point with twelve subcommands; every subcommand prints the active `PHASE3_MODE` banner before doing anything so you cannot run a paid call without seeing the mode first.
 
 ```
-run_phase3.py extract       → prepare_texts.main()
-run_phase3.py summarize     → summarizer.main()  (or --estimate → cost_estimator)
-run_phase3.py summarize-all → paired PDF + processed JSONL comparison (readable .txt files)
-run_phase3.py evaluate      → evaluator.main()
-run_phase3.py eval-report   → eval_report.main()  (read-only; saves to data/results/)
-run_phase3.py status        → reads jsonl files, prints counts
-run_phase3.py clean         → deletes data/batch/*.jsonl scratch files
+run_phase3.py extract                     → prepare_texts.main()
+run_phase3.py summarize                   → summarizer.main()  (or --estimate → cost_estimator)
+run_phase3.py summarize-all               → paired PDF + processed JSONL comparison (readable .txt files)
+run_phase3.py evaluate                    → evaluator.main()
+run_phase3.py eval-report                 → eval_report.main()  (read-only; saves to data/results/)
+run_phase3.py report-figures              → report_figures.main()  (Phase 6 charts and leaderboard)
+run_phase3.py stats-engine                → stats_engine.main()  (Phase 6 significance tests)
+run_phase3.py export-human-review         → human_review.main()  (Phase 5 blind review packets)
+run_phase3.py ingest-human-review         → human_review.ingest_main()  (Phase 5 load vet scoresheets)
+run_phase3.py export-pilot-human-review   → pilot_human_review.main()  (Phase 5 dev-pool trial run, see pilot_human_review.md)
+run_phase3.py status                      → reads jsonl files, prints counts
+run_phase3.py clean                       → deletes data/batch/*.jsonl scratch files
 ```
 
 Calling `run_phase3.py <cmd>` and calling the underlying script directly do exactly the same thing. The orchestrator is just for the muscle-memory of "I want to do Phase 3 stuff" without remembering which file each step lives in.
@@ -85,7 +90,7 @@ python llm-sum/run_phase3.py status --help
 
 ### `extract` (always free — no API calls)
 
-Build or refresh `data/raw_text/*.jsonl` and `data/processed/*.jsonl` from PDFs in `data/raw/`.
+Build or refresh `data/raw_text/*.jsonl` and `data/processed/*.jsonl` (folder name configurable via `PROCESSED_DIR_NAME`; ships as `processedv2` by default) from PDFs in `data/raw/`.
 
 ```powershell
 python llm-sum/run_phase3.py extract
@@ -167,11 +172,16 @@ The manual PDF-vs-processed comparison workflow. Matches articles by shared file
 | Processed JSONL (`data/processed/`) | OpenAI, Anthropic, Gemini | 3 |
 | **Total** | | **6** |
 
-Outputs are readable text files (not `summaries.jsonl`):
+Outputs are readable text files (not `summaries.jsonl`). `single`/`test` write
+to the top-level folders; `dev` defaults to `data/dev_tests/` instead so paid
+dev experiments stay separate from the main comparison output:
 
 ```text
-data/summaries_pdf/<matched-article-stem>.txt   ← 3 provider sections
-data/summaries_txt/<matched-article-stem>.txt   ← 3 provider sections
+data/summaries_pdf/<matched-article-stem>.txt              ← single / test, 3 provider sections
+data/summaries_txt/<matched-article-stem>.txt               ← single / test, 3 provider sections
+
+data/dev_tests/summaries_pdf/<matched-article-stem>.txt     ← dev, 3 provider sections
+data/dev_tests/summaries_txt/<matched-article-stem>.txt     ← dev, 3 provider sections
 ```
 
 ```powershell

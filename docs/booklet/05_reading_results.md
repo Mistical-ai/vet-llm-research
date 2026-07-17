@@ -232,8 +232,9 @@ help or hurt its scores?
 A one-line summary of **Krippendorff's alpha** (a chance-corrected agreement
 score between judges — Chapter 4 introduces it as "the rigorous version of
 judge disagreement"; Chapter 6 teaches the actual math) — populated only
-when a **jury** of two or more judges scored the same articles. With the
-default single judge, this reads "not available," not zero.
+when a **jury** of two or more judges scored the same articles (the default).
+If `JUDGE_MODELS` is dialed down to a single judge, this reads "not available,"
+not zero.
 
 #### Information density
 

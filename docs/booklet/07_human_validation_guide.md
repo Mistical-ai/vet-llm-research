@@ -54,34 +54,58 @@ labeled only with a plain reference number.
 
 ## 3. What you'll receive
 
-You'll get two things:
+You'll get the following, all in one folder:
 
-1. **A reading document.** This contains a set of items, each labeled
-   something like "item 001," "item 002," and so on. Each item has two
-   parts: the full text of the original research article, and three
-   AI-written summaries of it. That's all — no author names, no journal name
-   tricks, no hints about which AI wrote the summary.
+1. **One folder per item**, labeled `item_001`, `item_002`, and so on, plus a
+   short **index** (`packet.md`) that lists them all. Open each item folder and
+   you'll find two files: `article.md` (the full text of the original research
+   article) and `summary.md` (one AI-written summary of it). That's all — no
+   author names, no journal name tricks, no hints about which AI wrote the
+   summary. (The article's title *is* shown, which is fine — it tells you which
+   paper you're reading, not which AI wrote the summary.) **The same article
+   will appear in more than one item folder**, each time with a different
+   summary (labeled "version 1 of 3," and so on). Score each one on its own, as
+   if you were seeing the article for the first time — don't look back at how you
+   scored an earlier version of the same article.
 
-2. **A scoring sheet.** This is a simple spreadsheet with one row for every
-   item in the reading document. You'll fill in your scores and notes for
-   each item, one row at a time.
+2. **A scoring sheet** (`.xlsx`, an Excel file that also opens in Google Sheets
+   or Apple Numbers). It has one row for every item, keyed by the same
+   `item_001`/`item_002` label as the folders, so you always know which row goes
+   with which item. The score cells have drop-down menus so you can just pick a
+   number instead of typing it, and when an article repeats, its rows are
+   labeled with the version number so you can tell them apart. (An older `.csv`
+   version works the same way, minus the drop-downs.)
+
+3. **The original article PDFs** — *only in some hand-offs.* If your folder
+   contains a subfolder called `original_articles/`, it holds the original
+   published PDF of each article in your reading document. These are there
+   purely as a convenience — the real figures, tables, and layout can be
+   easier to read than the plain text in the item folders. **Score each summary
+   against the article text in that item's `article.md`, not the PDF.** That
+   text is exactly what the AI system was given to work from, so judging the
+   summary against it keeps the comparison fair — a PDF may show a chart or
+   table the AI never actually received. Think of the PDF as helpful
+   background, not the thing being graded against. (If there's no
+   `original_articles/` folder, don't worry — everything you need to score is
+   already in the item folders.)
 
 You will **not** receive any file that reveals which AI wrote which summary.
-If you're ever sent a file besides these two, or you accidentally come
-across one, please don't open it — just let us know, and set it aside.
-That file exists purely so we can match everything back up on our end after
-all reviewers have finished; it plays no role in your scoring.
+If you're ever sent a file besides these, or you accidentally come across
+one, please don't open it — just let us know, and set it aside. That file
+exists purely so we can match everything back up on our end after all
+reviewers have finished; it plays no role in your scoring.
 
 ---
 
 ## 4. How to work through an item
 
-Take the items one at a time, in order. For each one:
+Take the items one at a time, in order (`item_001`, then `item_002`, …). For
+each one, open its folder:
 
-1. **Read the original article first**, just as you normally would when
-   evaluating a piece of veterinary literature — enough to form your own
-   sense of what it actually found and concluded.
-2. **Then read the AI-written summary** of that same article.
+1. **Read `article.md` first** — the original article — just as you normally
+   would when evaluating a piece of veterinary literature, enough to form your
+   own sense of what it actually found and concluded.
+2. **Then read `summary.md`**, the AI-written summary of that same article.
 3. **Ask yourself: if a colleague handed me this summary instead of the
    article, would it serve me well — and could it mislead me?**
 4. **Fill in that item's row on the scoring sheet** before moving to the

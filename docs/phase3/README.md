@@ -10,6 +10,8 @@ This is a hands-on walkthrough for turning your collected PDFs into LLM summarie
 | [run_phase3.md](run_phase3.md) | Full CLI/flag reference for the orchestrator. |
 | [medhelm_evaluation.md](medhelm_evaluation.md) | **Authoritative** rubric definition and jury-score math for the current default judge. |
 | [evaluator.md](evaluator.md) | Operator how-to for `evaluator.py` — CLI, inputs/outputs, troubleshooting. |
+| [dev_evaluation_guide.md](dev_evaluation_guide.md) | Step-by-step loop for trying `summarize --mode dev` / `evaluate --mode dev` on a small sample before a real run. |
+| [reading_detail_eval_reports.md](reading_detail_eval_reports.md) | Cell-by-cell guide to `data/dev_detailEval_reports/*.md` — what every heading, table, and number means, and how to open the files in Markdown preview. |
 | [judge_and_rubric.md](judge_and_rubric.md) | Legacy reference for the superseded Vet-Score v2.0 rubric (`judge_v2.txt`). |
 | [summarizer.md](summarizer.md) | Operator how-to for `summarizer.py`. |
 | [prepare_texts.md](prepare_texts.md) | Operator how-to for PDF-to-text extraction. |
@@ -17,6 +19,8 @@ This is a hands-on walkthrough for turning your collected PDFs into LLM summarie
 | [cost_estimator.md](cost_estimator.md) | Operator how-to for offline cost forecasting. |
 | [check_batch_status.md](check_batch_status.md) | Operator how-to for collecting batch-API results. |
 | [../phase4/README.md](../phase4/README.md) | Scenarios, offline rubric, and run-manifest provenance (Phase 4). |
+| [../phase5/human_validation.md](../phase5/human_validation.md) | Blind human validation of the LLM jury — export packets, ingest scoresheets, agreement/correlation (Phase 5). |
+| [../phase5/pilot_human_review.md](../phase5/pilot_human_review.md) | Trial the human-validation workflow on the dev pool before the real run — incremental `humanN/` folders, `.xlsx` scoresheet, copied PDFs. |
 
 > **Primary command right now** — six summaries from one matched article (3 from raw PDF + 3 from processed JSONL). Use the hyphenated subcommand **`summarize-all`**, not `summarize all`:
 >
@@ -24,7 +28,7 @@ This is a hands-on walkthrough for turning your collected PDFs into LLM summarie
 > python llm-sum/run_phase3.py summarize-all --mode single
 > ```
 >
-> Outputs: `data/summaries_pdf/<stem>.txt` and `data/summaries_txt/<stem>.txt`. Same default in dev: `--mode dev`. Free mock: `--mode test`. Full reference: [run_phase3.md](run_phase3.md).
+> Outputs: `data/summaries_pdf/<stem>.txt` and `data/summaries_txt/<stem>.txt`. In `--mode dev`, outputs instead default to `data/dev_tests/summaries_pdf/<stem>.txt` and `data/dev_tests/summaries_txt/<stem>.txt` (keeps paid dev experiments separate). Free mock: `--mode test`. Full reference: [run_phase3.md](run_phase3.md).
 
 > **Golden rule:** the pipeline always starts in **test mode** (free, no API calls). You have to *deliberately* switch to a paid mode. So you can't accidentally spend money by following these steps — experiment freely.
 
@@ -137,11 +141,16 @@ python llm-sum/run_phase3.py summarize-all --mode single
 python llm-sum/run_phase3.py summarize-all --mode dev
 ```
 
-Outputs are written as readable text files:
+Outputs are written as readable text files — `single`/`test` write to the
+top-level folders, `dev` defaults to `data/dev_tests/` instead so paid dev
+experiments stay separate:
 
 ```text
-data/summaries_pdf/<matched-article-stem>.txt
+data/summaries_pdf/<matched-article-stem>.txt              # single / test
 data/summaries_txt/<matched-article-stem>.txt
+
+data/dev_tests/summaries_pdf/<matched-article-stem>.txt    # dev
+data/dev_tests/summaries_txt/<matched-article-stem>.txt
 ```
 
 **Why a single knob instead of several settings?** An earlier version had two separate switches that interacted in confusing ways — it was easy to *think* you were safe when you weren't. Collapsing everything into one named mode means there's exactly one thing to check, and its name tells you what will happen. `test` mode is also the default, so if you forget to set anything, nothing gets charged.
@@ -204,7 +213,7 @@ If all of that works, your pipeline is healthy and you're ready to spend real mo
 python llm-sum/run_phase3.py extract
 ```
 
-Reads every PDF in `data/raw/`, extracts the full text with column-aware `pdfplumber` settings, strips the references section and publisher boilerplate, and saves the clean text to `data/processed/<name>.jsonl`. It also saves the raw extracted text to `data/raw_text/<name>.jsonl` so you can compare “what came straight out of the PDF” against “what the LLM normally receives.”
+Reads every PDF in `data/raw/`, extracts the full text with column-aware `pdfplumber` settings, strips the references section and publisher boilerplate, and saves the clean text to `data/processed/<name>.jsonl` (folder name configurable via `PROCESSED_DIR_NAME`; ships as `processedv2` by default). It also saves the raw extracted text to `data/raw_text/<name>.jsonl` so you can compare “what came straight out of the PDF” against “what the LLM normally receives.”
 
 ```
 data/raw/jvim__pre_illness_diet__10_1111_jvim_16872.pdf
@@ -309,7 +318,7 @@ For each summary, a judge model scores quality, counts hallucinations, and flags
 }
 ```
 
-**Why this improves reproducibility:** `model_ids`/`resolved_model_versions` are dicts keyed by provider — with the default `JUDGE_MODELS=openai` they hold one entry, and scale to more without any manifest code changes if you switch to a multi-judge panel. `status` is always a terminal `completed`/`failed` value (set in a `finally` block), even if the run crashes mid-evaluation, so a manifest never silently looks "in progress" forever.
+**Why this improves reproducibility:** `model_ids`/`resolved_model_versions` are dicts keyed by provider — with the default `JUDGE_MODELS=openai,anthropic,gemini` panel they hold three entries, and scale up or down without any manifest code changes if you change the judge panel. `status` is always a terminal `completed`/`failed` value (set in a `finally` block), even if the run crashes mid-evaluation, so a manifest never silently looks "in progress" forever.
 
 ### Step 4 — `status` (always free)
 
@@ -350,11 +359,15 @@ python llm-sum/run_phase3.py summarize-all --mode dev
 ```
 
 The script matches by shared article stem, which includes the title-derived
-filename and DOI slug. It writes:
+filename and DOI slug. It writes (top-level for `single`; under
+`data/dev_tests/` for `dev`):
 
 ```text
-data/summaries_pdf/<matched-article-stem>.txt
+data/summaries_pdf/<matched-article-stem>.txt              # single / test
 data/summaries_txt/<matched-article-stem>.txt
+
+data/dev_tests/summaries_pdf/<matched-article-stem>.txt    # dev
+data/dev_tests/summaries_txt/<matched-article-stem>.txt
 ```
 
 ### Recipe B — "Small real run on 5 papers"

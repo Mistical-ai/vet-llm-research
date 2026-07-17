@@ -5,7 +5,7 @@
 Walks every PDF in `data/raw/` and writes two one-line JSONL cache files:
 
 * `data/raw_text/<descriptive_stem>.jsonl` contains the raw column-aware `pdfplumber` extraction.
-* `data/processed/<descriptive_stem>.jsonl` contains the cleaned full-text body after publisher noise and references are removed.
+* `data/processed/<descriptive_stem>.jsonl` contains the cleaned full-text body after publisher noise and references are removed (folder name configurable via `PROCESSED_DIR_NAME`; ships as `processedv2` by default).
 
 Nothing is truncated at this stage — that happens later inside the summariser when `MAX_INPUT_CHARS` is applied per call.
 

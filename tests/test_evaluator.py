@@ -1,6 +1,16 @@
 """
 Tests for llm-sum/evaluator.py.
 
+IN PLAIN ENGLISH: This file is an automated test suite for evaluator.py — a
+set of small, self-checking exercises that each set up a scenario, run one
+piece of evaluator.py's code, and check ("assert") that the result is what's
+expected. Running `pytest tests/test_evaluator.py` runs every function below
+whose name starts with `test_`; if any of its assert statements fails, pytest
+reports exactly which one and why. None of these tests make real network
+calls to OpenAI/Anthropic/Gemini — everything is either dry-run mode (fake,
+deterministic responses) or a hand-built ("mocked"/"faked") stand-in for a
+real API response, which is what makes it safe to run these automatically.
+
 Critical assertions:
     Blind check: rendered judge prompt contains NONE of the forbidden tokens.
     JSON fallback: response with extra conversational text still yields a score.
@@ -9,14 +19,26 @@ Critical assertions:
     PHASE3_MODE=dev: evaluator honours the dev paper cap.
 """
 
+# Lets type hints be treated as plain text instead of evaluated immediately —
+# see the matching comment in evaluator.py for more detail.
 from __future__ import annotations
 
+# Standard Python toolkits used across these tests: `json` reads/writes JSON
+# text, `Path` represents a file/folder location, and `SimpleNamespace` is a
+# quick way to build a throwaway object with whatever attributes you want
+# (used below to fake the shape of a real API response object).
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
+# pytest is the testing framework that discovers and runs every `test_...`
+# function in this file, and gives us `pytest.MonkeyPatch` — a tool for
+# temporarily changing settings/environment variables/functions for the
+# duration of one test, then automatically undoing the change afterward.
 import pytest
 
+# Import the module under test, plus the specific functions/constants from it
+# that these tests call directly or check the value of.
 import evaluator
 from evaluator import (
     BLIND_FORBIDDEN_TOKENS,
@@ -35,6 +57,12 @@ from evaluator import (
 )
 
 
+# A "fixture" is pytest's mechanism for reusable test setup/teardown code.
+# `autouse=True` means this fixture runs automatically before EVERY test in
+# this file, without each test having to ask for it by name. This particular
+# one forces dry-run mode on, so no test in this file can accidentally try to
+# make a real, paid API call — a belt-and-suspenders safety measure on top of
+# each test's own mocking.
 @pytest.fixture(autouse=True)
 def _force_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """See test_summarizer.py for the rationale — Phase 2's
@@ -45,8 +73,13 @@ def _force_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # ---------------------------------------------------------------------------
 # Blind protocol
+# These tests check the single most important safety rule in evaluator.py:
+# the judge must never be told which AI wrote the summary it's grading.
 # ---------------------------------------------------------------------------
 
+# Checks that the rendered judge prompt (the actual text sent to the judge
+# AI) never contains any of the forbidden provider-identifying words, no
+# matter which reference/candidate text is plugged in.
 def test_blind_judge_prompt_contains_no_model_identifiers() -> None:
     reference = "Reference text body about a clinical trial in dogs."
     candidate = "Some candidate summary text claiming X and Y."
@@ -58,12 +91,19 @@ def test_blind_judge_prompt_contains_no_model_identifiers() -> None:
         )
 
 
+# A structural (not just behavioural) guarantee of the blind protocol: this
+# inspects build_judge_prompt's own function signature (its list of allowed
+# parameter names) using Python's `inspect` module, to prove that there is no
+# way to even pass a summariser name into it — the possibility is removed by
+# the function's design, not just avoided by convention.
 def test_build_judge_prompt_signature_excludes_summariser_name() -> None:
     """The signature must not accept a summariser identifier — that is the
     structural guarantee of the blind protocol."""
     import inspect
     sig = inspect.signature(build_judge_prompt)
     forbidden_params = {"summarizer", "summariser", "model_name", "provider"}
+    # `&` between two sets gives their overlap (items in both). If that
+    # overlap is empty, none of the forbidden names are accepted parameters.
     assert not (set(sig.parameters) & forbidden_params), (
         "build_judge_prompt must not take a summariser identifier parameter."
     )
@@ -71,8 +111,14 @@ def test_build_judge_prompt_signature_excludes_summariser_name() -> None:
 
 # ---------------------------------------------------------------------------
 # JSON parsing + fallback
+# These tests exercise parse_judge_response()'s multi-step fallback chain:
+# clean JSON, then the older schema versions, then regex, then the sentinel.
 # ---------------------------------------------------------------------------
 
+# Feeds parse_judge_response() a clean JSON response using the OLDER
+# "Vet-Score v2.0" 4-dimension field names (factual_accuracy, etc.), to check
+# that this older schema is still parsed correctly and the composite score
+# formula runs end to end.
 def test_clean_json_parsed_directly() -> None:
     """v2 schema: 4 dimension scores → composite computed, quality_score = round(composite)."""
     raw = json.dumps({
@@ -97,6 +143,9 @@ def test_clean_json_parsed_directly() -> None:
     assert parsed["parse_method"] == "json"
 
 
+# Checks that when the AI wraps its JSON answer in chatty extra sentences
+# (as AIs sometimes do despite being asked for pure JSON), the parser still
+# finds and reads the embedded {...} block correctly.
 def test_json_with_conversational_wrapper_still_parses() -> None:
     raw = ("Sure! Here is the evaluation: "
            '{"quality_score": 7, "hallucination_count": 0, '
@@ -108,6 +157,9 @@ def test_json_with_conversational_wrapper_still_parses() -> None:
     assert parsed["parse_method"] == "json"
 
 
+# Checks that when the response isn't valid JSON at all (missing braces and
+# quotes), the regex fallback step still manages to pull out each named field
+# by pattern-matching the raw text directly.
 def test_regex_fallback_extracts_when_json_is_broken() -> None:
     # Missing braces / quotes but the named fields are still grep-able.
     raw = ("quality_score: 6, hallucination_count: 2, "
@@ -121,6 +173,10 @@ def test_regex_fallback_extracts_when_json_is_broken() -> None:
     assert parsed["parse_method"] == "regex"
 
 
+# Feeds a response that isn't JSON and doesn't match any regex pattern
+# either — the final "we have no idea" case — and checks that it correctly
+# produces the SCORE_SENTINEL_MALFORMED (99) flag rather than crashing or
+# guessing at a score.
 def test_completely_malformed_response_triggers_99_sentinel() -> None:
     raw = "Sorry, I cannot evaluate this summary."
     parsed = parse_judge_response(raw)
@@ -130,6 +186,9 @@ def test_completely_malformed_response_triggers_99_sentinel() -> None:
 
 # ---------------------------------------------------------------------------
 # requires_human_review flag
+# Each test below builds a small fake "parsed" dict by hand (rather than
+# going through parse_judge_response) so it can check exactly one trigger
+# condition of needs_human_review() in isolation.
 # ---------------------------------------------------------------------------
 
 def test_requires_human_review_on_low_confidence() -> None:
@@ -151,6 +210,10 @@ def test_does_not_require_review_on_good_response() -> None:
 # Evaluation row construction
 # ---------------------------------------------------------------------------
 
+# Builds a full evaluation row from a fake judge response and checks: the
+# summariser name is kept as metadata on the row (for later joining/
+# analysis) but never leaks into the actual judge prompt text — the same
+# blind-protocol guarantee tested above, now checked at the full-row level.
 def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
     judge_response = {
         "raw_text": json.dumps({
@@ -183,6 +246,9 @@ def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
     assert "anthropic" not in rendered
 
 
+# Checks that the dry-run fake judge response is deterministic: calling it
+# twice with the exact same inputs produces the exact same fake output, which
+# is what makes dry-run tests repeatable instead of randomly flaky.
 def test_mock_judge_response_is_stable() -> None:
     first = evaluator._mock_judge_response(
         "openai", "Reference body.", "Candidate summary."
@@ -193,6 +259,10 @@ def test_mock_judge_response_is_stable() -> None:
     assert first["raw_text"] == second["raw_text"]
 
 
+# Feeds the CURRENT MedHELM-style schema (five named criteria, each with its
+# own score and reasoning) and checks that both the weighted and unweighted
+# jury scores are computed correctly, and that the "primary" jury_score field
+# matches whichever aggregation mode is active by default (unweighted).
 def test_medhelm_schema_parses_criteria_scores() -> None:
     raw = json.dumps({
         "criteria_scores": {
@@ -225,6 +295,10 @@ def test_medhelm_schema_parses_criteria_scores() -> None:
     assert parsed["parse_method"] == "json"
 
 
+# `monkeypatch.setattr(...)` temporarily overwrites a module-level value
+# (here, evaluator.JURY_AGGREGATION_MODE) for the duration of this one test
+# only; pytest automatically restores the original value afterward, so this
+# override can never leak into other tests.
 def test_jury_aggregation_mode_selects_primary_score(monkeypatch: pytest.MonkeyPatch) -> None:
     """JURY_AGGREGATION_MODE=weighted makes the weighted score primary."""
     monkeypatch.setattr(evaluator, "JURY_AGGREGATION_MODE", "weighted")
@@ -246,6 +320,9 @@ def test_jury_aggregation_mode_selects_primary_score(monkeypatch: pytest.MonkeyP
     assert parsed["jury_score"] != parsed["jury_score_unweighted"]
 
 
+# `monkeypatch.setenv(...)` temporarily sets an environment variable (as if
+# it were written in .env) for just this test, automatically undone
+# afterward — the environment-variable equivalent of monkeypatch.setattr.
 def test_jury_criterion_weights_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """A valid JURY_CRITERION_WEIGHTS JSON overrides the hardcoded defaults."""
     import importlib
@@ -259,6 +336,10 @@ def test_jury_criterion_weights_env_override(monkeypatch: pytest.MonkeyPatch) ->
     assert weights == custom
 
 
+# Checks two separate broken-input cases in one test: a JSON object missing
+# some of the five required criteria, and text that isn't valid JSON at all.
+# Both should silently fall back to the safe defaults rather than crashing or
+# producing a partially-broken weights dict.
 def test_jury_criterion_weights_env_override_invalid_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -272,6 +353,9 @@ def test_jury_criterion_weights_env_override_invalid_falls_back(
     assert weights == evaluator._DEFAULT_MEDHELM_CRITERION_WEIGHTS
 
 
+# Three fake judge rows for the same paper (one with a missing score) — check
+# that the average, judge count, and "valid" judge count (excluding the
+# missing one) all come out correctly.
 def test_aggregate_jury_scores_tracks_disagreement() -> None:
     rows = [{"jury_score": 4.5}, {"jury_score": 3.5}, {"jury_score": None}]
     aggregate = aggregate_jury_scores(rows)
@@ -309,6 +393,8 @@ def test_aggregate_jury_scores_empty_rows_returns_nones() -> None:
 
 # ---------------------------------------------------------------------------
 # Judge selection: --judges / --jury / JURY_PRESET / JUDGE_MODELS
+# Each test below checks one rung of resolve_judges()'s priority ladder
+# (explicit list > --jury flag > JURY_PRESET > JUDGE_MODELS default).
 # ---------------------------------------------------------------------------
 
 def test_resolve_judges_defaults_to_judge_models(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -361,6 +447,12 @@ def test_resolve_judges_unknown_preset_falls_back(
     assert resolve_judges(None, jury=False) == ["openai"]
 
 
+# Replaces evaluator._call_judge_openai with a small stand-in function (a
+# "fake"/"mock") that records what message it was called with and returns a
+# canned response, instead of making a real network call. This lets the test
+# verify call_judge()'s wiring (does it build the prompt and route to the
+# right provider function?) without ever touching the real OpenAI API — the
+# core technique used throughout this file to keep tests safe and fast.
 def test_call_judge_uses_call_time_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("PHASE3_MODE", "single")
@@ -391,6 +483,17 @@ def test_call_judge_uses_call_time_dry_run(monkeypatch: pytest.MonkeyPatch) -> N
     assert "Reference body." in captured["message"]
 
 
+# A "class" is a blueprint for creating objects that bundle together data and
+# the functions that act on that data — Python's core building block for
+# "object-oriented" code. Builds small fake stand-in classes that mimic the
+# shape of the real Google Gemini library's objects (Client, its
+# .models.generate_content(...) method,
+# and the config object), then swaps them in for the real library. This lets
+# the test check that _call_judge_gemini() calls the library correctly
+# (right API key, right settings) without needing the real google-genai
+# package installed or a real network call. `**kwargs` here means "accept any
+# number of named arguments and collect them into a dict called kwargs" —
+# used so these fakes can accept whatever arguments the real call passes.
 def test_gemini_judge_uses_google_genai(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
@@ -446,6 +549,12 @@ def test_gemini_judge_uses_google_genai(monkeypatch: pytest.MonkeyPatch) -> None
 # PHASE3_MODE=dev paper cap
 # ---------------------------------------------------------------------------
 
+# Builds a fake summaries.jsonl file (in a temporary, throwaway test folder —
+# `tmp_path`, a pytest built-in that gives each test its own private folder
+# that's cleaned up afterward) with 5 fake papers, then runs the real
+# run_evaluation() loop in dev mode with a cap of 2, and checks that only 2
+# actually got evaluated and written out — proving the paper-count cap is
+# respected end to end, not just checked in isolation.
 def test_dev_mode_caps_paper_count(tmp_path: Path,
                                     monkeypatch: pytest.MonkeyPatch) -> None:
     """
@@ -469,6 +578,10 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
 
     from file_paths import doi_to_slug
 
+    # Build 5 fake papers, each with a matching cached "reference text" file
+    # and a fake OpenAI summary entry, written as JSONL (one JSON object per
+    # line) so the real evaluator code can read them exactly as if they were
+    # produced by a real summarizer.py run.
     with open(summaries_path, "w", encoding="utf-8") as f:
         for i in range(5):
             doi = f"10.9999/eval.{i:04d}"
@@ -507,6 +620,11 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
     assert len(lines) == 2
 
 
+# Checks the `instances=` override path: passes a pre-built instance list
+# straight into run_evaluation() and confirms it never even tries to read
+# summaries.jsonl (the file is asserted not to exist) — proving that the
+# judge loop's actual grading logic works the same regardless of where the
+# list of things-to-judge came from.
 def test_run_evaluation_with_explicit_instances_bypasses_summaries_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -546,6 +664,10 @@ def test_run_evaluation_with_explicit_instances_bypasses_summaries_path(
 
 # ---------------------------------------------------------------------------
 # Composite score (Vet-Score v2.0)
+# These tests check the OLDER calculate_composite_score() formula (see the
+# "IN PLAIN ENGLISH" note on that function in evaluator.py) against known,
+# hand-worked-out expected results, including edge cases at both ends of the
+# scale and out-of-range inputs.
 # ---------------------------------------------------------------------------
 
 def test_composite_score_all_threes() -> None:
@@ -599,6 +721,9 @@ def test_composite_score_clamps_out_of_range() -> None:
 
 # ---------------------------------------------------------------------------
 # v2 schema parsing
+# More end-to-end checks of parse_judge_response() on the older 4-dimension
+# schema, including hallucination claim details and backward compatibility
+# with the oldest (quality_score-only) schema.
 # ---------------------------------------------------------------------------
 
 def test_new_schema_parses_correctly() -> None:
@@ -684,6 +809,9 @@ def test_regex_fallback_new_fields() -> None:
 
 # ---------------------------------------------------------------------------
 # Hallucination major-severity flag
+# Checks the third trigger condition of needs_human_review() — a
+# major-severity hallucination claim forces review even when confidence is
+# high, but a minor one alone does not.
 # ---------------------------------------------------------------------------
 
 def test_hallucination_major_triggers_review() -> None:
@@ -715,8 +843,20 @@ def test_minor_hallucination_does_not_trigger_review_alone() -> None:
 
 # ---------------------------------------------------------------------------
 # Readable dev-eval mirrors (data/dev_evals_jsonl/, data/dev_detailEval_reports/)
+# These tests check the human-readable report writers at the bottom of
+# evaluator.py: write_dev_eval_jsonl_outputs (.txt) and
+# write_dev_detail_eval_outputs (.md). They build fake evaluation rows
+# directly (via the _fake_eval_row helper below) rather than running a full
+# evaluation, since only the report-formatting logic is under test here.
 # ---------------------------------------------------------------------------
 
+# A helper (not itself a test — it doesn't start with `test_`, so pytest
+# won't run it directly) that builds one realistic-looking fake evaluation
+# row with sensible defaults for every field the report writers read.
+# `**over` collects any extra keyword arguments the caller passes in (see
+# the `**kwargs` explanation above) and `row.update(over)` overwrites the
+# defaults with them — a compact way to let each test override just the one
+# or two fields it cares about, e.g. `_fake_eval_row(..., requires_human_review=True)`.
 def _fake_eval_row(doi: str, summarizer: str, judge: str, **over) -> dict:
     row = {
         "doi": doi,
@@ -756,11 +896,21 @@ def _fake_eval_row(doi: str, summarizer: str, judge: str, **over) -> dict:
     return row
 
 
+# A fake stand-in for the manifest index (normally loaded from
+# data/manifest.jsonl) that supplies just one paper's title/journal — enough
+# for the tests below to check that titles get looked up correctly, and that
+# a DOI with no manifest entry (like "10.2/bbb" further down) falls back
+# gracefully instead of crashing.
 _FAKE_MANIFEST_INDEX = {
     "10.1/aaa": {"title": "A study of aaa in cats", "journal": "JVIM"},
 }
 
 
+# Writes fake evaluation rows for 3 DOIs but only requests reports for 2 of
+# them, then checks: exactly 2 files were written, each contains the right
+# provider sections and the DOI-derived header, the un-requested DOI produced
+# no file, and a DOI missing from the manifest still produces a valid file
+# with "Not recorded" instead of a title.
 def test_write_dev_eval_jsonl_outputs_writes_one_file_per_doi(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -785,7 +935,7 @@ def test_write_dev_eval_jsonl_outputs_writes_one_file_per_doi(
     assert written == 2
 
     aaa = (out_dir / f"{doi_to_slug('10.1/aaa')}.txt").read_text(encoding="utf-8")
-    # Header begins with DOI: so run_phase3._read_dois_from_dev_folder can parse it.
+    # Header begins with DOI: so eval_instances.read_dois_from_dev_folder can parse it.
     assert aaa.startswith("DOI: 10.1/aaa")
     # Title line is sourced from the manifest index.
     assert "Title: A study of aaa in cats" in aaa
@@ -801,6 +951,9 @@ def test_write_dev_eval_jsonl_outputs_writes_one_file_per_doi(
     assert "Title: Not recorded" in bbb
 
 
+# Runs the writer twice in a row for the same DOI and checks there's still
+# only 1 file afterward — proving a re-run overwrites the existing file
+# (matched by DOI slug) instead of creating a second, timestamped duplicate.
 def test_write_dev_eval_jsonl_outputs_overwrites_in_place(
     tmp_path: Path,
 ) -> None:
@@ -822,6 +975,11 @@ def test_write_dev_eval_jsonl_outputs_overwrites_in_place(
     assert len(list(out_dir.glob("*.txt"))) == 1
 
 
+# The Markdown-report equivalent of the .txt test above: checks the deep-dive
+# report includes every judge's own scores and reasoning (not just the
+# aggregate), the title heading, hallucination claim detail, and cross-judge
+# agreement stats — plus the same "un-requested DOI produces no file" and
+# "missing-manifest DOI still works" checks.
 def test_write_dev_detail_eval_outputs_writes_one_file_per_doi(tmp_path: Path) -> None:
     from evaluator import write_dev_detail_eval_outputs
     from file_paths import doi_to_slug
@@ -875,6 +1033,9 @@ def test_write_dev_detail_eval_outputs_writes_one_file_per_doi(tmp_path: Path) -
     assert bbb.startswith("# Untitled -- 10.2/bbb")
 
 
+# Same overwrite-in-place check as
+# test_write_dev_eval_jsonl_outputs_overwrites_in_place above, but for the
+# Markdown deep-dive report writer.
 def test_write_dev_detail_eval_outputs_overwrites_in_place(tmp_path: Path) -> None:
     """A re-judge writes one file per DOI keyed by slug (no timestamped dupes)."""
     from evaluator import write_dev_detail_eval_outputs

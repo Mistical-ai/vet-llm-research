@@ -56,3 +56,9 @@ matplotlib>=3.7
 # note further up: a peer-reviewed, citable library beats a hand-rolled formula
 # whenever one already exists.
 scikit-learn>=1.3
+# Writes the .xlsx human-validation scoresheet (llm-sum/human_review.py's
+# render_scoresheet_xlsx) with dropdown validation, a frozen header, and sized
+# columns so a veterinarian reviewer can fill it in without mistyping a score.
+# Only the pilot export (export-pilot-human-review) uses it today; the real
+# export still writes a plain .csv, so this stays an offline, export-only dep.
+openpyxl>=3.1

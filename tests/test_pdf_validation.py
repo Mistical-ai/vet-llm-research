@@ -19,6 +19,17 @@ import pytest
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(SRC_DIR))
 
+# download.py reads these as module-level constants at import time, so they
+# must be set before `import download` below -- a fixture (which only runs
+# once a test starts) would be too late. Snapshot the pre-existing values
+# first so the module-teardown fixture below can put them back: left
+# unrestored, DRY_RUN=false here leaks into every test file collected after
+# this one for the rest of the pytest session (e.g. it silently turns
+# evaluator.py's rate-limit pacing into real multi-second sleeps in
+# supposedly-instant `--mode test` runs elsewhere).
+_ENV_KEYS = ("DRY_RUN", "SKIP_VALIDATION_FOR_TESTING", "MIN_EXTRACTED_WORDS", "MIN_PAGES", "MIN_SECTIONS")
+_ORIGINAL_ENV = {key: os.environ.get(key) for key in _ENV_KEYS}
+
 # Validation must be active in this test module.
 os.environ["DRY_RUN"] = "false"
 os.environ["SKIP_VALIDATION_FOR_TESTING"] = "false"
@@ -35,6 +46,25 @@ import download  # noqa: E402
 @pytest.fixture(autouse=True)
 def _reload_download_after_test() -> None:
     yield
+    importlib.reload(download)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_env_after_module() -> None:
+    """Undo this module's env pollution once its own tests are done.
+
+    Restores DRY_RUN and friends to their pre-import values (conftest.py's
+    forced DRY_RUN=true, absent an explicit shell override), then reloads
+    `download` so its cached module-level constants reflect the restored
+    environment too -- so a test file collected after this one never
+    inherits this file's validation-testing overrides.
+    """
+    yield
+    for key, value in _ORIGINAL_ENV.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
     importlib.reload(download)
 
 

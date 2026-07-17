@@ -140,7 +140,7 @@ copy .env.template .env
 
 # 5. Verify everything loaded correctly (optional)
 python src/main.py
-# Expected output: "Pipeline Initialized." — if you see this, you're ready.
+# Expected output: "Veterinary LLM Pipeline Initialized." — if you see this, you're ready.
 
 # 6. Run the test suite (optional — all API calls are mocked)
 pytest tests/ -q
@@ -205,15 +205,16 @@ python src/collect.py
 python src/download.py
 ```
 
-**What it does:** Goes through every paper in `data/manifest.jsonl`, tries up to 6 legal open-access sources for each one, validates each PDF, and saves passing PDFs to `data/raw/`. Stops at 50 PDFs per journal.
+**What it does:** Goes through every paper in `data/manifest.jsonl`, tries up to 7 legal open-access sources for each one, validates each PDF, and saves passing PDFs to `data/raw/`. Stops at 50 PDFs per journal.
 
-**The 6 sources it tries (in order):**
+**The 7 sources it tries (in order):**
 1. Unpaywall API
 2. PubMed Central
-3. Semantic Scholar
-4. fulltext-article-downloader tool
-5. Publisher-direct URLs (Wiley, AVMA, SAGE)
-6. HTML scraping
+3. Europe PMC
+4. Semantic Scholar
+5. fulltext-article-downloader tool
+6. Publisher-direct URLs (Wiley, AVMA, SAGE)
+7. HTML scraping
 
 **The 5 validation checks every PDF must pass:**
 1. Starts with `%PDF` magic bytes
@@ -288,7 +289,7 @@ Stop when `pipeline.py` shows 250/250 primary PDFs.
 
 ## Phase 3 — Summarize and evaluate
 
-Once `data/raw/` has enough PDFs, Phase 3 turns them into LLM summaries and judge scores. Extraction is column-aware for two-column journals (JVIM, VRU), writes raw text to `data/raw_text/`, then writes cleaned body text to `data/processed/` with references and publisher noise removed.
+Once `data/raw/` has enough PDFs, Phase 3 turns them into LLM summaries and judge scores. Extraction is column-aware for two-column journals (JVIM, VRU), writes raw text to `data/raw_text/`, then writes cleaned body text to `data/processed/` (folder name configurable via `PROCESSED_DIR_NAME`; ships as `processedv2` by default) with references and publisher noise removed.
 
 ### The four steps (always in this order)
 
@@ -468,8 +469,12 @@ vet-llm-research/
 │   │
 │   ├── raw_text/                 ← Phase 3: column-aware extracted text
 │   ├── processed/                ← Phase 3: cleaned text for LLM summaries
-│   ├── summaries_pdf/            ← Phase 3: summarize-all PDF-source outputs
-│   ├── summaries_txt/            ← Phase 3: summarize-all processed-text outputs
+│   ├── summaries_pdf/            ← Phase 3: summarize-all PDF-source outputs (single/test)
+│   ├── summaries_txt/            ← Phase 3: summarize-all processed-text outputs (single/test)
+│   ├── dev_summaries_jsonl/      ← Phase 3: readable .txt sibling of summaries.jsonl for summarize --mode dev
+│   ├── dev_evals_jsonl/          ← Phase 3: readable .txt sibling of evaluations.jsonl for evaluate --mode dev
+│   ├── dev_detailEval_reports/   ← Phase 3: deep-dive Markdown reports from evaluate --mode dev
+│   ├── dev_tests/                ← Phase 3: summarize-all dev-mode PDF-vs-processed comparison output
 │   ├── human_review/             ← Phase 5: exported blind review packets
 │   ├── run_manifests/            ← Phase 4: provenance records per evaluation run
 │   ├── results/                  ← Phase 3/6: timestamped eval and publication reports
@@ -565,7 +570,7 @@ python llm-sum/check_batch_status.py
 ### Cost estimate before a live run
 
 ```powershell
-python llm-sum/cost_estimator.py
+python llm-sum/run_phase3.py summarize --estimate
 ```
 
 ### Run supplement with a fixed seed

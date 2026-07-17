@@ -292,8 +292,8 @@ nothing here is a new statistic:
   with each other about THIS provider specifically?" A separate,
   all-providers-pooled alpha is reported once under "Overall inter-judge
   reliability." Both need a jury run (`--jury` / `JUDGE_MODELS` with 2+
-  providers) — with the default single judge, every reliability cell reads
-  "not available," not zero.
+  providers, which is the default). If dialed down to a single judge, every
+  reliability cell reads "not available," not zero.
 - **Human validation** (`r_s`, Spearman) — per-provider correlation between
   the LLM jury and human reviewers, read from `data/human_reviews.jsonl`
   (Phase 5) if it exists. Missing file or a provider with no reviewed items →

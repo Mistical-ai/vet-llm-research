@@ -988,6 +988,58 @@ def _cmd_evaluate_from_dev_jsonl(
               "Run 'summarize --mode dev' to add more, or pass --no-resume to re-judge.")
         return 0
 
+    # Cap + journal-balance the pending pool, mirroring `summarize --mode
+    # dev`'s round-robin-by-journal picker (_sample_round_robin_by_journal)
+    # on the judging side. Skipped for --mode test (always judge the whole
+    # mock pool for $0) and for --no-resume (an explicit "re-judge everything
+    # in the folder" request, not "re-judge a capped sample"). Papers left out
+    # by the cap are never marked done, so a follow-up run picks them up.
+    pending_before_sampling = len(target_dois)
+    sampling_info: dict | None = None
+    apply_cap = profile.name != "test" and not args.no_resume
+    if apply_cap:
+        cap = args.limit if args.limit is not None else profile.paper_limit
+        if cap is not None and pending_before_sampling > cap:
+            mapped_by_journal: dict[str, list[dict]] = {}
+            unmapped_dois: list[str] = []
+            for doi in sorted(target_dois):
+                journal = str(manifest_index.get(doi, {}).get("journal", "")).strip().lower()
+                if journal:
+                    mapped_by_journal.setdefault(journal, []).append(
+                        {"doi": doi, "journal": journal}
+                    )
+                else:
+                    unmapped_dois.append(doi)
+
+            if unmapped_dois:
+                msg_lines = [
+                    f"[phase3:evaluate] WARNING: {len(unmapped_dois)} pending dev paper(s) "
+                    "could not be mapped to a journal and will be excluded from the "
+                    "capped sample.",
+                    "  DOIs without a journal mapping in manifest.jsonl:",
+                ] + [f"    {d}" for d in unmapped_dois] + [
+                    "  Add the journal field to manifest.jsonl to include these articles.",
+                ]
+                for line in msg_lines:
+                    print(line)
+                LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                log_path = LOGS_DIR / "eval_journal_mapping.log"
+                ts = datetime.now(timezone.utc).isoformat()
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"\n[{ts}]\n" + "\n".join(msg_lines) + "\n")
+
+            seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
+            selected_records = _sample_round_robin_by_journal(mapped_by_journal, cap, seed=seed)
+            target_dois = {r["doi"] for r in selected_records}
+            journal_counts: dict[str, int] = {}
+            for r in selected_records:
+                journal_counts[r["journal"]] = journal_counts.get(r["journal"], 0) + 1
+            sampling_info = {"limit": cap, "journal_counts": journal_counts}
+
+            print(f"[phase3:evaluate] pending pool ({pending_before_sampling}) exceeds "
+                  f"cap ({cap}); sampled {len(target_dois)} paper(s) balanced across "
+                  f"{len(journal_counts)} journal(s).")
+
     # Hash the specific dev-summary files that seed this run for provenance.
     selected_files = sorted(
         p for p in DEV_SUMMARIES_JSONL_DIR.glob("*.txt")
@@ -1006,7 +1058,9 @@ def _cmd_evaluate_from_dev_jsonl(
             "type": "dev_jsonl",
             "source_dir": str(DEV_SUMMARIES_JSONL_DIR),
             "articles_found": len(source_dois),
+            "articles_pending_before_sampling": pending_before_sampling,
             "articles_to_judge": len(target_dois),
+            "sampling": sampling_info,
         },
         "taxonomy": VET_TAXONOMY_V1.describe(VeterinarySummaryQualityScenario.name),
     }
@@ -1286,6 +1340,28 @@ def cmd_ingest_human_review(args: argparse.Namespace) -> int:
     if args.output is not None:
         delegate += ["--output", str(args.output)]
     return ingest_main(delegate)
+
+
+def cmd_export_pilot_human_review(args: argparse.Namespace) -> int:
+    """Export ONE more pilot reviewer folder (humanN/) from the dev-summary pool.
+
+    Offline only — no API calls are made. The mode banner is printed only for
+    consistency with the other subcommands (same rationale as cmd_extract).
+    See docs/phase5/pilot_human_review.md.
+    """
+    print(resolve_mode(args.mode).banner())
+    from pilot_human_review import main as pilot_human_review_main
+
+    delegate: list[str] = []
+    if args.sample_size is not None:
+        delegate += ["--sample-size", str(args.sample_size)]
+    if args.overlap_ratio is not None:
+        delegate += ["--overlap-ratio", str(args.overlap_ratio)]
+    if args.sample_unit is not None:
+        delegate += ["--sample-unit", args.sample_unit]
+    if args.seed is not None:
+        delegate += ["--seed", str(args.seed)]
+    return pilot_human_review_main(delegate)
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1772,31 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Normalized JSONL output path "
                                "(default: data/human_reviews.jsonl).")
     p_ingest.set_defaults(func=cmd_ingest_human_review)
+
+    p_pilot = sub.add_parser(
+        "export-pilot-human-review",
+        help="Export ONE more pilot reviewer folder (humanN/) from the dev-summary pool "
+             "-- trial the human-validation workflow before the real export.",
+    )
+    _add_mode_arg(p_pilot)
+    p_pilot.add_argument("--sample-size", type=int, default=None,
+                         help="Items to sample per --sample-unit (default: "
+                              "PILOT_HUMAN_REVIEW_SAMPLE_SIZE from .env, or one "
+                              "item per evaluated dev article).")
+    p_pilot.add_argument("--overlap-ratio", type=float, default=None,
+                         help="Fraction of the previous tester's items to carry "
+                              "over (default: PILOT_HUMAN_REVIEW_OVERLAP_RATIO, or "
+                              "0.6). 1.0 = identical items every run, 0.0 = a fresh "
+                              "draw each run.")
+    p_pilot.add_argument("--sample-unit", choices=SAMPLE_UNITS, default=None,
+                         help="What --sample-size counts: 'articles' (default; one "
+                              "article, every provider summary of it included) or "
+                              "'items' (one (article, provider) pair). Default: "
+                              "PILOT_HUMAN_REVIEW_SAMPLE_UNIT from .env, or 'articles'.")
+    p_pilot.add_argument("--seed", type=int, default=None,
+                         help="Base sampling seed (default: PILOT_HUMAN_REVIEW_SEED "
+                              "from .env, or 42).")
+    p_pilot.set_defaults(func=cmd_export_pilot_human_review)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")
     p_clean.set_defaults(func=cmd_clean)

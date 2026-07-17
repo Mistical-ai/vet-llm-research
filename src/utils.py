@@ -210,7 +210,17 @@ def sleep_for_model(model_name: str) -> None:
     key = model_name.lower()
     delay = RATE_LIMITS.get(key, RATE_LIMITS["default"])
 
-    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+    # PHASE3_MODE=test is the documented "last guardrail" (see
+    # llm-sum/phase3_mode.py): it forces dry-run regardless of DRY_RUN so a
+    # stray DRY_RUN=false can't promote a unit test into real behaviour. That
+    # guardrail must hold here too, not just in evaluator._is_dry_run() --
+    # otherwise a polluted DRY_RUN env var still can't trigger a real API
+    # call in test mode, but it can silently turn this into a real
+    # multi-second/minute sleep per call, which looks exactly like a hang.
+    dry_run = (
+        os.getenv("DRY_RUN", "true").lower() == "true"
+        or os.getenv("PHASE3_MODE", "test").strip().lower() == "test"
+    )
     if dry_run:
         # In dry-run mode we skip the actual sleep so tests run instantly.
         # We still print a message so the researcher can verify the delay

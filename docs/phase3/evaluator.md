@@ -22,7 +22,7 @@ Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alo
 | Path                                  | Role                                                                       |
 |---------------------------------------|----------------------------------------------------------------------------|
 | `data/summaries.jsonl`                | Source of (paper, summariser, summary) triples.                            |
-| `data/processed/*.jsonl`              | Cleaned reference text the judge compares against.                         |
+| `data/processed/*.jsonl`              | Cleaned reference text the judge compares against (folder name configurable via `PROCESSED_DIR_NAME`; ships as `processedv2` by default). |
 | `data/evaluations.jsonl` (if exists)  | Used by `--resume` (default on).                                           |
 | `llm-sum/prompts/judge_medhelm_v1.txt` | Default vet-specific judge prompt (MedHELM-style, 5 criteria) — must contain `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`. |
 | `.env`                                | `PHASE3_MODE`, `JUDGE_MODELS` (default `openai,anthropic,gemini`), `JUDGE_PROMPT_FILE`, plus the API key for whatever judges are listed. |

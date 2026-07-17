@@ -310,24 +310,32 @@ python llm-sum/run_phase3.py export-human-review --reviewers 1 --mode test
 python llm-sum/run_phase3.py export-human-review --reviewers 3 --sample-size 15
 ```
 
+Available through `python llm-sum/run_phase3.py export-human-review`:
+
 | Flag | Overrides | Default |
 |---|---|---|
 | `--reviewers N` | `HUMAN_REVIEWERS` | 1 |
-| `--sample-size N` | `HUMAN_REVIEW_SAMPLE_SIZE` | 15 |
-| `--sample-unit {items,articles}` | `HUMAN_REVIEW_SAMPLE_UNIT` | `items` |
+| `--sample-size N` (articles) | `HUMAN_REVIEW_SAMPLE_SIZE` | ask interactively, min 5 |
+| `--sample-unit {articles,items}` | `HUMAN_REVIEW_SAMPLE_UNIT` | `articles` |
 | `--seed N` | `HUMAN_REVIEW_SEED` | 42 |
-| `--evaluations PATH` | — | `data/evaluations.jsonl` |
-| `--output-dir PATH` | — | `data/human_review/` |
 
-`--sample-unit articles` samples distinct articles instead of individual
-`(article, provider)` items, expanding each to every provider summary found
-for it — see "Why sampling can reuse the same article across multiple
-items" above. For example:
+`--evaluations PATH` (default `data/evaluations.jsonl`) and `--output-dir PATH`
+(default `data/human_review/`) are **not** exposed through `run_phase3.py` —
+run `python llm-sum/human_review.py` directly to override those two paths.
+
+The default sample unit is **`articles`**: `--sample-size` counts distinct
+articles (one per journal), and each is expanded to **every provider's summary
+of it** — so 5 articles → 15 scored items from 5 articles actually read (see
+"Why sampling can reuse the same article across multiple items" above). When
+`--sample-size` is omitted (and no `HUMAN_REVIEW_SAMPLE_SIZE` is set), the export
+**asks how many articles** you'll evaluate, enforcing a **minimum of 5** (one per
+journal); a non-interactive run falls back to that minimum.
 
 ```powershell
-python llm-sum/run_phase3.py export-human-review --sample-unit articles --sample-size 5
-# 5 articles selected (stratified across journals), every provider's summary
-# of each included -- typically ~15 scored items, 5 articles actually read.
+python llm-sum/run_phase3.py export-human-review --sample-size 5
+# 5 articles selected (stratified across journals), every provider's summary of
+# each included -> 15 scored items, ordered provider-major (article1..5 provider
+# A, then provider B, then C) so two summaries of one article are never adjacent.
 ```
 
 All three env knobs live in `.env.template` section 19. Like `EVAL_SAMPLE_SEED`,
@@ -366,16 +374,23 @@ printed as a warning; nothing fails silently.
 
 ```text
 data/human_review/
-  unblinding_key.json          NEVER share this file with reviewers
+  unblinding_key.json           NEVER share this file with reviewers
   reviewer_1/
     REVIEWER_GUIDE.md           full zero-jargon guide (copied from
                                  docs/booklet/07_human_validation_guide.md)
-    packet.md                  blind reading packet: item_id + article + summary
-    scoresheet_reviewer_1.csv  blank scoresheet for reviewer 1 to fill in
+    packet.md                   navigation index: one row per item_id -> folder
+    scoresheet_reviewer_1.xlsx  blank scoresheet (dropdowns, version-labeled rows)
+    item_001/
+      article.md                the original article text
+      summary.md                one candidate summary to score against it
+    item_002/
+      ...
+    original_articles/          matched source PDFs copied from data/raw (best-effort)
   reviewer_2/
     REVIEWER_GUIDE.md           identical content to reviewer_1's copy
-    packet.md                  identical content to reviewer_1's packet
-    scoresheet_reviewer_2.csv
+    packet.md                   identical content to reviewer_1's packet
+    scoresheet_reviewer_2.xlsx
+    item_001/ ...
   ...
 ```
 
@@ -396,15 +411,27 @@ what to do with a repeated article — with no other file or context required.
 recap for while scoring) and points to this file for the full explanation,
 rather than duplicating it.
 
-### `packet.md` — what the reviewer reads
+### `packet.md` — the navigation index
 
-One section per sampled item: `## item_XXX`, then the full original article
-text, then the candidate summary. Nothing else — no DOI, no journal, no model
-name.
+A short blind preamble (scoring scale + "score each article independently")
+followed by a table listing every `item_id`, its article title, its version
+(`k of n`, when an article appears more than once), and the `item_NNN/` folder to
+open. The full article text and summary no longer live inline here — each is in
+its own item folder.
 
-### `scoresheet_reviewer_N.csv` — what the reviewer fills in
+### `item_NNN/` — one folder per review item
 
-One blank row per `item_id`, with these columns:
+`article.md` holds the full original article text; `summary.md` holds the single
+candidate summary to score against it. Nothing else — no DOI, no journal, no
+model name. The same article recurs across several `item_NNN/` folders (one per
+provider's summary), each labeled with a blind-safe *version* number.
+
+### `scoresheet_reviewer_N.xlsx` — what the reviewer fills in
+
+One blank row per `item_id` (matching the folder names), with dropdown-validated
+cells (1–5 on the criteria, yes/no on hallucination) and a frozen header. When an
+article contributes more than one summary, its `article_title` cell is suffixed
+`— summary version k of n` so the repeated rows are told apart. The columns:
 
 | Column | Scale | Meaning |
 |---|---|---|
@@ -438,19 +465,21 @@ per export and is not regenerated per reviewer.
 1. Run the export.
 2. Send each reviewer only their own `reviewer_N/` folder — it is now fully
    self-contained (`REVIEWER_GUIDE.md` + `packet.md` +
-   `scoresheet_reviewer_N.csv`), nothing else needs to be separately
-   attached. Do **not** send `unblinding_key.json`.
-3. Ask them to read `REVIEWER_GUIDE.md` once, then fill in the CSV — one row
-   per `item_id`, 1-5 in each numeric column — and return it.
-4. Keep the completed CSVs **in their `reviewer_N/` folders** and
+   `scoresheet_reviewer_N.xlsx` + the `item_NNN/` folders + `original_articles/`),
+   nothing else needs to be separately attached. Do **not** send
+   `unblinding_key.json`.
+3. Ask them to read `REVIEWER_GUIDE.md` once, then work down the packet index:
+   open each `item_NNN/` folder, read `article.md` + `summary.md`, and fill that
+   `item_id`'s row in the `.xlsx` — 1-5 in each numeric column — then return it.
+4. Keep the completed `.xlsx` sheets **in their `reviewer_N/` folders** and
    `unblinding_key.json` together, so ingest (§7) can find both.
 
 ---
 
 ## 7. Ingesting filled scoresheets
 
-Once the reviewers return their CSVs (dropped back into their `reviewer_N/`
-folders under `data/human_review/`):
+Once the reviewers return their filled scoresheets (dropped back into their
+`reviewer_N/` folders under `data/human_review/`):
 
 ```powershell
 python llm-sum/run_phase3.py ingest-human-review
@@ -465,8 +494,9 @@ python llm-sum/run_phase3.py ingest-human-review
 
 1. Loads the private `unblinding_key.json` from the review directory (errors
    clearly if it is missing — ingest cannot un-blind without it).
-2. Reads every `reviewer_*/scoresheet_reviewer_*.csv` (plus any loose
-   `scoresheet_*.csv` at the top level, for a sheet returned without its folder).
+2. Reads every `reviewer_*/scoresheet_reviewer_*.xlsx` (older `.csv` sheets are
+   still read, as is any loose `scoresheet_*.{xlsx,csv}` at the top level, for a
+   sheet returned without its folder).
 3. For each filled row: parses the five 1-5 criteria (blank cells are allowed;
    a value outside 1-5 or non-numeric is **ignored with a warning**, never
    silently trusted), the yes/no `hallucination_present` flag, and the free
@@ -581,6 +611,7 @@ Both run against mock fixtures — `PHASE3_MODE=test`, `$0`, no network.
 
 ## 10. Related reading
 
+- [pilot_human_review.md](pilot_human_review.md) — trial this whole workflow on the dev pool first (incremental `humanN/` folders, `.xlsx` scoresheet, copied source PDFs)
 - [phase3/README.md](../phase3/README.md) — Phase 3 doc map and pipeline overview
 - [phase3/medhelm_evaluation.md](../phase3/medhelm_evaluation.md) — the jury rubric being validated
 - [phase4/README.md](../phase4/README.md) — taxonomy, scenarios, run manifests

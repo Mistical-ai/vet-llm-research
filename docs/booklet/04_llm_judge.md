@@ -394,22 +394,21 @@ compare the two methods directly.
 
 ## 6. One judge, or a panel? Judge disagreement
 
-Everything so far assumed a single judge. That's the default — one judge
-(OpenAI) keeps costs down. But "one grader" invites a fair question: *would a
-different judge have scored it the same way?* A score with no measure of its own
-reproducibility is hard to defend.
+The default is a **judge panel** — three judges (OpenAI, Anthropic, Gemini) score
+every summary. Running more than one judge answers a fair question a single
+grader can't: *would a different judge have scored it the same way?* A score
+with no measure of its own reproducibility is hard to defend.
 
-So the project supports a **judge panel** — running two or three judges over the
-same summaries. It's a one-line configuration change with an escalation path:
+The panel size is a one-line configuration change if you need to dial it down:
 
 | Setting | Judges | What it buys you |
 |---|---|---|
-| `openai` (default) | 1 | Cheapest. One opinion, no agreement estimate. |
+| `openai,anthropic,gemini` (default) | 3 | Three opinions — matching the standard MedHELM jury-panel size. |
 | `openai,anthropic` | 2 | Two independent opinions; enables a disagreement measure. |
-| `openai,anthropic,gemini` | 3 | Three opinions — matching the standard MedHELM jury-panel size. |
+| `openai` | 1 | Cheapest. One opinion, no agreement estimate. |
 
-Each added judge roughly multiplies the judging cost by the number of judges, so
-the panel is opt-in rather than the default.
+Each removed judge roughly divides the judging cost by the number of judges
+remaining, so a smaller panel is opt-in rather than the default.
 
 ### What "judge disagreement" means in plain English
 

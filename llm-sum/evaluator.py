@@ -2,6 +2,21 @@
 llm-sum/evaluator.py — Blind MedHELM-style judge for veterinary summaries
 =========================================================================
 
+IN PLAIN ENGLISH: Three AI models (OpenAI, Anthropic, Gemini) each write a
+summary of a veterinary research paper (that happens in summarizer.py, not
+this file). This file takes those summaries and asks a separate AI model —
+the "judge" — to grade each one, without telling the judge which AI wrote it
+(a "blind" grading, like a blind taste test, so the judge can't play
+favourites). The judge scores five things — faithfulness, completeness,
+clinical usefulness, clarity, and safety — each on a 1-5 scale, and flags any
+made-up or unsupported claims ("hallucinations"). Python (not the AI) then
+does the arithmetic to turn those five numbers into one final score, because
+a fixed formula is more trustworthy and checkable than trusting an AI to add
+numbers correctly. The results are saved to data/evaluations.jsonl. This file
+also contains code that writes easy-to-read .txt and .md report files for a
+small sample of papers ("dev mode"), and code that shows a safety confirmation
+prompt before any real (paid) API call is allowed to go out.
+
 For each (paper, summariser) pair this module asks a separate judge model to
 score a candidate summary against the cleaned article text. The current default
 rubric is MedHELM-style: the judge returns criterion-level scores for
@@ -44,10 +59,22 @@ are submitted by ``batch_utils`` alongside the summariser pass, and
 results are collected by ``check_batch_status.py``).
 """
 
+# This turns on a newer Python behaviour where type hints (the "-> dict"
+# and ": str" notes on functions below) are treated as plain text instead of
+# being evaluated immediately. You don't need to understand type hints to
+# read this file — they're just notes for programmers about what kind of
+# value goes in or out of a function; Python does not enforce them at runtime.
 from __future__ import annotations
 
+# "import" pulls in code that lives in another file so this file can use it.
+# "from X import *" (the star) means "bring in everything that file makes
+# available" — here, shared setup like DATA_DIR and REPO_ROOT used below.
 from _bootstrap import *  # noqa: F401,F403
 
+# Each of these lines below loads one built-in Python toolkit (or, further
+# down, one of this project's own files) so this module can use the tools it
+# provides — e.g. `json` reads/writes JSON text, `re` does pattern matching
+# over text ("regular expressions"), `time` lets code pause/sleep.
 import argparse
 import hashlib
 import importlib
@@ -60,6 +87,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+# These lines import specific helper functions/classes from other files in
+# this same project (llm-sum/*.py), rather than a general Python toolkit.
 from models_config import compute_cost, get_model_spec  # noqa: E402
 from file_paths import doi_to_slug  # noqa: E402
 from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
@@ -67,9 +96,16 @@ from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
 from eval_instances import EvaluationInstance, iter_evaluation_instances, load_manifest_index  # noqa: E402
 from eval_metrics import calculate_automatic_metrics  # noqa: E402
 
+# File locations: where the AI-written summaries are read FROM, and where the
+# judge's scores are written TO. DATA_DIR comes from the `_bootstrap import *`
+# above (it points at the project's top-level data/ folder).
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 
+# Settings that control how the judge AI behaves, read from the .env file (or
+# a sensible default if not set there). TEMPERATURE=0.0 asks the AI to be as
+# consistent/deterministic as possible rather than creative. SEED helps make
+# repeated runs reproducible where the AI provider supports it.
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 SEED = int(os.getenv("SEED", "42"))
 # Bumped from 500 to 1500: the v2 rubric requests source quotes per hallucination,
@@ -83,6 +119,8 @@ JUDGE_PROMPT_FILE = Path(os.getenv("JUDGE_PROMPT_FILE", "llm-sum/prompts/judge_m
 # the default (the full panel) and the one-word JURY_PRESET switches all draw
 # from a single source. ``duo`` keeps the two flagship judges; drop to ``solo``
 # (openai only) for the cheapest single-grader runs.
+# A "list" (the square-bracket notation below) is simply an ordered sequence
+# of values — here, the names of the three AI providers that can act as judges.
 JURY_PANEL = ["openai", "anthropic", "gemini"]
 JURY_DUO = ["openai", "anthropic"]
 
@@ -96,6 +134,11 @@ JUDGE_MODELS = [
 
 def _resolve_preset_judges() -> list[str] | None:
     """Expand JURY_PRESET (read at call time) into a judge list, or None.
+
+    IN PLAIN ENGLISH: Looks up the JURY_PRESET setting from .env (a shortcut
+    word like "panel", "duo", or "solo") and turns it into the actual list of
+    judge names it stands for. If no shortcut word is set, returns nothing
+    (None) so the caller falls back to a different setting instead.
 
     ``panel`` → the full three-provider jury; ``duo`` → openai + anthropic;
     ``solo`` → a single openai judge. Read from the environment here (not
@@ -119,6 +162,11 @@ def _resolve_preset_judges() -> list[str] | None:
 def resolve_judges(cli_judges: str | None = None, *, jury: bool = False) -> list[str]:
     """Resolve the active judge list from the layered opt-in controls.
 
+    IN PLAIN ENGLISH: Decides which AI models will act as judges for this run,
+    by checking several possible settings in priority order and using the
+    first one that was actually supplied. See the numbered list below for the
+    priority order.
+
     Precedence (first match wins), so the explicit choice always beats a preset:
         1. ``--judges openai,anthropic`` — an explicit comma-separated list.
         2. ``--jury`` — the convenience flag expanding to the full panel.
@@ -129,6 +177,10 @@ def resolve_judges(cli_judges: str | None = None, *, jury: bool = False) -> list
     defaults to the full openai,anthropic,gemini panel.
     """
     if cli_judges:
+        # A "list comprehension" — the `[... for ... in ...]` pattern below —
+        # is a compact way to build a new list by processing each item from
+        # an existing sequence. This one splits "openai, anthropic" on commas,
+        # trims stray spaces off each piece, and drops any empty pieces.
         return [j.strip() for j in cli_judges.split(",") if j.strip()]
     if jury:
         return list(JURY_PANEL)
@@ -137,11 +189,16 @@ def resolve_judges(cli_judges: str | None = None, *, jury: bool = False) -> list
         return preset
     return list(JUDGE_MODELS)
 
+# Labels stamped onto every output row so later analysis always knows exactly
+# which benchmark/rubric/code-version produced a given score.
 BENCHMARK_NAME = os.getenv("EVAL_BENCHMARK_NAME", "vet_lit_summary_medhelm")
 RUBRIC_VERSION = os.getenv("EVAL_RUBRIC_VERSION", "vet_medhelm_score_v1.0")
 EVALUATOR_VERSION = os.getenv("EVALUATOR_VERSION", "evaluator-medhelm-v1.0")
 
-# This dict is the single runtime source of truth for criterion weights.
+# A "dict" (dictionary, the curly-brace notation below) is like a lookup
+# table: you give it a key (here, a criterion name such as "faithfulness")
+# and it hands back the matching value (here, how heavily that criterion
+# counts toward the final score). This dict is the single runtime source of truth for criterion weights.
 # llm-sum/eval_config/medhelm_vet_summary.yaml carries a documentation mirror
 # of these same values for human readers; tests/test_weight_consistency.py
 # asserts the two never silently drift apart. Keeping the weights here (not
@@ -159,6 +216,10 @@ _DEFAULT_MEDHELM_CRITERION_WEIGHTS = {
 def _load_criterion_weights() -> dict[str, float]:
     """Read JURY_CRITERION_WEIGHTS (a JSON object) if set, else the default.
 
+    IN PLAIN ENGLISH: Lets you override the built-in criterion weights (above)
+    from .env instead of editing code, but only if what you typed is valid —
+    otherwise it quietly uses the safe defaults instead of crashing.
+
     Lets a researcher customise clinical-risk weighting without touching code.
     Falls back to the documented defaults on missing/invalid JSON so a typo in
     .env can't silently corrupt every score.
@@ -166,6 +227,11 @@ def _load_criterion_weights() -> dict[str, float]:
     raw = os.getenv("JURY_CRITERION_WEIGHTS")
     if not raw:
         return dict(_DEFAULT_MEDHELM_CRITERION_WEIGHTS)
+    # "try/except" means: attempt the code inside `try`, and if it raises an
+    # error (of one of the listed types) instead of crashing the program,
+    # jump to the `except` block and continue from there. Here: attempt to
+    # read the user's custom JSON; if it's broken, just fall through below
+    # and use the safe defaults instead.
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and set(parsed) == set(_DEFAULT_MEDHELM_CRITERION_WEIGHTS):
@@ -179,7 +245,8 @@ def _load_criterion_weights() -> dict[str, float]:
 
 MEDHELM_CRITERION_WEIGHTS = _load_criterion_weights()
 
-# The MedHELM-style flat mean: every criterion counts equally. Reuses
+# The MedHELM-style flat mean: every criterion counts equally (a weight of 1.0
+# each, instead of the clinical-risk weights above). Reuses
 # calculate_jury_score()'s weighted-average formula with all weights set to 1,
 # rather than a second formula, so both modes share one tested code path.
 UNWEIGHTED_CRITERION_WEIGHTS = {k: 1.0 for k in MEDHELM_CRITERION_WEIGHTS}
@@ -195,6 +262,11 @@ if JURY_AGGREGATION_MODE not in ("unweighted", "weighted"):
 
 def _is_dry_run() -> bool:
     """
+    IN PLAIN ENGLISH: A "dry run" means practising without spending real
+    money — instead of calling a real AI judge, the code makes up a fake
+    (but consistent) answer. This function checks whether dry-run mode is
+    currently switched on.
+
     Read DRY_RUN at call time so tests (and the user toggling .env between
     runs) get the current value. ``PHASE3_MODE=test`` ALSO forces dry-run
     via ``resolve_mode().dry_run`` — the same last-guardrail rule as the
@@ -215,11 +287,20 @@ BLIND_FORBIDDEN_TOKENS = ("openai", "anthropic", "gemini", "gpt", "claude", "cha
 # Prompt loading + blind builder
 # ---------------------------------------------------------------------------
 
+# Loads the judge's instructions ("prompt template") from a text file on
+# disk — e.g. llm-sum/prompts/judge_medhelm_v1.txt — and checks it looks
+# valid before handing it back. This is the fixed script that tells the judge
+# AI how to grade a summary; it contains two fill-in-the-blank markers,
+# {REFERENCE_TEXT} and {CANDIDATE_SUMMARY}, that get replaced with the real
+# article text and the real summary before the prompt is sent to the judge.
 def load_judge_prompt(prompt_file: Path = JUDGE_PROMPT_FILE) -> str:
     path = prompt_file if prompt_file.is_absolute() else REPO_ROOT / prompt_file
     if not path.exists():
         raise FileNotFoundError(f"Judge prompt not found: {path}")
     template = path.read_text(encoding="utf-8")
+    # Make sure both fill-in-the-blank markers actually exist in the prompt
+    # file, so a typo'd or edited prompt fails loudly here instead of quietly
+    # sending a broken prompt to the judge later.
     for placeholder in ("{REFERENCE_TEXT}", "{CANDIDATE_SUMMARY}"):
         if placeholder not in template:
             raise ValueError(f"Judge prompt {path} missing placeholder {placeholder}")
@@ -229,6 +310,10 @@ def load_judge_prompt(prompt_file: Path = JUDGE_PROMPT_FILE) -> str:
 def build_judge_prompt(reference_text: str, candidate_summary: str,
                        template: str | None = None) -> str:
     """
+    IN PLAIN ENGLISH: Takes the prompt template loaded above and fills in its
+    two blanks with the real article text and the real candidate summary,
+    producing the exact message that gets sent to the judge AI.
+
     Render the judge prompt with the (reference, candidate) pair. The
     summariser name is deliberately NOT a parameter — keeping it out of the
     signature makes the blind protocol enforceable by code review and by
@@ -244,6 +329,12 @@ def build_judge_prompt(reference_text: str, candidate_summary: str,
 # JSON parsing + regex fallback + "99" sentinel
 # ---------------------------------------------------------------------------
 
+# The list of hallucination "category" labels a judge is allowed to use when
+# flagging a made-up or unsupported claim (e.g. did the summary invent a
+# statistic, or leave out an important caveat?). SCORE_SENTINEL_MALFORMED
+# (99) is a special "impossible" score value used purely as a red flag: if
+# you ever see quality_score == 99, it means the judge's response could not
+# be understood at all, not that the summary scored 99 out of anything.
 VALID_HALLUCINATION_CATEGORIES = (
     "fabricated statistics", "omitted caveat", "contradiction", "unsupported_inference",
 )
@@ -252,6 +343,10 @@ SCORE_SENTINEL_MALFORMED = 99
 
 def _clamp(value: Any, lo: int, hi: int) -> int:
     """Clamp an LLM-provided integer score to [lo, hi].
+
+    IN PLAIN ENGLISH: "Clamping" means forcing a number to stay inside an
+    allowed range — e.g. if the allowed range is 1-5 and the judge somehow
+    returns 0 or 9, this pushes it back to the nearest valid value (1 or 5).
 
     An LLM occasionally returns 0 or a value outside the specified range.
     Without clamping, a score of 0 on a 1-3 scale would silently lower the
@@ -265,6 +360,12 @@ def _clamp(value: Any, lo: int, hi: int) -> int:
 
 def calculate_composite_score(scores: dict) -> float:
     """Compute the Vet-Score v2.0 composite from four dimension scores.
+
+    IN PLAIN ENGLISH: This is the OLDER scoring formula (from before the
+    current MedHELM-style rubric) kept here so old data can still be read.
+    It takes four 1-3 scores the judge gave, multiplies each by its own
+    importance weight, adds them up, and rescales the result onto a 1-10
+    scale. See ``calculate_jury_score`` below for the current formula.
 
     DECISION: Python computes this, not the LLM. LLMs make arithmetic errors
     with weighted formulas; having Python do it guarantees reproducibility and
@@ -287,6 +388,14 @@ def calculate_jury_score(criteria_scores: dict, *,
                          weights: dict[str, float] | None = None) -> float:
     """Compute a jury score on a 1-5 scale as a weighted average of criteria.
 
+    IN PLAIN ENGLISH: This is the CURRENT, primary scoring formula. It takes
+    the five 1-5 criterion scores the judge gave (faithfulness, completeness,
+    clinical usefulness, clarity, safety), multiplies each by how much it
+    should count (its "weight"), and divides by the total weight to get one
+    overall number, still on a 1-5 scale. Call it once with the project's
+    clinical-risk weights, and once with all weights equal, to get both the
+    "weighted" and "unweighted" versions of the score.
+
     The judge supplies criterion scores only. Python performs the weighted
     average because deterministic arithmetic is easier to audit, unit test, and
     explain in a methods section than asking every judge response to do math.
@@ -298,6 +407,10 @@ def calculate_jury_score(criteria_scores: dict, *,
     resolved_weights = weights or MEDHELM_CRITERION_WEIGHTS
     weighted_sum = 0.0
     weight_total = 0.0
+    # Walk through each (criterion name, weight) pair — e.g. ("faithfulness",
+    # 1.5) — look up the judge's score for that criterion, clamp it into
+    # range, and add "score x weight" to a running total (and the weight
+    # itself to a separate running total, used as the divisor below).
     for criterion, weight in resolved_weights.items():
         raw_value = criteria_scores.get(criterion)
         if isinstance(raw_value, dict):
@@ -313,6 +426,10 @@ def calculate_jury_score(criteria_scores: dict, *,
 def scale_jury_to_quality_score(jury_score: float) -> int:
     """Map the 1-5 jury scale to the legacy 1-10 quality_score field.
 
+    IN PLAIN ENGLISH: Converts the current 1-5 jury_score into the older
+    1-10 quality_score format, purely so old spreadsheets/notebooks that
+    expect a 1-10 number keep working. It is not a second, independent score.
+
     The legacy field is retained so older analysis scripts do not crash, but
     new analysis should prefer `jury_score` for MedHELM-style rows.
     """
@@ -323,6 +440,11 @@ def scale_jury_to_quality_score(jury_score: float) -> int:
 
 def _mean_and_spread(values: list[float]) -> tuple[float | None, float | None]:
     """Return (mean, max-minus-min) for a list of scores, or (None, None).
+
+    IN PLAIN ENGLISH: Given a list of numbers (e.g. one score per judge for
+    the same paper), returns the average, and how "spread apart" the judges
+    were (the highest score minus the lowest). A spread of 0 means every
+    judge gave the exact same score; a bigger spread means more disagreement.
 
     Max-minus-min is used as the disagreement measure because it is easy to
     explain to a beginner reader and needs no scipy. Krippendorff's alpha in
@@ -336,6 +458,11 @@ def _mean_and_spread(values: list[float]) -> tuple[float | None, float | None]:
 def aggregate_jury_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate multiple judge rows for the same paper-summary pair.
 
+    IN PLAIN ENGLISH: When more than one judge grades the same summary, this
+    combines their individual scores into one summary view: the average
+    score, how many judges took part, and how much they disagreed. It does
+    this separately for the "weighted" score and the "unweighted" score.
+
     MedHELM-style reliability mode can use several judges. The append-only
     JSONL design stores one row per judge, so this helper computes the
     cross-judge view without rewriting history.
@@ -346,6 +473,10 @@ def aggregate_jury_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
     disagreement spread, because judges can agree on the weighted score while
     disagreeing on the unweighted one (or vice versa).
     """
+    # A small helper (defined right here, only used inside this function)
+    # that pulls out every judge's numeric value for one field name (e.g.
+    # "jury_score"), skipping any row where that field is missing or not a
+    # number, and returns them as a plain list of numbers.
     def _values(field: str) -> list[float]:
         return [
             float(row[field])
@@ -373,6 +504,11 @@ def aggregate_jury_scores(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _normalize_criteria_scores(raw_scores: Any) -> dict[str, dict[str, Any]]:
     """Return a complete criterion-score mapping with clamped integer scores.
 
+    IN PLAIN ENGLISH: Cleans up whatever the judge sent back for the five
+    criteria into one consistent, predictable shape — always exactly five
+    criteria, each with a valid 1-5 score and a reasoning note (even if the
+    judge's raw answer was missing a criterion or used the wrong data type).
+
     Judges occasionally omit a criterion or return a string instead of an
     integer. We fill missing criteria with the lowest valid score rather than
     dropping the row, because a malformed partial response should be
@@ -380,6 +516,9 @@ def _normalize_criteria_scores(raw_scores: Any) -> dict[str, dict[str, Any]]:
     """
     normalized: dict[str, dict[str, Any]] = {}
     source = raw_scores if isinstance(raw_scores, dict) else {}
+    # Go through the five expected criteria one at a time (ignoring whatever
+    # order the judge might have used) so the result always has the same five
+    # keys in the same order, never more, never fewer.
     for criterion in MEDHELM_CRITERION_WEIGHTS:
         item = source.get(criterion, {})
         if isinstance(item, dict):
@@ -397,10 +536,17 @@ def _normalize_criteria_scores(raw_scores: Any) -> dict[str, dict[str, Any]]:
 
 def _try_parse_json_block(text: str) -> dict | None:
     """
+    IN PLAIN ENGLISH: Tries to find and read the judge's answer as JSON (a
+    structured, computer-friendly text format using {} and "quotes"), even if
+    the AI wrapped it in extra chatty sentences like "Sure! Here's my
+    evaluation: {...}". Returns None (nothing) if no usable JSON is found
+    anywhere in the text.
+
     Try strict JSON parse, then a relaxed search for the first {...} block.
     Returns None if no valid JSON object is found.
     """
     text = text.strip()
+    # First, the easy case: maybe the whole response IS valid JSON already.
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -408,6 +554,9 @@ def _try_parse_json_block(text: str) -> dict | None:
 
     # Find the first balanced {...} block — handles wrappers like
     # "Sure! Here is the evaluation: { ... } Let me know if you need anything."
+    # This walks character-by-character, counting "{" as +1 and "}" as -1, to
+    # find the point where the curly braces balance back out to zero — that
+    # marks the end of one complete, self-contained JSON object.
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -427,6 +576,12 @@ def _try_parse_json_block(text: str) -> dict | None:
     return None
 
 
+# A "regular expression" (or "regex", built with re.compile) is a pattern
+# used to search text for something that matches a shape — like "the digits
+# right after the word factual_accuracy and a colon" — even when the
+# surrounding text isn't valid JSON. This dict maps each field name to the
+# regex pattern used to fish that one field's number out of raw judge text
+# as a last-resort fallback, when JSON parsing has already failed.
 _REGEX_FALLBACK = {
     # v2 dimension fields (checked first — if found, use vet rubric path)
     "factual_accuracy":   re.compile(r'"?factual_accuracy"?\s*[:=]\s*(\d+)'),
@@ -445,6 +600,13 @@ _REGEX_CATEGORIES = re.compile(
 
 def parse_judge_response(raw_text: str) -> dict:
     """
+    IN PLAIN ENGLISH: This is the heart of turning a judge AI's raw text
+    answer into clean, structured data Python can work with. It tries several
+    approaches in order, each one a fallback for when the previous one
+    fails, ending in a "we have no idea what happened" sentinel if nothing
+    worked — so a broken response never silently vanishes, it just gets
+    flagged for a human to check.
+
     Extract the structured fields from a judge response.
 
     Order of attempts:
@@ -459,10 +621,17 @@ def parse_judge_response(raw_text: str) -> dict:
     MedHELM rows include criteria_scores and jury_score. Older schemas still
     parse so previously generated batch results and tests remain usable.
     """
+    # Step 1: try to read the response as JSON at all (see
+    # _try_parse_json_block above). `obj` will be a dict if this worked, or
+    # None if the text wasn't JSON-shaped in any recognisable way.
     obj = _try_parse_json_block(raw_text)
 
     if isinstance(obj, dict) and "criteria_scores" in obj:
-        # --- MedHELM-style schema: criteria_scores -> deterministic jury_score ---
+        # --- Path 1a: MedHELM-style schema (the current, expected format) ---
+        # criteria_scores -> deterministic jury_score. This is the normal,
+        # happy-path branch: the judge answered in the current five-criteria
+        # format, so Python computes both the weighted and unweighted jury
+        # scores and packages up the hallucination claims it reported.
         criteria_scores = _normalize_criteria_scores(obj.get("criteria_scores"))
         jury_score_weighted = calculate_jury_score(criteria_scores, weights=MEDHELM_CRITERION_WEIGHTS)
         jury_score_unweighted = calculate_jury_score(criteria_scores, weights=UNWEIGHTED_CRITERION_WEIGHTS)
@@ -498,7 +667,11 @@ def parse_judge_response(raw_text: str) -> dict:
         }
 
     if isinstance(obj, dict) and "factual_accuracy" in obj:
-        # --- v2 (older vet rubric) schema ---
+        # --- Path 1b: v2 (older vet rubric) schema ---
+        # The response wasn't in the current criteria_scores format, but it
+        # does look like the older four-dimension "Vet-Score v2.0" format
+        # (factual_accuracy/completeness/clinical_relevance/organization).
+        # Handled so old batch results and comparison runs still parse.
         composite = calculate_composite_score(obj)
         halluc_block = obj.get("hallucination") or {}
         claims = list(halluc_block.get("claims") or [])
@@ -529,7 +702,11 @@ def parse_judge_response(raw_text: str) -> dict:
         }
 
     if isinstance(obj, dict) and "quality_score" in obj:
-        # --- legacy schema (judge_v1 responses) ---
+        # --- Path 1c: legacy schema (judge_v1 responses) ---
+        # Neither of the newer schemas matched, but the response is valid
+        # JSON with the oldest "quality_score" field (a direct 1-10 number,
+        # no per-criterion breakdown). Handled so the earliest study runs
+        # remain readable.
         confidence = _clamp(obj.get("confidence_score", 1), 1, 5)
         return {
             "criteria_scores": {}, "jury_score": None,
@@ -548,9 +725,13 @@ def parse_judge_response(raw_text: str) -> dict:
             "parse_method": "json",
         }
 
-    # Regex fallback extracts older rubric fields one at a time. The MedHELM
-    # schema is nested JSON, so a broken MedHELM response falls through to the
-    # sentinel instead of pretending that partial nested data is reliable.
+    # --- Step 2: none of the JSON paths above matched (obj was None, or a
+    # dict missing all three known field names), so fall back to hunting for
+    # individual numbers in the raw text using the regex patterns defined
+    # earlier. Regex fallback extracts older rubric fields one at a time. The
+    # MedHELM schema is nested JSON, so a broken MedHELM response falls
+    # through to the sentinel instead of pretending that partial nested data
+    # is reliable.
     fields: dict[str, Any] = {}
     for key, regex in _REGEX_FALLBACK.items():
         m = regex.search(raw_text)
@@ -561,7 +742,8 @@ def parse_judge_response(raw_text: str) -> dict:
                 pass
 
     if "factual_accuracy" in fields:
-        # v2 regex path
+        # v2 regex path — the regex found the older four-dimension field
+        # names in the raw text, so compute the old composite from those.
         composite = calculate_composite_score(fields)
         confidence = _clamp(fields.get("confidence_score", 1), 1, 5)
         return {
@@ -584,7 +766,9 @@ def parse_judge_response(raw_text: str) -> dict:
         }
 
     if "quality_score" in fields:
-        # legacy regex path
+        # legacy regex path — the regex found an old-style "quality_score:"
+        # number in the raw text, so use that directly, plus whatever
+        # hallucination category words can be pulled out below.
         cats_match = _REGEX_CATEGORIES.search(raw_text)
         if cats_match:
             cats_raw = cats_match.group(1)
@@ -609,6 +793,11 @@ def parse_judge_response(raw_text: str) -> dict:
             "parse_method": "regex",
         }
 
+    # --- Step 3: total failure. Nothing above could make sense of the raw
+    # text — not as JSON, not even with regex pattern-hunting. Rather than
+    # crashing or silently dropping this result, return the special
+    # SCORE_SENTINEL_MALFORMED (99) score so it's obviously wrong at a
+    # glance, and mark it for a human to check in Phase 5.
     # Sentinel: flag for manual review in Phase 5. We preserve the raw response
     # excerpt in the final row, so a human can inspect what the judge returned.
     return {
@@ -635,12 +824,19 @@ def parse_judge_response(raw_text: str) -> dict:
 
 def needs_human_review(parsed: dict) -> bool:
     """
+    IN PLAIN ENGLISH: Decides yes/no whether this judge's verdict is
+    trustworthy enough to accept as-is, or whether a human should double
+    check it. Returns True (needs review) if any red flag below is present.
+
     True if the row should be flagged for Phase-5 manual review. Triggers on:
     - Low confidence (< 3): the judge is guessing
     - Sentinel score (99): response was malformed
     - Any major-severity hallucination claim: a finding that could mislead a
       clinician must be checked by a human even if overall confidence is high
     """
+    # `any(... for ... in ...)` checks a list and returns True the moment it
+    # finds even one item matching the condition — here, at least one
+    # hallucination claim marked "major" severity.
     any_major = any(
         c.get("severity") == "major"
         for c in (parsed.get("hallucination_claims") or [])
@@ -657,13 +853,25 @@ def needs_human_review(parsed: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _stable_hash_int(text: str) -> int:
-    """Use SHA-256 instead of Python's salted hash() for reproducible dry runs."""
+    """Use SHA-256 instead of Python's salted hash() for reproducible dry runs.
+
+    IN PLAIN ENGLISH: A "hash" turns any text into a big number in a way
+    that's consistent — the same text always produces the same number, but
+    even a tiny change in the text produces a totally different number. This
+    is used below to make up fake-but-repeatable scores during dry runs,
+    without needing an actual AI call.
+    """
     return int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16)
 
 
 def _mock_judge_response(provider: str, reference_text: str,
                          candidate_summary: str) -> dict:
     """
+    IN PLAIN ENGLISH: Stands in for a real judge AI call when running in
+    dry-run/test mode (no money spent, no network call). Makes up scores
+    that look plausible and are always the same for the same input text, so
+    tests are repeatable.
+
     Deterministic fake response for DRY_RUN. Uses hashes of the text so
     different summaries get different (but reproducible) scores. Returns
     the MedHELM schema so dry-run/test mode exercises the default parse path.
@@ -707,6 +915,13 @@ def call_judge(provider: str, reference_text: str, candidate_summary: str,
                *, prompt_template: str | None = None,
                max_retries: int = 3) -> dict:
     """
+    IN PLAIN ENGLISH: The single entry point for asking one specific judge
+    ("openai", "anthropic", or "gemini") to grade one summary. In dry-run
+    mode it calls the fake mock instead. On a real run, it builds the blind
+    prompt, sends it to the right provider's function below, and retries a
+    few times (waiting a little longer each time) if something goes wrong
+    before finally giving up and raising an error.
+
     Call a judge model and return the raw text + token + version metadata.
     Parsing happens in a separate step so failed parses can still log the
     raw text for inspection.
@@ -717,6 +932,9 @@ def call_judge(provider: str, reference_text: str, candidate_summary: str,
     user_message = build_judge_prompt(reference_text, candidate_summary, prompt_template)
 
     last_error: Exception | None = None
+    # Try up to `max_retries` times. Real API calls sometimes fail for
+    # temporary reasons (network hiccup, rate limit) — retrying with a short
+    # pause first is standard practice before giving up entirely.
     for attempt in range(max_retries):
         try:
             if provider == "openai":
@@ -729,12 +947,21 @@ def call_judge(provider: str, reference_text: str, candidate_summary: str,
         except Exception as exc:
             last_error = exc
             if attempt < max_retries - 1:
+                # Wait longer after each failed attempt (1s, then 2s, then
+                # 4s, ...) — a common pattern called "exponential backoff"
+                # that gives a struggling service more time to recover.
                 time.sleep(2 ** attempt)
 
     log_error("N/A", f"evaluate_{provider}", f"Judge failed after retries: {last_error}")
     raise RuntimeError(f"Judge {provider} failed: {last_error}")
 
 
+# The three functions below (_call_judge_openai, _call_judge_anthropic,
+# _call_judge_gemini) each know how to talk to one specific AI provider's API
+# using that provider's own Python library. They all do the same conceptual
+# job — send the judge prompt, get back the AI's raw text answer plus how
+# many "tokens" (word-pieces) were used — just with each provider's own
+# function names and response shape.
 def _call_judge_openai(user_message: str) -> dict:
     import openai  # type: ignore[import-not-found]
     spec = get_model_spec("openai")
@@ -761,6 +988,7 @@ def _call_judge_openai(user_message: str) -> dict:
     }
 
 
+# Sends the judge prompt to Anthropic's Claude API and returns its answer.
 def _call_judge_anthropic(user_message: str) -> dict:
     import anthropic  # type: ignore[import-not-found]
     spec = get_model_spec("anthropic")
@@ -780,7 +1008,13 @@ def _call_judge_anthropic(user_message: str) -> dict:
     }
 
 
+# Sends the judge prompt to Google's Gemini API and returns its answer.
 def _call_judge_gemini(user_message: str) -> dict:
+    # This loads the Gemini library by name at runtime (rather than a normal
+    # `import` line at the top of the file) so the rest of this file — and
+    # every test that doesn't touch Gemini — still works even if that
+    # optional package isn't installed. If it's missing, give a clear,
+    # actionable error message instead of a confusing crash.
     try:
         genai = importlib.import_module("google.genai")
         types = importlib.import_module("google.genai.types")
@@ -815,6 +1049,12 @@ def _call_judge_gemini(user_message: str) -> dict:
 # Evaluation row builder + persistence
 # ---------------------------------------------------------------------------
 
+# IN PLAIN ENGLISH: Builds one complete "row" of output — everything that
+# will be saved to data/evaluations.jsonl for one (paper, summariser, judge)
+# combination. It takes the judge's raw answer, runs it through
+# parse_judge_response to get clean numbers, adds identifying details (which
+# paper, which summariser, which judge, which rubric version), and returns it
+# all as one dictionary ready to be written out.
 def build_evaluation_row(*, doi: str, summariser: str, judge: str,
                          input_source: str = "processed",
                          reference_text: str, candidate_summary: str,
@@ -888,6 +1128,11 @@ def build_evaluation_row(*, doi: str, summariser: str, judge: str,
     }
 
 
+# Saves one evaluation row (built by build_evaluation_row above) to
+# data/evaluations.jsonl by adding it as a new line at the end of the file
+# ("a" below means "append" — add to the end, never overwrite what's already
+# there). This is why the file is called "append-only": once a row is
+# written, this function never goes back and edits or deletes older rows.
 def append_evaluation(row: dict, path: Path | None = None) -> None:
     resolved = path if path is not None else EVALUATIONS_PATH
     resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -898,6 +1143,13 @@ def append_evaluation(row: dict, path: Path | None = None) -> None:
 # ---------------------------------------------------------------------------
 # Readable dev-eval mirrors (data/dev_evals_jsonl/, data/dev_detailEval_reports/)
 # ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# Everything from here down builds human-readable report files (.txt and
+# .md) that mirror what's already in data/evaluations.jsonl, purely so a
+# person can read a paper's judge results without opening raw JSON. These
+# functions never change evaluations.jsonl itself — they only read from it.
+# -----------------------------------------------------------------------
 
 # Plain-English display labels for the five MedHELM criteria, in report order.
 CRITERION_LABELS: dict[str, str] = {
@@ -914,6 +1166,11 @@ def _rows_by_doi_for(
 ) -> dict[str, list[dict]]:
     """Read data/evaluations.jsonl rows for the given DOIs, grouped by doi.
 
+    IN PLAIN ENGLISH: Reads through the evaluations file and collects every
+    row that belongs to one of the requested papers (identified by DOI, a
+    paper's unique ID), bundling all of one paper's rows together — since
+    each paper can have multiple rows (one per summariser/judge pair).
+
     Shared read path for both readable mirrors below, so a re-judge's rows
     are grouped identically regardless of which mirror is being written.
     """
@@ -922,12 +1179,18 @@ def _rows_by_doi_for(
     for row in _iter_summaries(source):  # generic JSONL iterator, reused here
         doi = str(row.get("doi", "")).strip()
         if doi and doi in dois:
+            # `.setdefault(doi, [])` means "if this DOI doesn't have a list
+            # yet, start one"; either way, add this row onto that DOI's list.
             rows_by_doi.setdefault(doi, []).append(row)
     return rows_by_doi
 
 
 def _lookup_title(doi: str, manifest_index: dict[str, dict] | None) -> str:
     """Best-effort article title for ``doi`` from a manifest index.
+
+    IN PLAIN ENGLISH: Looks up the human-readable title of a paper given its
+    DOI, so report files can show "A Study of X in Cats" instead of just a
+    DOI number. Returns an empty string if no title can be found.
 
     ``manifest_index`` is normally ``eval_instances.load_manifest_index()``'s
     output (keyed off the long-lived data/manifest.jsonl, not the prunable
@@ -946,10 +1209,16 @@ def _format_dev_eval_entry_as_text(
 ) -> str:
     """Render one paper's judge rows into a plain-English report.
 
+    IN PLAIN ENGLISH: Builds the actual text content of one .txt report file
+    for one paper — a short header (DOI, journal, title) followed by one
+    section per (summariser, judge) pair showing that judge's score and
+    reasoning. This is the text-building step; the function below it
+    (write_dev_eval_jsonl_outputs) is what actually saves this text to disk.
+
     The readable sibling of ``summarizer._format_dev_summary_entry_as_text``:
     the eval-side counterpart written to ``data/dev_evals_jsonl/`` so a human
     can eyeball dev judge results without parsing JSON. The header begins with
-    ``DOI:`` so ``run_phase3._read_dois_from_dev_folder`` can read it back for
+    ``DOI:`` so ``eval_instances.read_dois_from_dev_folder`` can read it back for
     the incremental skip. ``data/evaluations.jsonl`` remains the source of truth.
     """
     strata = rows[0].get("strata") if rows and isinstance(rows[0].get("strata"), dict) else {}
@@ -968,6 +1237,11 @@ def _format_dev_eval_entry_as_text(
         "source of truth. One section per (summarizer, judge) pair below.",
     ]
 
+    # `sorted(..., key=lambda r: ...)` sorts the rows using a small one-line
+    # function (a "lambda") that says what to sort by — here, first by
+    # summariser name, then by judge name — so the file's section order is
+    # always the same regardless of which order the rows were originally
+    # written in.
     # Deterministic ordering so the readable file is stable across re-runs.
     for row in sorted(
         rows, key=lambda r: (str(r.get("summarizer")), str(r.get("judge")))
@@ -1004,6 +1278,11 @@ def write_dev_eval_jsonl_outputs(
 ) -> int:
     """Render a readable ``.txt`` file per DOI into ``data/dev_evals_jsonl/``.
 
+    IN PLAIN ENGLISH: For each requested paper, gathers its judge rows, turns
+    them into readable text (using the function above), and saves one .txt
+    file per paper into data/dev_evals_jsonl/. Re-running this overwrites
+    each paper's file in place rather than piling up duplicate files.
+
     The eval-side sibling of ``summarizer.write_dev_summary_jsonl_outputs``: it
     reads the judge rows ``run_evaluation`` just appended to
     ``data/evaluations.jsonl`` for the given ``dois`` and writes one file per
@@ -1024,6 +1303,11 @@ def write_dev_eval_jsonl_outputs(
     written = 0
     for doi, rows in rows_by_doi.items():
         out_path = output_dir / f"{doi_to_slug(doi)}.txt"
+        # Write to a temporary ".tmp" file first, then rename it into place
+        # (`.replace`). This "write-then-rename" trick means the real output
+        # file is never left half-written if something goes wrong partway
+        # through — the old file stays intact until the new one is fully
+        # ready to take its place.
         tmp_path = out_path.with_suffix(".txt.tmp")
         tmp_path.write_text(
             _format_dev_eval_entry_as_text(doi, rows, manifest_index=manifest_index),
@@ -1038,6 +1322,15 @@ def _format_dev_detail_eval_entry_as_markdown(
     doi: str, rows: list[dict], *, manifest_index: dict[str, dict] | None = None,
 ) -> str:
     """Render one paper's judge rows into a detailed, skimmable Markdown report.
+
+    IN PLAIN ENGLISH: Like ``_format_dev_eval_entry_as_text`` above, but much
+    more detailed — this is the "deep dive" version. Instead of only showing
+    the final aggregate score, it shows each individual judge's score AND
+    written reasoning for every one of the five criteria, the automatic text
+    metrics, any hallucination claims in detail, and how much the judges
+    agreed or disagreed with each other. Written in Markdown (a simple
+    text formatting style using # for headings and | for tables) so it reads
+    nicely both as plain text and if opened in a Markdown viewer.
 
     The deep-dive sibling of ``_format_dev_eval_entry_as_text``: shows every
     judge's own per-criterion score AND reasoning (not just the aggregate),
@@ -1086,12 +1379,22 @@ def _format_dev_detail_eval_entry_as_markdown(
         "",
     ])
 
+    # A "set" (the curly-brace `{...}` comprehension below, like a dict but
+    # with no values, just keys) automatically drops duplicates. This builds
+    # the list of distinct summariser names that have any rows for this
+    # paper, sorted alphabetically, then loops over each one to build its own
+    # section of the report (one "## summariser-name" heading per provider).
     summarizers = sorted({str(r.get("summarizer") or "?") for r in rows})
     for summarizer in summarizers:
+        # Keep only this summariser's rows (there's one row per judge that
+        # scored it) to build this section.
         srows = [r for r in rows if str(r.get("summarizer") or "?") == summarizer]
         lines.append(f"## {summarizer}")
         lines.append("")
 
+        # Automatic metrics (word overlap, coverage, etc.) are computed once
+        # per summary and are identical across judges, so it's safe to just
+        # read them off the first row.
         metrics = srows[0].get("automatic_metrics") or {}
         if metrics:
             section_coverage = metrics.get("section_coverage") or {}
@@ -1121,6 +1424,10 @@ def _format_dev_detail_eval_entry_as_markdown(
             f"| Jury score (weighted) | {agg.get('jury_score_weighted_mean', '-')} | "
             f"{agg.get('judge_disagreement_weighted', '-')} | {agg.get('valid_judge_count', '-')} |",
         ])
+        # For each of the five criteria, gather every judge's score for it
+        # (safely skipping rows with missing/malformed data) and show the
+        # mean and the spread, so a reader can see at a glance which
+        # criterion the judges disagreed on most for this summary.
         for criterion, label in CRITERION_LABELS.items():
             values = [
                 r["criteria_scores"][criterion]["score"]
@@ -1135,6 +1442,9 @@ def _format_dev_detail_eval_entry_as_markdown(
             lines.append(f"| {label} | {mean} | {spread} | {len(values)} |")
         lines.append("")
 
+        # Now show each individual judge's own full breakdown — one
+        # "### Judge: name" subsection per judge, with a table of that
+        # judge's own score and written reasoning for all five criteria.
         for row in sorted(srows, key=lambda r: str(r.get("judge") or "")):
             judge = row.get("judge") or "?"
             lines.append(f"### Judge: {judge}")
@@ -1165,6 +1475,9 @@ def _format_dev_detail_eval_entry_as_markdown(
                 lines.append("**Flagged for human review.**")
             lines.append("")
 
+            # List each hallucination claim this judge flagged (if any),
+            # showing exactly what the summary claimed versus what the
+            # source article actually supports.
             claims = [c for c in (row.get("hallucination_claims") or []) if isinstance(c, dict)]
             if claims:
                 lines.append("**Hallucination claims:**")
@@ -1203,6 +1516,12 @@ def write_dev_detail_eval_outputs(
 ) -> int:
     """Render a detailed Markdown file per DOI into ``data/dev_detailEval_reports/``.
 
+    IN PLAIN ENGLISH: Same save-to-disk pattern as
+    ``write_dev_eval_jsonl_outputs`` above (read this paper's rows, build the
+    text, write to a .tmp file, then rename into place so a partial write
+    never corrupts the real file) but writes the detailed Markdown report
+    instead of the shorter plain-text one.
+
     The deep-dive sibling of ``write_dev_eval_jsonl_outputs``: same DOI-grouped
     read of ``data/evaluations.jsonl`` (via ``_rows_by_doi_for``) and the same
     atomic write-in-place-by-slug pattern, but renders every judge's full
@@ -1233,6 +1552,14 @@ def write_dev_detail_eval_outputs(
 # Run loop
 # ---------------------------------------------------------------------------
 
+# IN PLAIN ENGLISH: Reads a JSONL file (one JSON object per line — "JSONL"
+# means "JSON Lines") one line at a time and hands back each parsed row.
+# `yield` (instead of `return`) makes this a "generator": rather than reading
+# the whole file into memory and returning one big list, it produces rows one
+# at a time as the caller asks for them — more memory-efficient for a
+# potentially large file, and it can be used in a normal `for row in ...`
+# loop just like a list. Blank lines and lines that aren't valid JSON are
+# silently skipped rather than crashing the whole read.
 def _iter_summaries(path: Path | None = None):
     # Resolved at call time so tests can monkeypatch evaluator.SUMMARIES_PATH.
     resolved = path if path is not None else SUMMARIES_PATH
@@ -1251,6 +1578,10 @@ def _iter_summaries(path: Path | None = None):
 
 def _read_cached_text(record_or_doi) -> str | None:
     """
+    IN PLAIN ENGLISH: Finds and loads the cleaned, pre-processed full text of
+    one paper (the "reference text" the judge compares the summary against),
+    from wherever it was cached on disk earlier in the pipeline.
+
     Locate this paper's cleaned-text cache and return its body.
 
     ``record_or_doi`` is normally a row from ``data/summaries.jsonl`` —
@@ -1270,11 +1601,21 @@ def already_evaluated(doi: str, summariser: str, judge: str,
                       rubric_version: str = RUBRIC_VERSION) -> bool:
     """Check evaluations.jsonl to support a manual resume.
 
+    IN PLAIN ENGLISH: Before spending money to have a judge re-grade
+    something, this checks whether that exact combination (this paper, this
+    summariser, this judge, this rubric version) has already been graded and
+    saved. If it's a "resume" run, matching rows get skipped instead of
+    re-judged. Answers a plain True/False question — "have we already done
+    this one?"
+
     Rubric version is part of the resume key so a new methodology can be run
     next to older scores without silently skipping already-seen DOI/model pairs.
     """
     if not EVALUATIONS_PATH.exists():
         return False
+    # Scan every existing row looking for an exact match on all five fields.
+    # This is a simple linear search, acceptable here because it only runs
+    # once per (paper, judge) pair being considered, not for every row ever.
     with open(EVALUATIONS_PATH, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1295,12 +1636,22 @@ def already_evaluated(doi: str, summariser: str, judge: str,
 
 def confirm_real_judge(profile: ModeProfile, force: bool) -> bool:
     """
+    IN PLAIN ENGLISH: This is the safety checkpoint that stands between the
+    code and a real, money-spending API call. If the current mode is
+    dry-run/test, it just says "go ahead" automatically (True) since nothing
+    real will be spent. Otherwise it either logs that --force was used to
+    skip the prompt, or actually stops and asks the person running the
+    script to type "yes" before continuing — a real human confirmation, not
+    something this code (or Claude) can answer on someone's behalf.
+
     Mirror summarizer's confirmation: only triggers when the profile both
     requires confirmation AND is not short-circuited to mocks.
     """
     if profile.dry_run or not profile.requires_confirm:
         return True
     if force:
+        # --force skips the interactive prompt, but the bypass is written to
+        # a permanent log file so there's still a record that it happened.
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         line = (f"[phase3:safety] evaluator confirmation bypassed via --force at "
                 f"{datetime.now(timezone.utc).isoformat()}\n")
@@ -1308,6 +1659,10 @@ def confirm_real_judge(profile: ModeProfile, force: bool) -> bool:
             f.write(line)
         print(line.strip())
         return True
+    # `input(...)` pauses the program and waits for the person at the
+    # keyboard to type something and press Enter. Only the exact word "yes"
+    # counts as confirmation; anything else (including just pressing Enter)
+    # cancels the run.
     reply = input(
         "\n[phase3:safety] About to call the judge with REAL API requests.\n"
         "Type 'yes' to confirm: "
@@ -1324,6 +1679,14 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                    instances: Iterable[EvaluationInstance] | None = None) -> dict[str, int]:
     """Run the blind judge loop over a set of evaluation instances.
 
+    IN PLAIN ENGLISH: This is the main engine that actually runs an
+    evaluation pass. For every paper-summary pair, and every judge in the
+    judge list, it: skips ones already graded (if resuming), calls the judge,
+    turns the response into a clean row, saves that row, and keeps a running
+    tally of how many succeeded/failed/were skipped and how much money was
+    spent. Everything above in this file (parsing, scoring, prompt-building)
+    exists to support this one loop.
+
     doi_filter: when provided, only evaluate DOIs in this set. Used by
     run_phase3.py's journal-stratified sampling to pass a pre-selected
     subset without changing evaluator logic.
@@ -1337,15 +1700,21 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
     """
     judges = judges or JUDGE_MODELS
     prompt_template = load_judge_prompt()
+    # BudgetGuard (from utils.py) tracks running spend across this whole run
+    # and can stop things if a spending limit is exceeded — the project-wide
+    # safety net for cost control.
     guard = BudgetGuard()
     counts = {"evaluated": 0, "skipped": 0, "failed": 0, "no_text": 0}
 
+    # Either use the caller-supplied list of instances directly, or build the
+    # list of (paper, summariser) pairs to judge from summaries.jsonl.
     instance_iter = instances if instances is not None else iter_evaluation_instances(
         summaries_path=SUMMARIES_PATH,
         doi_filter=doi_filter,
         paper_limit=paper_limit,
     )
 
+    # Outer loop: one pass per (paper, summariser) pair to judge.
     for instance in instance_iter:
         # Automatic metrics are computed once per paper-summary pair and then
         # attached to every judge row. This avoids recomputing deterministic
@@ -1356,19 +1725,28 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
             reference_summary=instance.manifest_record.get("abstract"),
         )
 
+        # Inner loop: for this one paper-summary pair, ask every judge in the
+        # active jury to grade it (so with the 3-judge panel, each summary
+        # gets graded three separate times, once per judge).
         for judge in judges:
+            # Resume support: if this exact (paper, summariser, judge, rubric)
+            # combination is already in evaluations.jsonl, skip it instead of
+            # paying to re-judge it.
             if resume and already_evaluated(
                 instance.doi, instance.summarizer, judge, instance.input_source,
             ):
                 counts["skipped"] += 1
                 continue
-            sleep_for_model(judge)
+            sleep_for_model(judge)  # be polite to the provider's rate limits
             try:
                 response = call_judge(
                     judge, instance.reference_text, instance.candidate_summary,
                     prompt_template=prompt_template,
                 )
             except Exception as exc:
+                # A failed judge call for one pair should not stop the whole
+                # run — log it, count it as a failure, and move on to the
+                # next judge/pair.
                 counts["failed"] += 1
                 log_error(instance.doi, f"evaluate_{judge}", str(exc))
                 continue
@@ -1384,6 +1762,9 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
             )
             append_evaluation(row)
             counts["evaluated"] += 1
+            # Work out how much this one judge call cost (based on how many
+            # tokens/word-pieces it used) and add it to the running budget
+            # total, so the user can see spend accumulate as the run goes.
             cost = compute_cost(
                 judge,
                 int(response["input_tokens"] or 0),
@@ -1396,12 +1777,24 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                   f"score={score} via {row['parse_method']} "
                   f"(${cost:.4f})")
 
+    # Final progress summary, printed once the whole run finishes.
     print(f"\n[phase3:evaluate] done. counts={counts}  "
           f"budget_spent=${guard.total_spent:.4f}")
     return counts
 
 
+# IN PLAIN ENGLISH: This is what actually runs when someone types
+# `python evaluator.py ...` at the command line — it's the "CLI" (command
+# line interface) entry point. It reads whatever flags/options were typed
+# in (like --mode or --judges), works out the resulting settings, runs the
+# safety confirmation, and then kicks off run_evaluation() above. It returns
+# 0 for "everything ran" and 1 for "stopped, e.g. confirmation declined" —
+# the standard success/failure convention for command-line programs.
 def main(argv: list[str] | None = None) -> int:
+    # argparse is Python's standard toolkit for reading command-line flags
+    # (like --mode dev or --limit 5) and turning them into ordinary Python
+    # values. Each `.add_argument(...)` call below defines one flag: its
+    # name, allowed values, default, and the help text shown for --help.
     parser = argparse.ArgumentParser(description="Phase 3 — blind judge evaluator.")
     parser.add_argument("--mode", choices=VALID_MODES, default=None,
                         help="Override PHASE3_MODE from .env: test|single|dev|batch.")
@@ -1420,6 +1813,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Bypass interactive confirmation. USE WITH CAUTION.")
     args = parser.parse_args(argv)
 
+    # Work out which judges to use and which mode profile (test/single/dev/
+    # batch) governs this run, combining CLI flags with .env settings per the
+    # precedence rules documented on resolve_judges() and resolve_mode().
     judges = resolve_judges(args.judges, jury=args.jury)
 
     profile = resolve_mode(args.mode)
@@ -1433,8 +1829,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit is not None:
         print(f"[phase3:evaluate] --limit {args.limit} overrides mode default.")
 
+    # Safety checkpoint (see confirm_real_judge above) — stops here if this
+    # would be a real, paid run and the person didn't confirm it.
     if not confirm_real_judge(profile, force=args.force):
         return 1
+    # A second safety check: refuses to proceed with a real (non-dry-run) call
+    # if the configured budget is zero or negative, catching a misconfigured
+    # .env before any money is spent.
     require_positive_budget_for_real_run(
         dry_run=profile.dry_run,
         context="Phase 3 evaluation",
@@ -1448,5 +1849,9 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# This only runs if evaluator.py is executed directly as a script (e.g.
+# `python evaluator.py --mode dev`), not if it's imported by another file
+# (like the test file does). `sys.exit(...)` reports main()'s return value
+# (0 or 1) back to the operating system as the program's exit code.
 if __name__ == "__main__":
     sys.exit(main())

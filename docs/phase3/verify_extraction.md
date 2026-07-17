@@ -2,7 +2,7 @@
 
 ## What it does
 
-Audits `data/raw/*.pdf` against the cleaned cache in `data/processed/*.jsonl`. For each PDF it extracts the raw text with the same column-aware `pdfplumber` helper used by Phase 3, compares the word count against the cached cleaned word count, and assigns a PASS / WARN / FAIL status. No API calls; safe to re-run.
+Audits `data/raw/*.pdf` against the cleaned cache in `data/processed/*.jsonl` (folder name configurable via `PROCESSED_DIR_NAME`; ships as `processedv2` by default). For each PDF it extracts the raw text with the same column-aware `pdfplumber` helper used by Phase 3, compares the word count against the cached cleaned word count, and assigns a PASS / WARN / FAIL status. No API calls; safe to re-run.
 
 Healthy papers land at ratio 0.70-0.90 (references + publisher noise removed = ~15-25% of raw text). The thresholds are conservative — a tight 0.90 rule would flag every paper.
 
