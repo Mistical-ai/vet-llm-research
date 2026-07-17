@@ -1,17 +1,101 @@
-*Overall good agreement of smartphone-based and standard base-apex electrocardiography in healthy sheep*
+The following are 4 example summaries showing the target format, length, and tone: a short title/author line, then Background, Methods, Results, Limitations, and Conclusions as brief prose paragraphs — written for a busy clinician, not an exhaustive extraction.
 
-Authors: King A, Rolph KE, Dzikiti L, Cavanaugh SM. J Am Vet Med Assoc. 2023.
+=== EXAMPLE 1 ===
 
-1. Objective
-The study assessed whether a smartphone-based ECG device (KardiaMobile, AliveCor Inc) produces tracings of similar quality to standard base-apex ECG in healthy sheep and whether the two methods agree on heart rate, waveform morphology, and interval measurements. The authors hypothesized that smartphone ECG would yield comparable quality and good parameter agreement with standard ECG.
+Long-term assessment of nephrosplenic space closure in horses
+Camila Cantarelli, Nicola C. Cribb, Massimo Delli-Rocili, Brigitte Brisson, Alex zur Linden, Jeff L. Caswell
 
-2. Key Methods
-Prospective observational study in 23 healthy feral rams (Barbados Blackbelly, Pelibüey, and St. Croix; approximately 1 year old; median weight 28 kg) from a university teaching flock. Standard base-apex ECG (CardEx 300) was recorded first, followed by a single-lead smartphone ECG (KardiaMobile on an iPhone 8) placed on the left thoracic wall at the apex beat. Hair was not clipped; 70% isopropyl alcohol was used for contact. A single board-certified internist reviewed all masked tracings. Quality was scored on a 0–3 scale (0 = best, 3 = worst) based on baseline undulation and tremor artifacts.
+Background
 
-3. Primary Results
-Standard ECGs were interpretable in 100% (23/23) of sheep, while smartphone ECGs were interpretable in 65% (15/23). Eight of 23 (35%) smartphone tracings were uninterpretable due to motion artifact, tachypnea, or very low waveform amplitude; all 8 had uninterpretable P waves. Quality scores showed no agreement between devices (κ coefficient, –0.0062).
+Nephrosplenic entrapment (NSE) is a cause of equine colic with notable recurrence rates. Laparoscopic nephrosplenic space (NSS) closure is widely used to prevent recurrence, but long-term data on adhesion persistence and quality are limited. Additionally, the reliability of non-invasive methods such as ultrasonography and rectal palpation for assessing closure remains unclear. This study aimed to evaluate adhesion formation 5 years postoperatively and determine whether clinical or imaging findings could predict closure adequacy.
 
-Good agreement was found for heart rate (mean difference 2.86 bpm; 95% CI, –3.44 to 9.16), P wave amplitude (0.02 mV; CI, –0.01 to 0.05), QRS duration (–10.5 ms; CI, –20.96 to –0.04), QT interval (–27.14 ms; CI, –59.36 to 5.08), T wave duration (–30.00 ms; CI, –66.73 to 6.73), and T wave amplitude (–0.07 mV; CI, –0.22 to 0.08).
-Clinically relevant differences were observed for PR interval (mean difference –44.38 ms; CI, –64.69 to –24.06) and QRS amplitude (mean difference 0.18 mV; CI, 0.06 to 0.29), making these parameters unreliable on smartphone tracings.
+Methods
 
+This prospective study evaluated 12 healthy research horses that previously underwent laparoscopic NSS closure. Assessments included rectal palpation and ultrasonography preoperatively, at 30 days, and at 5 years. At 5 years, adhesion formation was directly evaluated via laparoscopy using a novel scoring system assessing both extent and strength across three NSS regions. Statistical analyses included logistic regression to assess predictors of adhesion adequacy and repeated-measures ANOVA for ultrasonographic changes.
 
+Results
+
+At 5-year follow-up, 8 of 11 horses demonstrated adequate adhesion formation, defined as >50% NSS coverage with sufficient strength. Three horses had inadequate adhesions. Intra-operative variables (surgery time, bleeding, number of sutures) were not predictive of outcomes. Rectal palpation was a significant predictor of adhesion adequacy and showed no false positives or negatives when the NSS was accessible. Ultrasonography showed a significant decrease in caudal NSS size over time but failed to predict adhesion adequacy and was frequently limited by bowel interference.
+
+Limitations
+
+The study had a small sample size and used a research population, which may limit generalizability to clinical cases. Ultrasonographic data were incomplete due to imaging limitations. The adhesion scoring system, while structured, relies partly on subjective thresholds that require further validation. Additionally, variability in imaging equipment and operators may have influenced ultrasonographic consistency.
+
+Conclusions
+
+Laparoscopic NSS closure results in durable adhesion formation lasting at least 5 years in most horses, supporting its long-term effectiveness in preventing NSE recurrence. Rectal palpation is a reliable clinical tool for assessing closure, whereas ultrasonography has limited diagnostic value in this context. These findings support continued use of NSS closure and may improve confidence in its long-term benefits.
+
+=== EXAMPLE 2 ===
+
+Concurrent Congenital Umbilicobiliary Fistula and Vesicourachal Diverticula in a Dog
+Sathidpak N. Assawarachan, Veerada Wachirodom, Benjang Hakhen, Piyathip Chuchalermporn, Rungrueang Yodsheewan, Phudit Maneesaay, John M. Cullen, Jonathan A. Lidbury, Panpicha Sattasathuchana
+
+Background
+
+Congenital umbilicobiliary fistula is an exceptionally rare hepatobiliary malformation characterized by an abnormal communication between the biliary system and the umbilicus, allowing bile drainage externally. Only three canine cases have been previously reported. Urachal anomalies, including vesicourachal diverticula, are also uncommon congenital disorders resulting from incomplete urachal closure. Gallbladder agenesis is a rare biliary abnormality in dogs and has been reported concurrently with umbilicobiliary fistula in prior cases. This report describes the first documented case, in both veterinary and human medicine, of three concurrent congenital anomalies: umbilicobiliary fistula, gallbladder agenesis, and vesicourachal diverticula.
+
+Methods
+
+A 2-month-old intact male French Bulldog presented with greenish-yellow umbilical discharge since birth. Diagnostic evaluation included complete blood count, serum biochemistry, urinalysis, positive contrast cystography, abdominal ultrasonography, computed tomography (CT) fistulography, and histopathology. Cystography assessed for patent urachus. Ultrasonography and CT fistulography evaluated biliary anatomy and fistulous communication. Surgical exploratory laparotomy was performed to correct both the umbilicobiliary fistula and vesicourachal diverticula. Liver biopsies were obtained for histological assessment.
+
+Results
+
+Serum biochemistry was largely normal, except for mildly increased alkaline phosphatase activity. Positive contrast cystography identified a vesicourachal diverticulum without communication to the umbilicus. Ultrasonography demonstrated a markedly dilated common bile duct and absence of the gallbladder. CT fistulography confirmed a tubular tract connecting the umbilicus to the common bile duct with contrast passage into the biliary tree and duodenum, consistent with umbilicobiliary fistula and gallbladder agenesis. Surgical excision of the fistulous tract and diverticulum was successfully performed. Histopathology revealed biliary-type cuboidal to columnar epithelium transitioning to squamous epithelium near the umbilicus, with chronic inflammatory infiltrates. Liver histology demonstrated portal vein hypoplasia and mild bile duct hyperplasia. The dog recovered uneventfully and remained clinically healthy for 19 months postoperatively.
+
+Limitations
+
+This report describes a single case, limiting generalizability. Serum gamma-glutamyl transferase activity was not measured, and postoperative alkaline phosphatase activity was not reassessed. Cytological examination and bacterial culture of the umbilical discharge were not performed. Long-term follow-up was limited, as the dog died at 1 year and 10 months of age due to aspiration pneumonia unrelated to the congenital abnormalities.
+
+Conclusions
+
+This case represents the first reported concurrence of umbilicobiliary fistula, gallbladder agenesis, and vesicourachal diverticula. Multimodal imaging, including CT fistulography, facilitated definitive diagnosis and surgical planning. Early surgical correction resulted in a favorable clinical outcome. The association between umbilicobiliary fistula and gallbladder agenesis, particularly in French Bulldogs and male dogs, may warrant further investigation into potential embryologic or breed-related predispositions.
+
+=== EXAMPLE 3 ===
+
+A case of feline gastrointestinal eosinophilic sclerosing fibroplasia extending to the liver and jejunal lymph nodes
+Margherita Orlandi, Francesca Parisi, Francesca Abramo, Caterina Puccinelli, Verena Habermaaß, Giulia Mennuni, Veronica Marchetti
+
+Background
+
+Feline gastrointestinal eosinophilic sclerosing fibroplasia (FGESF) is an uncommon inflammatory disease typically affecting the gastrointestinal tract and often mimicking neoplastic masses. Extraintestinal involvement is rare, particularly in the liver, with very few documented cases. This report describes a case of feline eosinophilic sclerosing fibroplasia (FESF) with hepatic and lymph node involvement, aiming to emphasize diagnostic challenges and the importance of considering this condition in differential diagnoses of feline liver masses.
+
+Methods
+
+This is a single case report of an 8-year-old neutered male domestic shorthair cat with a prior diagnosis of jejunal FGESF. Clinical evaluation included physical examination, hematology, biochemistry, and abdominal ultrasonography. Imaging findings prompted laparoscopic biopsies of hepatic lesions and jejunal lymph nodes. Histopathologic analysis, including special stains and immunohistochemistry, was performed to confirm diagnosis and exclude infectious or neoplastic causes.
+
+Results
+
+Ultrasonography revealed hepatomegaly with diffuse multinodular lesions and altered echostructure. Histopathology confirmed hepatic and lymph node involvement of FESF, characterized by dense fibrous tissue and mixed inflammatory infiltrates, including eosinophils. No infectious agents were identified. Despite treatment with corticosteroids and supportive care, the cat's condition deteriorated, leading to euthanasia 15 days after diagnosis.
+
+Limitations
+
+As a single case report, findings are not generalizable. The rarity of hepatic FESF limits understanding of disease progression, prognosis, and optimal treatment. Lack of postmortem examination further restricted full pathological assessment. Additionally, the unclear temporal relationship between intestinal and hepatic lesions limits conclusions regarding disease pathogenesis.
+
+Conclusions
+
+FESF should be considered as a differential diagnosis in cats presenting with liver masses, particularly with a history of gastrointestinal fibroplasia. Definitive diagnosis requires histopathologic confirmation due to its similarity to neoplastic conditions. Prognosis for hepatic involvement remains uncertain, and further studies are needed to guide treatment and outcome expectations.
+
+=== EXAMPLE 4 ===
+
+The Use of CT Scan as a Diagnostic Tool in Pet Rabbits Presenting With Signs of Orbital and Retrobulbar Disease
+Lauren-Tess Goossens, Susanne A E B Boroffka, Michaela Gumpenberger, Nico J Schoemaker, Inge J M Slenter, Rick F Sanchez
+
+Background
+
+Orbital and retrobulbar diseases are common in pet rabbits and frequently associated with dental pathology due to the anatomical relationship between tooth roots and the orbit. Clinical signs may include exophthalmos, epiphora, reduced retropulsion, and periocular swelling. Conventional diagnostic modalities, including physical examination and skull radiography, may underestimate lesion extent. This study evaluated the utility of computed tomography (CT) as a diagnostic tool in pet rabbits presenting with clinical signs consistent with orbital or retrobulbar disease.
+
+Methods
+
+This retrospective study reviewed medical records of pet rabbits presenting with orbital or retrobulbar clinical signs that underwent CT imaging. Clinical findings, CT characteristics, underlying etiologies, and treatment outcomes were analyzed. CT scans were assessed for dental abnormalities, retrobulbar abscessation, bone lysis, soft tissue swelling, and involvement of adjacent structures. Imaging findings were compared with clinical diagnoses and, when available, surgical or histopathological confirmation.
+
+Results
+
+CT imaging identified dental disease as the most common underlying cause of orbital and retrobulbar pathology, frequently associated with apical elongation, periapical lucency, osteolysis, and retrobulbar abscess formation. CT allowed clear delineation of lesion extent, identification of bone involvement, and detection of concurrent sinus or nasal cavity disease. In several cases, CT revealed clinically occult pathology not detected on radiographs. The imaging findings influenced therapeutic decision-making, including surgical planning and medical management.
+
+Limitations
+
+The retrospective design limited standardization of imaging protocols and follow-up. Histopathological confirmation was not available in all cases. The study population may reflect referral bias toward more advanced or complex cases.
+
+Conclusions
+
+CT is a valuable diagnostic modality in pet rabbits with suspected orbital or retrobulbar disease, providing superior anatomical detail compared to conventional imaging. It facilitates accurate diagnosis, identifies underlying dental pathology, and supports informed therapeutic planning. Early use of CT may improve diagnostic accuracy and clinical outcomes in rabbits presenting with periocular or retrobulbar signs.

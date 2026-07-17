@@ -39,7 +39,7 @@ from pathlib import Path
 # couple of helpers reused to build realistic fake data.
 import prepare_texts
 from evaluator import BLIND_FORBIDDEN_TOKENS
-from file_paths import doi_to_slug
+from file_paths import descriptive_pdf_filename, doi_to_slug
 import human_review
 from human_review import (
     REVIEWER_GUIDE_PATH,
@@ -419,21 +419,25 @@ def test_sampler_articles_mode_is_deterministic_for_a_fixed_seed() -> None:
 _FIXTURE_DOIS = [f"10.1111/test.{i}" for i in range(len(STUDY_JOURNALS))]
 
 
-def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
+def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path]:
     """Build a minimal evaluations.jsonl + summaries.jsonl/processed cache pair.
 
     One DOI per study journal (_FIXTURE_DOIS / STUDY_JOURNALS), one
     summarizer slot each, all successfully judged and joinable back to real
     reference/candidate text via prepare_texts.PROCESSED_DIR (patched here
-    exactly as tests/test_eval_instances.py does).
+    exactly as tests/test_eval_instances.py does). Also writes a matching
+    dummy PDF per article under a returned ``raw_dir``, so export's default
+    path (copy the real source PDF into ``article.pdf``) is exercised rather
+    than only the ``article.md`` fallback.
 
     In plain English: this helper fakes an entire tiny "study" — one article
-    per journal, each already summarized (by "openai") and already judged —
-    and writes it to temporary files, so the tests below can run the real
-    export function (which always samples evenly across all 5 real study
-    journals) against realistic-looking input without needing the actual
-    multi-gigabyte project data. ``tmp_path`` is pytest's built-in "give me
-    an empty scratch folder for this test" fixture.
+    per journal, each already summarized (by "openai") and already judged,
+    with its "original PDF" sitting on disk too — and writes it to temporary
+    files, so the tests below can run the real export function (which always
+    samples evenly across all 5 real study journals) against realistic-
+    looking input without needing the actual multi-gigabyte project data.
+    ``tmp_path`` is pytest's built-in "give me an empty scratch folder for
+    this test" fixture.
     """
     processed_dir = tmp_path / "processed"
     processed_dir.mkdir()
@@ -442,6 +446,8 @@ def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     dois = _FIXTURE_DOIS
     summaries_path = tmp_path / "summaries.jsonl"
     evaluations_path = tmp_path / "evaluations.jsonl"
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
 
     with open(summaries_path, "w", encoding="utf-8") as f:
         for doi, journal in zip(dois, STUDY_JOURNALS):
@@ -457,6 +463,10 @@ def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
             json.dumps({"doi": doi, "slug": slug, "text": f"Full cleaned article text for {doi}."}) + "\n",
             encoding="utf-8",
         )
+
+    for doi, journal in zip(dois, STUDY_JOURNALS):
+        record = {"doi": doi, "journal": journal}
+        (raw_dir / descriptive_pdf_filename(record)).write_bytes(b"%PDF-1.4 dummy\n")
 
     with open(evaluations_path, "w", encoding="utf-8") as f:
         for i, (doi, journal) in enumerate(zip(dois, STUDY_JOURNALS)):
@@ -476,7 +486,7 @@ def _write_fixture_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
                 "timestamp": "2026-01-01T00:00:00+00:00",
             }) + "\n")
 
-    return summaries_path, evaluations_path
+    return summaries_path, evaluations_path, raw_dir
 
 
 def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatch) -> None:
@@ -484,10 +494,10 @@ def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatc
     (overlap_ratio=1.0, so human2 repeats human1's items) over the 5-journal
     fixture corpus should each produce a complete, correctly structured
     humanN/ folder (guide + packet + xlsx scoresheet + per-item
-    article/summary files), a matching sibling unblinding key, and —
+    article.pdf/summary files), a matching sibling unblinding key, and —
     critically — none of it anywhere containing a forbidden AI-identity word.
     """
-    summaries_path, evaluations_path = _write_fixture_corpus(tmp_path, monkeypatch)
+    summaries_path, evaluations_path, raw_dir = _write_fixture_corpus(tmp_path, monkeypatch)
     output_dir = tmp_path / "human_review"
 
     kwargs = dict(
@@ -496,6 +506,7 @@ def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatc
         summaries_path=summaries_path,
         summaries_txt_dir=tmp_path / "no_summaries_txt",
         dev_tests_summaries_txt_dir=tmp_path / "no_dev_summaries_txt",
+        raw_dir=raw_dir,
     )
     results = [export_human_review(**kwargs) for _ in range(2)]
 
@@ -515,12 +526,20 @@ def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatc
         assert guide == expected_guide
         assert "item_001" in packet and last_item_id in packet
         assert f"scoresheet_human{human_number}.xlsx" in packet
-        # Full article text + summaries live in per-item folders now.
+        assert "article.pdf" in packet
+        # The real source PDF + candidate summary live in per-item folders now
+        # (article.pdf is a byte-for-byte copy — a real PDF is found for every
+        # fixture DOI, so no item falls back to the article.md text dump).
         item_dir = human_dir / "item_001"
-        article = (item_dir / "article.md").read_text(encoding="utf-8")
+        article_pdf = item_dir / "article.pdf"
         summary = (item_dir / "summary.md").read_text(encoding="utf-8")
-        assert "Full cleaned article text for" in article
-        blind_text = "\n".join([guide, packet, article, summary]).lower()
+        assert article_pdf.exists()
+        assert not (item_dir / "article.md").exists()
+        assert article_pdf.read_bytes() == b"%PDF-1.4 dummy\n"
+        assert not (human_dir / "original_articles").exists()
+        blind_text = "\n".join([
+            guide, packet, article_pdf.read_bytes().decode("ascii", errors="ignore"), summary,
+        ]).lower()
         for forbidden in BLIND_FORBIDDEN_TOKENS:
             assert forbidden not in blind_text
 
@@ -533,6 +552,36 @@ def test_export_human_review_creates_reviewer_folders(tmp_path: Path, monkeypatc
 
     # overlap_ratio=1.0 -> human2 should carry every article human1 saw.
     assert results[1].overlap_units == len(STUDY_JOURNALS)
+
+
+def test_export_human_review_falls_back_to_article_md_without_source_pdf(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """When no source PDF can be resolved for a DOI, the item folder falls
+    back to article.md (the cached text the AI summarizer actually read)
+    instead of being left without an article at all — and the export warns
+    about every DOI that fell back.
+    """
+    summaries_path, evaluations_path, _real_raw_dir = _write_fixture_corpus(tmp_path, monkeypatch)
+    empty_raw_dir = tmp_path / "empty_raw"  # deliberately has no matching PDFs
+    empty_raw_dir.mkdir()
+    output_dir = tmp_path / "human_review"
+
+    result = export_human_review(
+        sample_size=len(STUDY_JOURNALS),
+        evaluations_path=evaluations_path,
+        output_dir=output_dir,
+        summaries_path=summaries_path,
+        summaries_txt_dir=tmp_path / "no_summaries_txt",
+        dev_tests_summaries_txt_dir=tmp_path / "no_dev_summaries_txt",
+        raw_dir=empty_raw_dir,
+    )
+
+    human_dir = output_dir / f"human{result.human_number}"
+    for item_dir in sorted(p for p in human_dir.glob("item_*") if p.is_dir()):
+        assert not (item_dir / "article.pdf").exists()
+        article = (item_dir / "article.md").read_text(encoding="utf-8")
+        assert "Full cleaned article text for" in article
 
 
 def _write_fixture_corpus_multi_provider(
@@ -644,7 +693,7 @@ def test_export_human_review_skips_rows_missing_source_text(tmp_path: Path, monk
     changed since the article was judged) — export should quietly skip that
     one item and continue, rather than crashing the whole export.
     """
-    summaries_path, evaluations_path = _write_fixture_corpus(tmp_path, monkeypatch)
+    summaries_path, evaluations_path, _raw_dir = _write_fixture_corpus(tmp_path, monkeypatch)
 
     # Add an extra evaluation row for a DOI with no matching summaries.jsonl
     # entry, in the SAME journal as one of the 5 real fixture articles
@@ -760,7 +809,7 @@ def test_ingest_reads_filled_xlsx_scoresheet(tmp_path: Path, monkeypatch) -> Non
     """
     from openpyxl import load_workbook
 
-    summaries_path, evaluations_path = _write_fixture_corpus(tmp_path, monkeypatch)
+    summaries_path, evaluations_path, _raw_dir = _write_fixture_corpus(tmp_path, monkeypatch)
     output_dir = tmp_path / "human_review"
     export_human_review(
         sample_size=len(STUDY_JOURNALS),

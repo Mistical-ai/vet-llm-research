@@ -8,7 +8,7 @@
 
 ## What it does
 
-Reads every `(paper, summariser)` pair from `data/summaries.jsonl` and asks a **judge model** to score the summary against the original cleaned text. Records quality (1-10), hallucination count, hallucination categories, confidence (1-5), and a `requires_human_review` flag for the Phase-5 sample. The judge is **blind to the summariser identity** — the prompt template only sees `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`.
+Reads every `(paper, summariser)` pair from `data/summaries.jsonl` and asks a **judge model** to score the summary against the original cleaned text. Records the primary `jury_score` (1–5, MedHELM-style default — see [medhelm_evaluation.md](medhelm_evaluation.md)), a legacy `quality_score` (1-10), hallucination count, hallucination categories, confidence (1-5), and a `requires_human_review` flag for the Phase-5 sample. The judge is **blind to the summariser identity** — the prompt template only sees `{REFERENCE_TEXT}` and `{CANDIDATE_SUMMARY}`.
 
 Real-time only. Batch evaluation submissions are handled by `batch_utils.py` alongside summarisation, and the results are collected by `check_batch_status.py`.
 

@@ -66,7 +66,7 @@ run_manifest              →    provenance record for every evaluation run
 
 
 PHASE 5 — HUMAN VALIDATION
-export-human-review   →   (vets fill blind CSVs)   →   ingest-human-review
+export-human-review   →   (vets fill blind XLSX scoresheets)   →   ingest-human-review
                                                               ↓
                                                     data/human_reviews.jsonl
 
@@ -114,6 +114,7 @@ That guide explains how the folders connect, how data moves from PDF to summary 
 | 6 | [docs/phase6/reporting.md](docs/phase6/reporting.md) — publication tables and figures |
 | Stats | [docs/statistics_explained.md](docs/statistics_explained.md) — Friedman, Wilcoxon, bootstrap CIs in plain English |
 | Booklet | [docs/booklet/BOOKLET.md](docs/booklet/BOOKLET.md) — full teaching booklet, start to finish, for a complete beginner (plus a standalone chapter for veterinarian reviewers) |
+| Commands | [docs/COMMANDS.md](docs/COMMANDS.md) — every command in the pipeline, in order, one page, copy-paste ready |
 
 ---
 
@@ -393,7 +394,7 @@ Full details: **[docs/phase4/README.md](docs/phase4/README.md)**
 Before trusting LLM jury scores at scale, we check them against human experts. The workflow is three commands:
 
 ```text
-export-human-review  →  (vets fill blind CSVs)  →  ingest-human-review  →  eval-report
+export-human-review  →  (vets fill blind XLSX scoresheets)  →  ingest-human-review  →  eval-report
 ```
 
 ```powershell

@@ -409,7 +409,7 @@ def test_partial_provider_payload_is_repaired_without_inventing_facts() -> None:
     assert parsed.key_findings == []
     assert parsed.clinical_significance == "Not reported"
     assert parsed.limitations == []
-    assert parsed.summary_text.startswith("Objective: Assess diet associations.")
+    assert parsed.summary_text.startswith("Background: Assess diet associations.")
 
 
 # ---------------------------------------------------------------------------
@@ -1037,30 +1037,30 @@ def test_openai_is_temperature_error_detection() -> None:
 # Human-readable format
 # ---------------------------------------------------------------------------
 
-def test_format_human_readable_produces_numbered_sections() -> None:
+def test_format_human_readable_produces_ordered_sections() -> None:
     structured = _valid_summary_dict()
     text = summarizer._format_human_readable(structured)
 
-    assert "1. Objective" in text
-    assert "2. Key Methods" in text
-    assert "3. Primary Results" in text
-    assert "4. Clinical Significance" in text
-    assert "5. Limitations" in text
+    assert "Background" in text
+    assert "Methods" in text
+    assert "Results" in text
+    assert "Limitations" in text
+    assert "Conclusions" in text
     # Lists should be bullet-pointed.
     assert "- Medical records were reviewed." in text
     assert "- Clinical signs improved in 30 of 42 dogs." in text
-    # Sections must appear in order.
-    assert text.index("1. Objective") < text.index("2. Key Methods")
-    assert text.index("2. Key Methods") < text.index("3. Primary Results")
-    assert text.index("3. Primary Results") < text.index("4. Clinical Significance")
-    assert text.index("4. Clinical Significance") < text.index("5. Limitations")
+    # Sections must appear in the same order as the prose summary_text.
+    assert text.index("Background") < text.index("Methods")
+    assert text.index("Methods") < text.index("Results")
+    assert text.index("Results") < text.index("Limitations")
+    assert text.index("Limitations") < text.index("Conclusions")
 
 
 def test_enrich_result_adds_human_readable_on_success() -> None:
     result = summarizer._mock_summary("openai", "Some article text.")
     enriched = summarizer._enrich_result_with_human_readable(result)
     assert "human_readable" in enriched
-    assert "1. Objective" in enriched["human_readable"]
+    assert "Background" in enriched["human_readable"]
 
 
 def test_enrich_result_skips_human_readable_on_failure() -> None:
@@ -1115,7 +1115,7 @@ def test_summarize_all_pdfs_test_mode_writes_output_files(
         assert "OPENAI SUMMARY" in text
         assert "ANTHROPIC SUMMARY" in text
         assert "GEMINI SUMMARY" in text
-        assert "1. Objective" in text
+        assert "Background" in text
 
 
 def test_summarize_all_pdfs_each_pdf_has_all_three_providers(

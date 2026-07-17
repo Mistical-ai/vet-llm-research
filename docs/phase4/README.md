@@ -195,7 +195,7 @@ The offline rubric uses four 1–5 dimensions defined in
 - `factual_accuracy` — token overlap between summary and reference text
 - `hallucination_risk` — inverse of unsupported-looking claims
 - `clinical_relevance` — species + clinical keyword presence
-- `completeness` — coverage of objective/methods/results/limitations cues
+- `completeness` — coverage of objective, methods, population/species, results, significance, and limitations cues
 
 **Reference text precedence** (matches MedHELM jury intent):
 

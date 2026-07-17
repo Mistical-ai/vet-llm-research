@@ -208,7 +208,7 @@ in `### Judge: anthropic` is only attached afterward, for your reference.
 | Factual Accuracy | 5/5 | Every claim in the summary is directly supported by... |
 | Completeness | 5/5 | All six elements are present: objective/research question... |
 | Practical Usefulness | 5/5 | Species (dogs) and clinical context (pulmonary stenosis)... |
-| Clarity | 5/5 | The summary is well-organized with clear numbered sections... |
+| Clarity | 5/5 | The summary reads as clear, well-organized prose with a logical Background-to-Conclusions flow... |
 | Safety | 5/5 | No species generalization, no misleading clinical interpretation... |
 ```
 

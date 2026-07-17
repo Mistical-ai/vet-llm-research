@@ -199,20 +199,31 @@ These rows are meant for a later Phase 5 manual check — not ignored, but marke
 Controlled by `.env`:
 
 ```env
-JUDGE_MODELS=openai
+JUDGE_MODELS=openai,anthropic,gemini
 ```
 
-Default: **OpenAI** judges all summaries. You can add more judges (e.g. `openai,anthropic`) for a second opinion; each combination gets its own row in `data/evaluations.jsonl`.
+Default: the **full 3-judge panel** (`openai,anthropic,gemini`) scores every summary when `JUDGE_MODELS` is unset — evaluation is a real jury, not a single grader. You can narrow it to fewer judges (e.g. `JUDGE_MODELS=openai`, or the `JURY_PRESET=solo|duo|panel` shortcut) for a cheaper run; each judge gets its own row in `data/evaluations.jsonl`.
 
 The judge is **separate** from the three summarisers. Summarisers write; the judge only reads and scores.
 
 ---
 
-## Journal-stratified sampling (single / dev runs)
+## Small-sample evaluation (single / dev runs)
 
-In `single` or `dev` mode, evaluation does **not** score every paper in the corpus. It randomly picks **one paper per journal** (five journals → five papers), using a fixed seed (`EVAL_SAMPLE_SEED=42`) so the same sample is chosen every time unless you change the seed.
+Neither `single` nor `dev` mode scores every paper in the corpus, but they pick
+their sample differently:
 
-That keeps paid test runs cheap while still covering all five target journals.
+- **`single`** randomly picks **one paper per journal** (five journals → five
+  papers), using a fixed seed (`EVAL_SAMPLE_SEED=42`) so the same sample is
+  chosen every time unless you change the seed.
+- **`dev`** now defaults to the folder-driven **dev-jsonl loop**: it judges the
+  papers already sitting in `data/dev_summaries_jsonl/`, mirrors each score into
+  `data/dev_evals_jsonl/`, and skips papers it has already judged so the dev
+  sample grows incrementally. See
+  [dev_evaluation_guide.md](dev_evaluation_guide.md) and
+  [evaluator.md](evaluator.md) for the step-by-step loop.
+
+That keeps paid test runs cheap while still covering the target journals.
 
 Full **batch** runs evaluate everything.
 

@@ -157,9 +157,9 @@ class VeterinarySummary(BaseModel):
     )
     key_methods: list[str] = Field(
         description=(
-            "Main methods, interventions, exposures, measurements, comparisons, "
-            "or statistical approach. Each item must be directly supported by "
-            "the article text."
+            "Main methods, interventions, exposures, measurements/outcomes "
+            "assessed, statistical analysis approach, or comparisons. Each item "
+            "must be directly supported by the article text."
         ),
     )
     key_findings: list[str] = Field(
@@ -183,9 +183,12 @@ class VeterinarySummary(BaseModel):
     )
     summary_text: str = Field(
         description=(
-            "A readable clinical prose summary under 400 words. It must include "
-            "Objective, Key Methods, Primary Results, and Clinical Significance, "
-            "and must not include unsupported facts."
+            "A short plain-language prose summary under 400 words (target 300-380), "
+            "written for a busy veterinary clinician. Flowing paragraphs only — no "
+            "numbered lists, no bullet points, no bold headers — one paragraph each "
+            "for Background, Methods, Results, Limitations, and Conclusions, in that "
+            "order. Mention only headline numbers; keep exhaustive statistics in "
+            "key_findings instead. Must not include unsupported facts."
         ),
     )
 
@@ -234,10 +237,11 @@ def _summary_text_from_payload(payload: dict[str, Any]) -> str:
     """
     parts = []
     for label, key in (
-        ("Objective", "objective"),
-        ("Key Methods", "key_methods"),
-        ("Primary Results", "key_findings"),
-        ("Clinical Significance", "clinical_significance"),
+        ("Background", "objective"),
+        ("Methods", "key_methods"),
+        ("Results", "key_findings"),
+        ("Limitations", "limitations"),
+        ("Conclusions", "clinical_significance"),
     ):
         value = payload.get(key)
         if isinstance(value, list):
@@ -1597,40 +1601,34 @@ class SummaryRunStats(dict[str, int]):
 
 def _format_human_readable(structured: dict) -> str:
     """
-    Format a VeterinarySummary structured dict into numbered clinical sections.
+    Format a VeterinarySummary structured dict into plain clinical sections.
 
-    Sections always appear in this fixed order so every output looks the same
-    regardless of which provider produced it. Lists are bullet-pointed; scalar
-    fields are left as prose.
+    Sections always appear in the same fixed order as the prose ``summary_text``
+    (Background, Methods, Results, Limitations, Conclusions) so every readable
+    output — this inspection dump and the actual summaries alike — looks the
+    same regardless of which provider produced it. List fields are
+    bullet-pointed; scalar fields are left as prose.
+
+    The section order is copied literally from ``_summary_text_from_payload``
+    (the ``(label, key)`` tuple) so the two renderers can never drift apart.
+    They intentionally don't share one helper: this one bullet-points list
+    fields, whereas the payload repair path joins them into prose.
     """
     parts: list[str] = []
 
-    objective = str(structured.get("objective") or "Not reported").strip()
-    parts.append(f"1. Objective\n{objective}")
-
-    methods = structured.get("key_methods") or []
-    if isinstance(methods, list):
-        body = "\n".join(f"- {m}" for m in methods) if methods else "Not reported"
-    else:
-        body = str(methods)
-    parts.append(f"2. Key Methods\n{body}")
-
-    findings = structured.get("key_findings") or []
-    if isinstance(findings, list):
-        body = "\n".join(f"- {f}" for f in findings) if findings else "Not reported"
-    else:
-        body = str(findings)
-    parts.append(f"3. Primary Results\n{body}")
-
-    significance = str(structured.get("clinical_significance") or "Not reported").strip()
-    parts.append(f"4. Clinical Significance\n{significance}")
-
-    limitations = structured.get("limitations") or []
-    if isinstance(limitations, list):
-        body = "\n".join(f"- {l}" for l in limitations) if limitations else "Not reported"
-    else:
-        body = str(limitations)
-    parts.append(f"5. Limitations\n{body}")
+    for label, key in (
+        ("Background", "objective"),
+        ("Methods", "key_methods"),
+        ("Results", "key_findings"),
+        ("Limitations", "limitations"),
+        ("Conclusions", "clinical_significance"),
+    ):
+        value = structured.get(key)
+        if isinstance(value, list):
+            body = "\n".join(f"- {item}" for item in value) if value else "Not reported"
+        else:
+            body = str(value or "Not reported").strip()
+        parts.append(f"{label}\n{body}")
 
     return "\n\n".join(parts)
 

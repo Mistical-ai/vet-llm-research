@@ -5,33 +5,36 @@ Your main focus is providing structured summaries that emphasize facts directly 
 The API requires you to fill a VeterinarySummary schema. Populate every schema field using only the article text below, then assemble summary_text in the human-readable format described later.
 
 Schema field guidance (facts from the paper only; use "Not reported" when absent):
-- headline: a catchy email subject line designed to maximize open rates. It must accurately reflect the study's main finding—never clickbait or unsupported claims.
+- headline: one sentence with the most clinically important takeaway.
 - objective: the rationale, hypothesis, or purpose (typically from the introduction).
 - study_design: the study type and design (e.g., randomized trial, retrospective cohort, cross-sectional survey).
 - species: the animal species or population studied.
 - sample_size: number of animals, samples, records, owners, or cases analyzed; use null if not reported.
-- key_methods: main methods and how the study was executed. Each list item should be a concise factual statement supported by the text.
+- key_methods: main methods and how the study was executed, including measurements/outcomes assessed and the statistical analysis approach when reported. Each list item should be a concise factual statement supported by the text.
 - key_findings: the most important results. Present specific findings without detailed statistics unless a key number is essential to understanding the result.
 - clinical_significance: the authors' high-level conclusions and the study's significance.
 - limitations: drawbacks or caveats noted by the authors, usually from the discussion.
 - summary_text: the full structured summary in paragraph format (see format below).
 
-summary_text format (under 400 words total, paragraph form for each section):
+summary_text format (a short, plain-language prose summary for a busy veterinary clinician
+who has about a minute to read it; under 400 words total, target 300-380; flowing paragraphs
+only — no numbered headers, no bullet points, no markdown bold):
 
-Title: [article title as reported in the text, or "Not reported"]
-Authors: [author names only if present in the article text, or "Not reported"]
-DOI: [DOI only if present in the article text, or "Not reported"]
-
-Email Subject: [same catchy subject line as headline—accurate and open-rate focused]
+[Article title, as reported in the text — omit this line if not present]
+[Author names, as reported, comma-separated — omit this line if not present]
 
 Background
 [One concise paragraph: rationale, hypothesis, or purpose from the introduction.]
 
 Methods
-[One concise paragraph: study type, population, and how the study was executed.]
+[One concise paragraph: study type, population, how the study was executed, and
+— briefly, when reported — how outcomes were measured and analyzed
+statistically. Exact statistical figures belong in key_findings, not here.]
 
 Results
-[One concise paragraph: specific findings without detailed statistics unless essential.]
+[One concise paragraph: the main findings in plain language. Mention at most one or two
+headline numbers — do not restate every statistic; exact figures belong in key_findings
+instead.]
 
 Limitations
 [One concise paragraph: drawbacks or caveats noted by the authors.]
@@ -41,11 +44,13 @@ Conclusions
 
 Rules:
 - Use only information present or directly implied in the article text.
-- Do not invent titles, authors, DOIs, statistics, or conclusions.
+- Do not invent titles, authors, statistics, or conclusions.
 - If a field or section lacks source information, write "Not reported" rather than inferring.
 - For missing sample_size, use null. Do not use 0 unless the article explicitly reports zero.
-- Keep each summary_text section as a paragraph, not bullet points.
-- summary_text must stay under 400 words.
+- Keep each summary_text section as a flowing prose paragraph — no bullet points, no numbered
+  lists, no bold headers.
+- summary_text must stay under 400 words (target 300-380) and must not simply restate the
+  key_findings list.
 
 Article text:
 {ARTICLE_TEXT}

@@ -83,11 +83,11 @@ The fields every provider must fill in are:
 | `study_design` | The reported design, or `"Not reported"`. |
 | `species` | The animal species or population studied. |
 | `sample_size` | Number of animals/samples/records/cases analyzed, or `null` if not reported — the prompt explicitly forbids writing `0` unless the article says zero. |
-| `key_methods` | A short list of the main methods, interventions, or comparisons. |
-| `key_findings` | A short list of the most important findings — the prompt specifically instructs the model to keep exact numbers (percentages, thresholds, durations) rather than compressing them into vague phrases like "significant reduction." |
+| `key_methods` | A short list of the main methods, interventions, measurements/outcomes assessed, statistical analysis approach, or comparisons. |
+| `key_findings` | A short list of the most important findings — the prompt asks for a key number only when it's essential to understanding a result, rather than trying to capture every statistic in the article. |
 | `clinical_significance` | How a practicing clinician should interpret or apply the findings. |
 | `limitations` | Important caveats — the prompt specifically calls out missing confirmatory diagnostics (e.g. EEG, histopathology, imaging) as a limitation worth surfacing on its own, separate from sample-size caveats. |
-| `summary_text` | Readable prose, under 400 words, in a fixed section order: Objective, Key Methods, Primary Results, Clinical Significance, Limitations. |
+| `summary_text` | Short plain-language prose for a busy clinician, under 400 words (target 300-380), in a fixed section order: title/authors, Background, Methods, Results, Limitations, Conclusions. Flowing paragraphs only — no numbered headers, no bullet points, no bold. |
 
 Every one of these rules exists to stop the model from **inventing**
 information: if a fact isn't in the article, the prompt tells the model to

@@ -424,11 +424,12 @@ data/human_review/
     packet.md                    navigation index: one row per item_id -> folder
     scoresheet_human1.xlsx       blank scoresheet (dropdowns, version-labeled rows)
     item_001/
-      article.md                 the original article text
-      summary.md                 one candidate summary to score against it
+      article.pdf                 the original published article, copied from data/raw
+                                   (falls back to article.md — the cached text the AI
+                                   read — if no source PDF can be resolved for that DOI)
+      summary.md                  one candidate summary to score against it
     item_002/
       ...
-    original_articles/           matched source PDFs copied from data/raw (best-effort)
   human2/
     REVIEWER_GUIDE.md
     packet.md
@@ -466,10 +467,21 @@ its own item folder.
 
 ### `item_NNN/` — one folder per review item
 
-`article.md` holds the full original article text; `summary.md` holds the single
-candidate summary to score against it. Nothing else — no DOI, no journal, no
-model name. The same article recurs across several `item_NNN/` folders (one per
-provider's summary), each labeled with a blind-safe *version* number.
+`article.pdf` holds a copy of the original published article — figures, tables,
+and references intact, exactly as it appeared in the journal — copied from
+`data/raw` (`write_item_folders()` in `human_review.py`). Reviewers now score
+against this real PDF rather than the stripped text the AI summarizer actually
+read; see `docs/booklet/07_human_validation_guide.md` §3 for the reviewer-facing
+explanation of why that's fair, and what to do when a paper's key finding lives
+only in a graph/table the AI never saw. When no source PDF can be resolved for a
+DOI (moved, renamed, or never downloaded), the item folder falls back to
+`article.md` — the same full cached text from `data/processed/` the AI was given
+— so export never produces an item with no article at all; `export-human-review`
+prints a warning naming every DOI that fell back. `summary.md` holds the single
+candidate summary to score against it. Nothing else in either file — no DOI, no
+journal, no model name. The same article recurs across several `item_NNN/`
+folders (one per provider's summary), each labeled with a blind-safe *version*
+number.
 
 ### `scoresheet_humanN.xlsx` — what the reviewer fills in
 
@@ -517,12 +529,13 @@ merged, global `item_id` table — so this can't get crossed.
 1. Run the export.
 2. Send each reviewer only their own `humanN/` folder — it is now fully
    self-contained (`REVIEWER_GUIDE.md` + `packet.md` +
-   `scoresheet_humanN.xlsx` + the `item_NNN/` folders + `original_articles/`),
-   nothing else needs to be separately attached. Do **not** send
-   `unblinding_key_human{N}.json`.
+   `scoresheet_humanN.xlsx` + the `item_NNN/` folders, each with its own
+   `article.pdf`), nothing else needs to be separately attached. Do **not**
+   send `unblinding_key_human{N}.json`.
 3. Ask them to read `REVIEWER_GUIDE.md` once, then work down the packet index:
-   open each `item_NNN/` folder, read `article.md` + `summary.md`, and fill that
-   `item_id`'s row in the `.xlsx` — 1-5 in each numeric column — then return it.
+   open each `item_NNN/` folder, read `article.pdf` + `summary.md`, and fill
+   that `item_id`'s row in the `.xlsx` — 1-5 in each numeric column — then
+   return it.
 4. Keep the completed `.xlsx` sheets **in their `humanN/` folders** and every
    `unblinding_key_human{N}.json` together under `data/human_review/`, so
    ingest (§7) can find both.

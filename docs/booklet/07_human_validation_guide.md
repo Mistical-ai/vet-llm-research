@@ -58,8 +58,9 @@ You'll get the following, all in one folder:
 
 1. **One folder per item**, labeled `item_001`, `item_002`, and so on, plus a
    short **index** (`packet.md`) that lists them all. Open each item folder and
-   you'll find two files: `article.md` (the full text of the original research
-   article) and `summary.md` (one AI-written summary of it). That's all — no
+   you'll find two files: `article.pdf` (the original article exactly as it
+   was published — the real PDF, with its figures, tables, and reference list
+   intact) and `summary.md` (one AI-written summary of it). That's all — no
    author names, no journal name tricks, no hints about which AI wrote the
    summary. (The article's title *is* shown, which is fine — it tells you which
    paper you're reading, not which AI wrote the summary.) **The same article
@@ -76,18 +77,28 @@ You'll get the following, all in one folder:
    labeled with the version number so you can tell them apart. (An older `.csv`
    version works the same way, minus the drop-downs.)
 
-3. **The original article PDFs** — *only in some hand-offs.* If your folder
-   contains a subfolder called `original_articles/`, it holds the original
-   published PDF of each article in your reading document. These are there
-   purely as a convenience — the real figures, tables, and layout can be
-   easier to read than the plain text in the item folders. **Score each summary
-   against the article text in that item's `article.md`, not the PDF.** That
-   text is exactly what the AI system was given to work from, so judging the
-   summary against it keeps the comparison fair — a PDF may show a chart or
-   table the AI never actually received. Think of the PDF as helpful
-   background, not the thing being graded against. (If there's no
-   `original_articles/` folder, don't worry — everything you need to score is
-   already in the item folders.)
+3. **One important thing to know about how the AI wrote its summaries:** the
+   AI never saw the PDF you're looking at. It was only given the article's
+   plain text — no images, no charts, no tables, and no reference list, just
+   the words. It genuinely could not see any figure or graph in the paper; it
+   only knew whatever the surrounding text happened to say about it. (This was
+   deliberate on our part — today's AI systems are still unreliable at reading
+   scientific charts and diagrams accurately, and testing that separately
+   wasn't the point of this study.)
+
+   Keep that in mind as you score: **if a summary doesn't describe the visual
+   details of a chart or figure, that's not really a fair strike against
+   it** — the AI never had the chance to see it. But there's an important
+   exception: **if a paper's key finding or conclusion is really only fully
+   conveyed in a graph, table, or image** — something no summary written from
+   the plain text alone could have gotten right — **and the summary
+   consequently misses or misstates it, that genuinely is worth reflecting in
+   your score.** That's less "the AI was careless" and more "this AI system,
+   right now, has a real limitation here" — and how often that limitation
+   actually costs a summary something clinically real is one of the things
+   this study is trying to find out. Use your own clinical judgment: was the
+   omission harmless in this particular case, or would a clinician relying on
+   this summary actually be missing something that mattered?
 
 You will **not** receive any file that reveals which AI wrote which summary.
 If you're ever sent a file besides these, or you accidentally come across
@@ -102,9 +113,10 @@ reviewers have finished; it plays no role in your scoring.
 Take the items one at a time, in order (`item_001`, then `item_002`, …). For
 each one, open its folder:
 
-1. **Read `article.md` first** — the original article — just as you normally
-   would when evaluating a piece of veterinary literature, enough to form your
-   own sense of what it actually found and concluded.
+1. **Read `article.pdf` first** — the original article, exactly as published —
+   just as you normally would when evaluating a piece of veterinary
+   literature, enough to form your own sense of what it actually found and
+   concluded.
 2. **Then read `summary.md`**, the AI-written summary of that same article.
 3. **Ask yourself: if a colleague handed me this summary instead of the
    article, would it serve me well — and could it mislead me?**

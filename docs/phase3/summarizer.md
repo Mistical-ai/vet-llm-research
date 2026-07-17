@@ -95,7 +95,7 @@ python llm-sum/summarizer.py --mode single --guide-summary llm-sum/prompts/guide
 
 ## Optional Format Guide
 
-If you write one summary yourself, paste it into:
+`llm-sum/prompts/guide_summary_template.txt` ships pre-populated with 4 example summaries (short title/author line, then Background/Methods/Results/Limitations/Conclusions prose paragraphs) showing the target length and tone. To use your own instead, replace its contents:
 
 ```text
 llm-sum/prompts/guide_summary_template.txt

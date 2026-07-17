@@ -10,13 +10,15 @@ here calls a real AI model or the internet, it's completely safe to run.
 
 Offline, mock corpus only (PHASE3_MODE=test, $0, no network). Covers:
     - The relocated dev-pool DOI reader (eval_instances.read_dois_from_dev_folder).
-    - A self-contained humanN/ folder: guide + packet + .xlsx + original_articles/.
+    - A self-contained humanN/ folder: guide + packet + .xlsx + one article.pdf
+      per item folder (copied from the source PDF).
     - The blind protocol: packet.md AND the .xlsx carry no summariser identity.
     - packet.md points at the actual .xlsx scoresheet, not the CSV default.
     - Partial overlap: human2 shares exactly round(N*ratio) of human1's items.
     - human2's export never mutates human1's folder.
     - Prerequisite handling: summarized-but-unevaluated warning; empty pool -> None.
-    - PDF copy, including the graceful skip + warning when a PDF is absent.
+    - Per-item PDF copy, including the graceful fallback to article.md + warning
+      when a PDF is absent.
     - Pool-exhaustion backfill warning when the dev pool can't supply new items.
 """
 
@@ -266,7 +268,7 @@ def test_read_dois_from_dev_folder_parses_headers(tmp_path: Path) -> None:
 # item — and that the private answer key ends up NEXT TO the human1 folder,
 # never inside it (so handing the folder to a real person can't leak
 # anything). Also checks the expected 15 items (5 articles x 3 AI providers)
-# and that one PDF was copied per distinct article.
+# and that every item folder got its own copy of the source PDF.
 def test_pilot_export_creates_self_contained_human1(tmp_path: Path, monkeypatch) -> None:
     fx = _build_fixture(tmp_path, monkeypatch)
     result = _export(fx, overlap_ratio=0.6, seed=42)
@@ -286,23 +288,23 @@ def test_pilot_export_creates_self_contained_human1(tmp_path: Path, monkeypatch)
     assert not (human_dir / "unblinding_key_human1.json").exists()
 
     # Nested per-item layout: one item_NNN/ folder per item, each with its own
-    # article.md + summary.md.
+    # article.pdf (the source PDF, copied per item) + summary.md. The
+    # top-level original_articles/ dedup folder is gone now that every item
+    # carries its own article.pdf.
     item_folders = sorted(p for p in human_dir.glob("item_*") if p.is_dir())
     assert len(item_folders) == 15
     for folder in item_folders:
-        assert (folder / "article.md").exists()
+        assert (folder / "article.pdf").exists()
+        assert not (folder / "article.md").exists()
         assert (folder / "summary.md").exists()
-
-    # PDFs copied into the subfolder (one per distinct article = 5).
-    pdfs = list((human_dir / "original_articles").glob("*.pdf"))
-    assert len(pdfs) == len({doi for doi, _, _ in _key_identities(
-        fx["output_dir"] / "unblinding_key_human1.json")}) == 5
+    assert not (human_dir / "original_articles").exists()
 
 
 # In plain English: gathers up every piece of text a reviewer would actually
-# read in a humanN/ folder (the packet, the guide, every article.md and
+# read in a humanN/ folder (the packet, the guide, every article.pdf/.md and
 # summary.md) into one big lowercase blob, so a test can search it for
-# forbidden words in one go.
+# forbidden words in one go. article.pdf is binary, so it's decoded loosely
+# (ignoring bytes that aren't plain ASCII) rather than as UTF-8 text.
 def _folder_text(human_dir: Path) -> str:
     """All reviewer-facing text in a humanN/ folder (packet + guide + item files)."""
     parts = [
@@ -310,7 +312,11 @@ def _folder_text(human_dir: Path) -> str:
         (human_dir / "REVIEWER_GUIDE.md").read_text(encoding="utf-8"),
     ]
     for folder in human_dir.glob("item_*"):
-        parts.append((folder / "article.md").read_text(encoding="utf-8"))
+        article_pdf = folder / "article.pdf"
+        if article_pdf.exists():
+            parts.append(article_pdf.read_bytes().decode("ascii", errors="ignore"))
+        else:
+            parts.append((folder / "article.md").read_text(encoding="utf-8"))
         parts.append((folder / "summary.md").read_text(encoding="utf-8"))
     return "\n".join(parts).lower()
 
@@ -553,31 +559,45 @@ def test_pilot_returns_none_when_dev_folder_empty(tmp_path: Path, monkeypatch) -
 # ---------------------------------------------------------------------------
 
 # In plain English: with overlap_ratio=1.0 (so human1 gets every fixture
-# article), checks that a real PDF got copied into original_articles/ for
-# every distinct article, and nothing was reported missing.
+# article), checks that a real PDF got copied into every item's own
+# article.pdf, and nothing was reported missing.
 def test_pilot_copies_matched_pdfs(tmp_path: Path, monkeypatch) -> None:
     fx = _build_fixture(tmp_path, monkeypatch)
     result = _export(fx, overlap_ratio=1.0, seed=42)
-    copied = list((fx["output_dir"] / "human1" / "original_articles").glob("*.pdf"))
-    # One PDF per distinct sampled article, all present in raw/.
-    assert result.pdfs_copied == len(copied) > 0
+    human_dir = fx["output_dir"] / "human1"
+    item_folders = [p for p in human_dir.glob("item_*") if p.is_dir()]
+    copied = [p for p in item_folders if (p / "article.pdf").exists()]
+    # Every item folder got its own copy of its article's source PDF.
+    assert result.pdfs_copied == len(copied) == len(item_folders) == result.items_exported
     assert result.pdfs_missing == []
+    for folder in item_folders:
+        assert not (folder / "article.md").exists()
 
 
 # In plain English: builds a fixture where one article's PDF is deliberately
 # missing from raw/, and checks the export doesn't crash — it should still
-# finish, list that one article under "pdfs_missing", print a warning
-# mentioning it, and still successfully copy the other articles' PDFs.
+# finish, list that article's item(s) under "pdfs_missing" (falling back to
+# article.md for just those items), print a warning mentioning it, and still
+# successfully copy the other articles' PDFs.
 def test_pilot_missing_pdf_warns_not_fatal(tmp_path: Path, monkeypatch, capsys) -> None:
     # Force the whole 5-item sample so the article with no PDF is always included.
     fx = _build_fixture(tmp_path, monkeypatch, missing_pdf_index=0)
     result = _export(fx, seed=42, sample_size=5)
     out = capsys.readouterr().out
     assert result is not None
-    assert result.pdfs_missing  # the missing article is reported
+    assert result.pdfs_missing  # the missing article's item(s) are reported
     assert "no source PDF found" in out
     # The rest still copied.
     assert result.pdfs_copied >= 1
+
+    human_dir = fx["output_dir"] / "human1"
+    item_folders = [p for p in human_dir.glob("item_*") if p.is_dir()]
+    pdf_items = [p for p in item_folders if (p / "article.pdf").exists()]
+    md_items = [p for p in item_folders if (p / "article.md").exists()]
+    # Every item falls back to exactly one of the two — never both, never neither.
+    assert len(pdf_items) + len(md_items) == len(item_folders) == result.items_exported
+    assert len(pdf_items) == result.pdfs_copied
+    assert len(md_items) == len(result.pdfs_missing)
 
 
 # ---------------------------------------------------------------------------

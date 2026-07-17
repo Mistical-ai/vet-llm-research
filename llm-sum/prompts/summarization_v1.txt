@@ -6,32 +6,53 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
 - study_design: the reported design, or "Not reported".
 - species: the animal species or population studied, or "Not reported".
 - sample_size: the number of animals, samples, records, owners, or cases analyzed; use null if not reported.
-- key_methods: short list of main methods, interventions, measurements, or comparisons.
+- key_methods: short list of main methods, interventions, measurements/outcomes
+  assessed, statistical analysis approach, or comparisons.
 - key_findings: short list of the most important findings, especially quantitative results.
-  Include every specific number: episode durations, frequency percentages (e.g. "40% daily /
-  27% weekly"), response thresholds (e.g. "≥50% reduction"), follow-up durations with ranges.
-  Do not compress multiple statistics into a vague phrase like "significant reduction" when
-  the article states a specific threshold or value.
+  Include a key number or threshold when it is essential to understanding a finding (for
+  example a response rate or a follow-up duration), but do not try to capture every statistic
+  in the article — favor the most clinically important results over exhaustive coverage.
 - clinical_significance: how a practising clinician should interpret or apply the findings.
 - limitations: short list of important caveats or limitations from the article.
   Specifically include the absence of confirmatory diagnostic tests (EEG,
   electroencephalography, histopathology, imaging) if the article mentions them as limitations.
   These methodological limitations are distinct from sample-size caveats and are often the most
   scientifically important.
-- summary_text: readable prose under 400 words using these sections in order:
-  1. Objective
-  2. Key Methods
-  3. Primary Results
-  4. Clinical Significance
-  5. Limitations
+- summary_text: a short, plain-language prose summary for a busy veterinary clinician who has
+  about a minute to read it. Write flowing paragraphs only — no numbered headers, no bullet
+  points, no markdown bold — one short paragraph per section, in this exact order:
+
+  [Article title, as reported in the text — omit this line if not present]
+  [Author names, as reported, comma-separated — omit this line if not present]
+
+  Background
+  [The clinical problem and why the study was done.]
+
+  Methods
+  [Study design, species, sample size, what was done, and — briefly, when
+  reported — how outcomes were measured and analyzed statistically, in plain
+  language. Exact statistical figures belong in key_findings, not here.]
+
+  Results
+  [The main findings in plain language. Mention at most one or two headline numbers —
+  do not restate every statistic; exact figures belong in key_findings instead.]
+
+  Limitations
+  [The most important caveats, in plain language.]
+
+  Conclusions
+  [The bottom-line takeaway and its clinical relevance.]
 
 Rules:
-- summary_text must be under 400 words.
+- summary_text must be under 400 words (target 300-380) and contain only flowing prose
+  paragraphs in the section order above — no numbered lists, no bullet points, no bold headers.
+- summary_text must not simply restate the key_findings list; describe results in plain
+  language and save exact statistics for key_findings.
 - Do not introduce facts, statistics, or interpretations that are not present or directly implied in the article text.
 - If a text field's information is not present in the source, write "Not reported" rather than inferring.
 - For missing sample size, use null. Do not use 0 unless the article explicitly reports zero.
 - Keep wording clear for a clinical veterinary audience.
-- Include author names in summary_text only if they are present in the article text.
+- Include the article title and author names in summary_text only if they are present in the article text.
 
 Article text:
 {ARTICLE_TEXT}

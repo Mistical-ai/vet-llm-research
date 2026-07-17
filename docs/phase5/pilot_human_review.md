@@ -33,11 +33,11 @@ Both commands now share the same incremental `humanN/`, exact-per-journal-quota,
 and overlap-carry machinery in `llm-sum/human_review.py` — `next_human_number`,
 `select_incremental_rows`, `sample_articles_from_journal_quota`, the blind
 protocol, the un-blinding key, the reviewer guide, the "5/10/25 articles?"
-prompt, the nested per-item folder layout (`item_NNN/article.md` +
-`summary.md`), the version-labeled `.xlsx` scoresheet, and the
-`original_articles/` PDF copy. The pilot (`llm-sum/pilot_human_review.py`)
-only adds the dev-pool scoping and the softer backfill-on-shortfall policy on
-top — appropriate for a dry-run tool whose whole point is a still-growing
+prompt, the nested per-item folder layout (`item_NNN/article.pdf` +
+`summary.md`, copied per item from `data/raw`), and the version-labeled
+`.xlsx` scoresheet. The pilot (`llm-sum/pilot_human_review.py`) only adds
+the dev-pool scoping and the softer backfill-on-shortfall policy on top —
+appropriate for a dry-run tool whose whole point is a still-growing
 dev pool.
 
 ---
@@ -132,29 +132,28 @@ data/pilot_human_review/
     packet.md                    navigation index: one row per item_id -> folder
     scoresheet_human1.xlsx       dropdowns (1-5, yes/no), frozen header, version-labeled rows
     item_001/
-      article.md                 the original article text
-      summary.md                 one candidate summary to score against it
+      article.pdf                 the original published article, copied from data/raw
+                                   (falls back to article.md — the cached text the AI
+                                   read — if no source PDF can be resolved for that DOI)
+      summary.md                  one candidate summary to score against it
     item_002/
       ...
-    item_015/                    5 articles x 3 providers = 15 item folders
-    original_articles/
-      javma__...__10_2460_javma_24_05_0312.pdf   real source PDF(s), copied from data/raw
+    item_015/                    5 articles x 3 providers = 15 item folders, each with
+                                  its own article.pdf copy
   human2/
     REVIEWER_GUIDE.md
     packet.md
     scoresheet_human2.xlsx
     item_001/ ...
-    original_articles/
-      ...
 ```
 
 Each `humanN/` folder therefore holds **15 item folders** (5 articles, each read
-three times against a different provider's summary) + the guide + the packet
-index + the `.xlsx` scoresheet + the `original_articles/` PDFs.
+three times against a different provider's summary, each with its own
+`article.pdf`) + the guide + the packet index + the `.xlsx` scoresheet.
 
 - **Self-contained folder.** Hand a tester their whole `humanN/` folder
-  (e.g. zipped) — guide, packet, scoresheet, and PDFs — and they need nothing
-  else, no repo access.
+  (e.g. zipped) — guide, packet, scoresheet, and every item's PDF — and they
+  need nothing else, no repo access.
 - **The private key is a sibling of the folders, never inside one.** So
   handing off a `humanN/` folder cannot leak which AI wrote which summary. It
   also records what the next tester's overlap carries forward.
@@ -166,13 +165,17 @@ index + the `.xlsx` scoresheet + the `original_articles/` PDFs.
 
 ### About the PDFs (a methods note worth keeping in mind)
 
-The AI summariser only ever saw the **extracted text** (what each
-`item_NNN/article.md` shows), not the PDF's figures or tables. The PDF is copied
-in as *supplementary context* — easier to read, and a way to catch a
-text-extraction glitch — but a reviewer should score each summary against the
-**article.md text**, since that is what the model actually worked from. Scoring
-against a figure the AI never received would penalise it unfairly. The reviewer
-guide says this in plain language.
+The AI summariser only ever saw the **extracted text** cached in
+`data/processed/` (the `article.md` fallback content), never the PDF's figures,
+tables, or reference list — `article.pdf` is now the primary artifact a
+reviewer reads, not a supplementary convenience, so this is a real methods
+tradeoff worth keeping in mind: a reviewer sees more than the AI did. The
+reviewer guide (`docs/booklet/07_human_validation_guide.md` §3) asks reviewers
+not to penalise a summary for missing a chart's purely visual detail (the AI
+never had the chance to see it), but to flag it normally if a paper's key
+finding lived only in a graph/table and the summary consequently got it wrong
+— that's a genuine, worth-recording AI limitation, not a foul against the
+model.
 
 ---
 

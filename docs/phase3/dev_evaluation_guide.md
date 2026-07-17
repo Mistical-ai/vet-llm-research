@@ -57,9 +57,9 @@ summaries from `summaries.jsonl`), runs the blind judge, appends rows to
 
 **Capped and journal-balanced per run:** if more papers are pending (summarized but not yet
 judged) than `PHASE3_DEV_LIMIT` (default 5, or `--limit N`), this run judges only that many —
-picked evenly across journals, one per journal per round — and prints a "Dev-mode
-journal-stratified sampling" table showing exactly which DOIs were picked and how many were
-deferred. Deferred papers aren't lost; they're simply still pending, so the next
+picked evenly across journals, one per journal per round — and prints a "pending pool …
+sampled … balanced across N journal(s)" table showing exactly which DOIs were picked and how
+many were deferred. Deferred papers aren't lost; they're simply still pending, so the next
 `evaluate --mode dev` run reconsiders them (see Step 5). `--no-resume` ignores this cap and
 always re-judges every paper in `data/dev_summaries_jsonl/`.
 

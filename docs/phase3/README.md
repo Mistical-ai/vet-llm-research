@@ -21,6 +21,7 @@ This is a hands-on walkthrough for turning your collected PDFs into LLM summarie
 | [../phase4/README.md](../phase4/README.md) | Scenarios, offline rubric, and run-manifest provenance (Phase 4). |
 | [../phase5/human_validation.md](../phase5/human_validation.md) | Blind human validation of the LLM jury — export packets, ingest scoresheets, agreement/correlation (Phase 5). |
 | [../phase5/pilot_human_review.md](../phase5/pilot_human_review.md) | Trial the human-validation workflow on the dev pool before the real run — incremental `humanN/` folders, `.xlsx` scoresheet, copied PDFs. |
+| [../COMMANDS.md](../COMMANDS.md) | Every command in the whole pipeline (gather → extract → summarize → evaluate → human validation), one page, in order. |
 
 > **Primary command right now** — six summaries from one matched article (3 from raw PDF + 3 from processed JSONL). Use the hyphenated subcommand **`summarize-all`**, not `summarize all`:
 >

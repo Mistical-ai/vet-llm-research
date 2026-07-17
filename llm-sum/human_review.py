@@ -138,7 +138,7 @@ EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 SUMMARIES_TXT_DIR = DATA_DIR / "summaries_txt"
 DEV_TESTS_SUMMARIES_TXT_DIR = DATA_DIR / "dev_tests" / "summaries_txt"
-RAW_DIR = DATA_DIR / "raw"  # source PDFs copied into each reviewer folder's original_articles/
+RAW_DIR = DATA_DIR / "raw"  # source PDFs copied into each reviewer folder's item_NNN/article.pdf
 HUMAN_REVIEW_DIR = DATA_DIR / "human_review"
 
 # In plain English: MIN_ARTICLES is the smallest number of articles allowed
@@ -1149,48 +1149,90 @@ def _article_title_with_version(
     return title
 
 
+def _write_article_md_fallback(folder: Path, item: ReviewItem) -> None:
+    """Write ``article.md`` from cached text — the fallback when no source PDF exists.
+
+    This is the layout every item folder used before ``article.pdf`` became the
+    primary artifact (see ``write_item_folders``): the article's title (if any)
+    followed by the full cleaned text the AI summarizer actually read. Kept as a
+    fallback so export never produces an item folder with no article at all when
+    a DOI's PDF can't be resolved (moved, renamed, or never downloaded).
+    """
+    title = item.title.strip()
+    article_lines: list[str] = []
+    if title:
+        article_lines.append(f"# {title}")
+        article_lines.append("")
+    article_lines.append("## Original article text")
+    article_lines.append("")
+    article_lines.append(item.reference_text.strip())
+    article_lines.append("")
+    (folder / "article.md").write_text("\n".join(article_lines) + "\n", encoding="utf-8")
+
+
 def write_item_folders(
     items: list[ReviewItem], base_dir: Path,
     versions: dict[str, tuple[int, int]] | None = None,
-) -> list[Path]:
-    """Write one ``item_id/`` folder per review item: ``article.md`` + ``summary.md``.
+    raw_dir: Path | None = None,
+    lookup: dict[tuple[str, str, str], EvaluationInstance] | None = None,
+) -> tuple[list[Path], list[str]]:
+    """Write one ``item_id/`` folder per review item: ``article.pdf`` + ``summary.md``.
 
     This is the nested reviewer layout: instead of one long ``packet.md`` with
     every article+summary inline, each item gets its own folder holding the
-    full original article text (``article.md``) and the single candidate summary
-    to score against it (``summary.md``). The folder is named by ``item_id`` so
-    it lines up exactly with the scoresheet's ``item_id`` column.
+    original published article (``article.pdf``, copied from ``raw_dir``) and
+    the single candidate summary to score against it (``summary.md``). The
+    folder is named by ``item_id`` so it lines up exactly with the scoresheet's
+    ``item_id`` column.
+
+    Reviewers now read the real PDF — figures, tables, and references intact —
+    rather than the stripped text the AI summarizer actually saw; see
+    ``docs/booklet/07_human_validation_guide.md`` §3 for why that's fair (and
+    what a reviewer should do when a paper's key finding lives only in a
+    graph/table). When ``raw_dir``/``lookup`` are omitted, or a DOI's PDF can't
+    be resolved, the item folder falls back to ``article.md`` (the full cached
+    text the AI received) instead — export must never produce an item folder
+    with no article at all.
 
     Blind-safe by construction: like ``render_packet_markdown`` it reads only
-    ``item_id``, ``title``, ``reference_text``, ``candidate_summary`` and the
-    version number — never the summariser/judge identity.
+    ``item_id``, ``title``, ``reference_text``/the source PDF, ``candidate_summary``
+    and the version number — never the summariser/judge identity.
+
+    Returns ``(written_folders, missing_dois)`` — ``missing_dois`` lists every
+    DOI that fell back to ``article.md`` because no source PDF could be found.
 
     In plain English: for every review item, this creates a folder named
-    after its item_id (e.g. ``item_003/``) containing two files:
-    ``article.md`` (the full original article text) and ``summary.md`` (the
-    one AI-written summary to score against it). This is what a reviewer
-    actually opens and reads.
+    after its item_id (e.g. ``item_003/``) containing two files: ``article.pdf``
+    (a copy of the original published article) and ``summary.md`` (the one
+    AI-written summary to score against it). This is what a reviewer actually
+    opens and reads.
     """
     if versions is None:
         versions = summary_versions(items)
     base_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    missing_dois: list[str] = []
     for item in items:
         folder = base_dir / item.item_id
         folder.mkdir(parents=True, exist_ok=True)
-
-        # Build article.md: the article's title (if any) followed by the
-        # full original article text.
         title = item.title.strip()
-        article_lines: list[str] = []
-        if title:
-            article_lines.append(f"# {title}")
-            article_lines.append("")
-        article_lines.append("## Original article text")
-        article_lines.append("")
-        article_lines.append(item.reference_text.strip())
-        article_lines.append("")
-        (folder / "article.md").write_text("\n".join(article_lines) + "\n", encoding="utf-8")
+
+        # Prefer a copy of the real source PDF; fall back to the cached-text
+        # article.md when no raw_dir/lookup was given or the PDF can't be found.
+        pdf_path = None
+        if raw_dir is not None and lookup is not None:
+            instance = lookup.get((item.doi, item.summarizer, item.input_source))
+            record = instance.summary_record if instance is not None else {"doi": item.doi}
+            pdf_path = resolve_existing_pdf_path(raw_dir, record)
+
+        if pdf_path is not None:
+            shutil.copy2(pdf_path, folder / "article.pdf")
+            article_filename = "article.pdf"
+        else:
+            if raw_dir is not None and lookup is not None:
+                missing_dois.append(item.doi)
+            _write_article_md_fallback(folder, item)
+            article_filename = "article.md"
 
         # Build summary.md: a heading (with a version label if this article
         # was summarized more than once), a short instruction, and the
@@ -1204,9 +1246,9 @@ def write_item_folders(
             summary_lines.append(f"**Article:** {title}")
             summary_lines.append("")
         summary_lines.append(
-            "Read `article.md` in this folder, then score THIS summary against it "
-            f"by filling row `{item.item_id}` in the scoresheet. If the article "
-            "appears more than once, score every version completely independently."
+            f"Open `{article_filename}` in this folder, then score THIS summary "
+            f"against it by filling row `{item.item_id}` in the scoresheet. If the "
+            "article appears more than once, score every version completely independently."
         )
         summary_lines.append("")
         summary_lines.append("## Candidate summary")
@@ -1215,7 +1257,7 @@ def write_item_folders(
         summary_lines.append("")
         (folder / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
         written.append(folder)
-    return written
+    return written, missing_dois
 
 
 def render_packet_index_markdown(
@@ -1251,9 +1293,9 @@ def render_packet_index_markdown(
         "of the others.",
         "",
         "**Each item below is in its own folder** in this directory. Open the "
-        "folder, read `article.md` (the original article) and `summary.md` (one "
-        "candidate summary of it), then score that item's row in "
-        f"`{scoresheet_filename}` — match by the `item_id`.",
+        "folder, read `article.pdf` (the original article, exactly as published) "
+        "and `summary.md` (one candidate summary of it), then score that item's "
+        f"row in `{scoresheet_filename}` — match by the `item_id`.",
         "",
         "**The same article appears more than once**, each time paired with a "
         "different candidate summary (a different *version*). Score every version "
@@ -1289,45 +1331,6 @@ def render_packet_index_markdown(
     return "\n".join(lines) + "\n"
 
 
-def copy_original_pdfs(
-    items: list[ReviewItem],
-    lookup: dict[tuple[str, str, str], EvaluationInstance],
-    dest_dir: Path,
-    raw_dir: Path,
-) -> tuple[list[str], list[str]]:
-    """Copy each item's source PDF from ``raw_dir`` into ``dest_dir``.
-
-    Deduped by DOI (an article appears under more than one provider item).
-    Returns ``(copied_names, missing_dois)``. A DOI whose PDF can't be found is
-    reported and skipped, never fatal — the packet/article text still covers it;
-    only the supplementary PDF is absent.
-
-    In plain English: for every distinct article in this reviewer's packet,
-    find its original PDF file (already downloaded earlier in the project,
-    living in ``raw_dir``) and copy it into the reviewer's
-    ``original_articles/`` folder, so a reviewer who wants to see the paper
-    as originally published/formatted can. "Deduped by DOI" means if an
-    article shows up 3 times (once per AI), its PDF is only copied once.
-    """
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
-    missing: list[str] = []
-    seen_dois: set[str] = set()
-    for item in items:
-        if item.doi in seen_dois:
-            continue
-        seen_dois.add(item.doi)
-        instance = lookup.get((item.doi, item.summarizer, item.input_source))
-        record = instance.summary_record if instance is not None else {"doi": item.doi}
-        pdf_path = resolve_existing_pdf_path(raw_dir, record)
-        if pdf_path is None:
-            missing.append(item.doi)
-            continue
-        shutil.copy2(pdf_path, dest_dir / pdf_path.name)
-        copied.append(pdf_path.name)
-    return copied, missing
-
-
 def write_review_folder(
     items: list[ReviewItem], folder: Path, *,
     reviewer_id: int | str, scoresheet_filename: str,
@@ -1340,15 +1343,19 @@ def write_review_folder(
     Single source of truth shared by the real export and the pilot (both
     write ``humanN/`` folders) so their folder shapes can never drift. Writes:
     ``REVIEWER_GUIDE.md`` (verbatim guide), ``packet.md`` (navigation index),
-    the ``.xlsx`` scoresheet (version-labeled), one ``item_id/`` folder per item
-    (``article.md`` + ``summary.md``), and — when ``raw_dir`` and ``lookup`` are
-    given — an ``original_articles/`` subfolder with the matched source PDFs.
+    the ``.xlsx`` scoresheet (version-labeled), and one ``item_id/`` folder per
+    item — each holding ``article.pdf`` (a copy of the source PDF from
+    ``raw_dir``, or ``article.md`` as a fallback when it can't be found) plus
+    ``summary.md``. See ``write_item_folders`` for the PDF-vs-fallback logic.
 
-    Returns ``(pdfs_copied, pdfs_missing)`` (both empty when no PDF copy runs).
+    Returns ``(pdfs_copied, pdfs_missing)`` — ``pdfs_copied`` lists every item
+    folder that got a real ``article.pdf``; ``pdfs_missing`` lists the DOIs
+    that instead fell back to ``article.md`` (empty when ``raw_dir``/``lookup``
+    are omitted, e.g. in tests that don't care about source PDFs).
 
     In plain English: this is the "assemble everything into one folder"
     function — it calls each of the pieces built above (guide, packet
-    index, scoresheet, per-item folders, PDF copies) in the right order so
+    index, scoresheet, per-item folders + their PDFs) in the right order so
     that one call produces one complete, ready-to-hand-to-a-reviewer folder.
     """
     if versions is None:
@@ -1365,11 +1372,11 @@ def write_review_folder(
         encoding="utf-8",
     )
     render_scoresheet_xlsx(items, folder / scoresheet_filename, versions=versions)
-    write_item_folders(items, folder, versions=versions)
-
-    if raw_dir is not None and lookup is not None:
-        return copy_original_pdfs(items, lookup, folder / "original_articles", raw_dir)
-    return [], []
+    written, missing_dois = write_item_folders(
+        items, folder, versions=versions, raw_dir=raw_dir, lookup=lookup,
+    )
+    copied = [str(p) for p in written if (p / "article.pdf").exists()]
+    return copied, missing_dois
 
 
 def build_unblinding_key(

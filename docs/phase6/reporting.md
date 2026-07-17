@@ -202,9 +202,11 @@ training data) than canine papers?" or "do all providers struggle with case
 series but do fine on RCTs?" directly, e.g. *"GPT-5 has a 0.82 Kappa for
 canine papers but only 0.45 for equine papers."*
 
-**Read the n before the Kappa.** The human-review sample is small (Phase 5's
-default is `HUMAN_REVIEW_SAMPLE_SIZE=15`) split across every provider and
-every stratum value, so most cells will have very few human-reviewed items.
+**Read the n before the Kappa.** The human-review sample is small — the
+minimum is 5 articles → 15 items (`HUMAN_REVIEW_SAMPLE_SIZE` is an article
+count that must be a multiple of 5; unset offers a 5/10/25 menu), split across
+every provider and every stratum value, so most cells will have very few
+human-reviewed items.
 Any cell below `stats_engine.MIN_ITEMS_FOR_KAPPA` (default 5) is flagged
 `kappa_underpowered: true` in the JSON / "(underpowered)" in the Markdown —
 shown for transparency, not as a firm conclusion. Collect more human reviews

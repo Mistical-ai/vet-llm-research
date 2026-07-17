@@ -4,7 +4,8 @@ This is the full, merged version of the project's teaching booklet — every
 chapter in one document, in reading order, with consistent terminology and
 one working table of contents.
 
-**Who this is for.** Chapters 1 through 6 are written for a **technical
+**Who this is for.** Chapters 1 through 6, and the short "Running Human
+Validation" section right after Chapter 6, are written for a **technical
 beginner**: someone comfortable running a command in a terminal, but who has
 never seen this specific pipeline before and has no assumed statistics
 background. Chapter 7 shifts audience entirely — it's written for a
@@ -30,6 +31,7 @@ For the terminology and tone conventions this booklet follows, see
 4. [Chapter 4 — The Blind AI Judge](#chapter-4--the-blind-ai-judge) — how a blind judge scores summaries and the jury-score formula (Phase 3 evaluate).
 5. [Chapter 5 — Reading Your Results](#chapter-5--reading-your-results) — what `eval-report` and the publication tables actually show.
 6. [Chapter 6 — The Statistics Behind the Numbers](#chapter-6--the-statistics-behind-the-numbers) — every formula (Wilcoxon, Friedman, bootstrap, Krippendorff's alpha, Cohen's Kappa, TF-IDF/cosine, ROUGE), taught from scratch.
+   - [Running Human Validation (Researcher Commands)](#running-human-validation-researcher-commands) — the `export-human-review` / `ingest-human-review` commands that produce a `humanN/` folder, for the researcher (not the reviewer).
 7. [Chapter 7 — A Guide for Veterinarian Reviewers](#chapter-7--a-guide-for-veterinarian-reviewers-scoring-ai-written-summaries) — zero-jargon standalone handout for a veterinarian reviewer, also usable as a printable document on its own.
 
 ---
@@ -871,11 +873,11 @@ The fields every provider must fill in are:
 | `study_design` | The reported design, or `"Not reported"`. |
 | `species` | The animal species or population studied. |
 | `sample_size` | Number of animals/samples/records/cases analyzed, or `null` if not reported — the prompt explicitly forbids writing `0` unless the article says zero. |
-| `key_methods` | A short list of the main methods, interventions, or comparisons. |
-| `key_findings` | A short list of the most important findings — the prompt specifically instructs the model to keep exact numbers (percentages, thresholds, durations) rather than compressing them into vague phrases like "significant reduction." |
+| `key_methods` | A short list of the main methods, interventions, measurements/outcomes assessed, statistical analysis approach, or comparisons. |
+| `key_findings` | A short list of the most important findings — the prompt asks for a key number only when it's essential to understanding a result, rather than trying to capture every statistic in the article. |
 | `clinical_significance` | How a practicing clinician should interpret or apply the findings. |
 | `limitations` | Important caveats — the prompt specifically calls out missing confirmatory diagnostics (e.g. EEG, histopathology, imaging) as a limitation worth surfacing on its own, separate from sample-size caveats. |
-| `summary_text` | Readable prose, under 400 words, in a fixed section order: Objective, Key Methods, Primary Results, Clinical Significance, Limitations. |
+| `summary_text` | Short plain-language prose for a busy clinician, under 400 words (target 300-380), in a fixed section order: title/authors, Background, Methods, Results, Limitations, Conclusions. Flowing paragraphs only — no numbered headers, no bullet points, no bold. |
 
 Every one of these rules exists to stop the model from **inventing**
 information: if a fact isn't in the article, the prompt tells the model to
@@ -3058,6 +3060,69 @@ sand.
 ---
 
 
+## Running Human Validation (Researcher Commands)
+
+**Who this is for:** the researcher running the pipeline — not the
+veterinarian reviewer. A reviewer needs nothing from this section; they only
+ever open their own `humanN/` folder and read `REVIEWER_GUIDE.md` (a
+verbatim copy of Chapter 7, below). This section is the bridge between
+Chapter 6 (reading the LLM jury's results) and Chapter 7 (what a reviewer
+actually experiences): the commands that turn already-judged
+`data/evaluations.jsonl` rows into a blind reviewer folder, and the filled
+scoresheet back into a validation report.
+
+The whole loop is three commands, and — unlike summarization or
+evaluation — **entirely free and offline**: it only reads data your Phase 3
+run already produced, no API calls involved.
+
+```powershell
+python llm-sum/run_phase3.py export-human-review --sample-size 10
+#   -> data/human_review/human1/                        (human2/, human3/, ... on each next run)
+#   -> data/human_review/unblinding_key_human1.json      PRIVATE — never share this with a reviewer
+
+# Hand the reviewer ONLY the humanN/ folder. Once they return the filled
+# scoresheet (dropped back into that same humanN/ folder):
+
+python llm-sum/run_phase3.py ingest-human-review
+#   -> data/human_reviews.jsonl
+
+python llm-sum/run_phase3.py eval-report --markdown
+#   -> gains a "Human validation" section: inter-reviewer agreement + jury correlation
+```
+
+`--sample-size` is an **exact article count**, always split evenly across
+the study's 5 journals — each article expanded to *every* provider's summary
+of it, so a reviewer reads fewer distinct articles than the item count
+suggests:
+
+| `--sample-size` | Articles per journal | Items to score (articles x ~3 providers) |
+|---|---|---|
+| `5` | 1 | 15 |
+| `10` | 2 | 30 |
+| `25` | 5 | 75 |
+
+`--overlap-ratio` (default `0.6`) controls how much of the *next* tester's
+folder repeats the previous tester's articles — `1.0` = identical items
+every run (maximum comparability), `0.0` = a completely fresh draw each run.
+Omitting `--sample-size` at a real terminal shows an interactive 5/10/25
+menu instead.
+
+This is deliberately the terse version. The full flag reference, the
+blind-protocol guarantees, why articles can repeat across items without
+breaking independent scoring, and the Krippendorff's alpha /
+Spearman / Pearson / Bland-Altman agreement math the final `eval-report`
+computes, all live in
+[`docs/phase5/human_validation.md`](../phase5/human_validation.md). To
+rehearse this whole loop on the small dev-mode pool before committing to a
+real reviewer, see
+[`docs/phase5/pilot_human_review.md`](../phase5/pilot_human_review.md)
+(`export-pilot-human-review`). For the full command list of the *entire*
+pipeline — gathering articles through this step — see
+[`docs/COMMANDS.md`](../COMMANDS.md).
+
+---
+
+
 ## Chapter 7 — A Guide for Veterinarian Reviewers: Scoring AI-Written Summaries
 
 > **Note:** This chapter is also distributed on its own as a standalone,
@@ -3120,34 +3185,70 @@ labeled only with a plain reference number.
 
 ### 3. What you'll receive
 
-You'll get two things:
+You'll get the following, all in one folder:
 
-1. **A reading document.** This contains a set of items, each labeled
-   something like "item 001," "item 002," and so on. Each item has two
-   parts: the full text of the original research article, and one
-   AI-written summary of it. That's all — no author names, no journal name
-   tricks, no hints about which AI wrote the summary.
+1. **One folder per item**, labeled `item_001`, `item_002`, and so on, plus a
+   short **index** (`packet.md`) that lists them all. Open each item folder and
+   you'll find two files: `article.pdf` (the original article exactly as it
+   was published — the real PDF, with its figures, tables, and reference list
+   intact) and `summary.md` (one AI-written summary of it). That's all — no
+   author names, no journal name tricks, no hints about which AI wrote the
+   summary. (The article's title *is* shown, which is fine — it tells you which
+   paper you're reading, not which AI wrote the summary.) **The same article
+   will appear in more than one item folder**, each time with a different
+   summary (labeled "version 1 of 3," and so on). Score each one on its own, as
+   if you were seeing the article for the first time — don't look back at how you
+   scored an earlier version of the same article.
 
-2. **A scoring sheet.** This is a simple spreadsheet with one row for every
-   item in the reading document. You'll fill in your scores and notes for
-   each item, one row at a time.
+2. **A scoring sheet** (`.xlsx`, an Excel file that also opens in Google Sheets
+   or Apple Numbers). It has one row for every item, keyed by the same
+   `item_001`/`item_002` label as the folders, so you always know which row goes
+   with which item. The score cells have drop-down menus so you can just pick a
+   number instead of typing it, and when an article repeats, its rows are
+   labeled with the version number so you can tell them apart. (An older `.csv`
+   version works the same way, minus the drop-downs.)
+
+3. **One important thing to know about how the AI wrote its summaries:** the
+   AI never saw the PDF you're looking at. It was only given the article's
+   plain text — no images, no charts, no tables, and no reference list, just
+   the words. It genuinely could not see any figure or graph in the paper; it
+   only knew whatever the surrounding text happened to say about it. (This was
+   deliberate on our part — today's AI systems are still unreliable at reading
+   scientific charts and diagrams accurately, and testing that separately
+   wasn't the point of this study.)
+
+   Keep that in mind as you score: **if a summary doesn't describe the visual
+   details of a chart or figure, that's not really a fair strike against
+   it** — the AI never had the chance to see it. But there's an important
+   exception: **if a paper's key finding or conclusion is really only fully
+   conveyed in a graph, table, or image** — something no summary written from
+   the plain text alone could have gotten right — **and the summary
+   consequently misses or misstates it, that genuinely is worth reflecting in
+   your score.** That's less "the AI was careless" and more "this AI system,
+   right now, has a real limitation here" — and how often that limitation
+   actually costs a summary something clinically real is one of the things
+   this study is trying to find out. Use your own clinical judgment: was the
+   omission harmless in this particular case, or would a clinician relying on
+   this summary actually be missing something that mattered?
 
 You will **not** receive any file that reveals which AI wrote which summary.
-If you're ever sent a file besides these two, or you accidentally come
-across one, please don't open it — just let us know, and set it aside.
-That file exists purely so we can match everything back up on our end after
-all reviewers have finished; it plays no role in your scoring.
+If you're ever sent a file besides these, or you accidentally come across
+one, please don't open it — just let us know, and set it aside. That file
+exists purely so we can match everything back up on our end after all
+reviewers have finished; it plays no role in your scoring.
 
 ---
 
 ### 4. How to work through an item
 
-Take the items one at a time, in order. For each one:
+Take the items one at a time, in order (`item_001`, then `item_002`, …). For
+each one, open its folder:
 
-1. **Read the original article first**, just as you normally would when
-   evaluating a piece of veterinary literature — enough to form your own
-   sense of what it actually found and concluded.
-2. **Then read the AI-written summary** of that same article.
+1. **Read `article.pdf` first** — the original article, exactly as published —
+   just as you normally would when evaluating a piece of veterinary
+   literature, enough to form your own sense of what it actually found and
+   concluded.
+2. **Then read `summary.md`**, the AI-written summary of that same article.
 3. **Ask yourself: if a colleague handed me this summary instead of the
    article, would it serve me well — and could it mislead me?**
 4. **Fill in that item's row on the scoring sheet** before moving to the

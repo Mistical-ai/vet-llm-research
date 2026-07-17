@@ -40,11 +40,12 @@ WHAT IT DOES DIFFERENTLY FROM THE REAL EXPORT
    stays usable while the pool grows.
 3. **Self-contained folders in the nested per-item layout.** Each ``humanN/``
    folder holds the reviewer guide, a ``packet.md`` navigation index, an
-   ``.xlsx`` scoresheet (dropdowns, frozen header, version-labeled rows), one
-   ``item_NNN/`` subfolder per item (``article.md`` + ``summary.md``), and an
-   ``original_articles/`` subfolder with the matched source PDFs copied out of
-   ``data/raw`` — all written by the shared ``human_review.write_review_folder``,
-   so a tester needs no repo access and no manual file digging.
+   ``.xlsx`` scoresheet (dropdowns, frozen header, version-labeled rows), and
+   one ``item_NNN/`` subfolder per item — each holding ``article.pdf`` (the
+   matched source PDF copied out of ``data/raw``, or ``article.md`` as a
+   fallback when it can't be found) plus ``summary.md`` — all written by the
+   shared ``human_review.write_review_folder``, so a tester needs no repo
+   access and no manual file digging.
 
 WHAT IT REUSES (no duplicated logic)
 -------------------------------------
@@ -141,8 +142,8 @@ class PilotExportResult:
     sample_size: int  # how many articles were requested
     items_exported: int  # how many (article, AI) items actually ended up in the folder
     overlap_units: int  # how many articles were repeated from the previous tester
-    pdfs_copied: int  # how many source PDFs were successfully copied in
-    pdfs_missing: list[str]  # DOIs whose PDF could not be found
+    pdfs_copied: int  # how many item_NNN/article.pdf files were successfully copied in
+    pdfs_missing: list[str]  # DOIs (one entry per affected item) whose PDF could not be found
     skipped_rows: int  # sampled rows that couldn't be matched to source text
 
 
@@ -289,8 +290,8 @@ def export_pilot_human_review(
     )
     if missing:
         print(f"[pilot_human_review] WARNING: no source PDF found in {resolved_raw} for "
-              f"{len(missing)} article(s): " + ", ".join(missing) + ". The packet text "
-              "still covers them; only the supplementary PDF is absent.")
+              f"{len(set(missing))} article(s): " + ", ".join(sorted(set(missing)))
+              + ". Those item(s) fall back to article.md (the cached text the AI read).")
 
     # --- Step 7: write the private "answer key" (never shown to the tester) ---
     # In plain English: save a separate file recording which real article,
