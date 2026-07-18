@@ -559,6 +559,13 @@ def test_cmd_summarize_dev_mode_selects_one_per_journal_and_writes_readable_fold
     txt_files = list(dev_dir.glob("*.txt"))
     assert len(txt_files) == 2
 
+    # Prose sibling: one file per selected paper under prose/, carrying the
+    # word-count header. The bullet files above stay at the folder top level so
+    # the *.txt discovery readers (eval source / resume) are unaffected.
+    prose_files = list((dev_dir / "prose").glob("*.txt"))
+    assert len(prose_files) == 2
+    assert "Summary (prose):" in prose_files[0].read_text(encoding="utf-8")
+
 
 def _write_dev_readable_txt(folder: Path, doi: str, *, suffix: str | None = None) -> Path:
     """Write a minimal dev-mode readable .txt whose first line is ``DOI: <doi>``.
@@ -1120,6 +1127,146 @@ def test_cmd_summarize_dev_no_skip_existing_reconsiders(
     rows = [json.loads(l) for l in summaries_path.read_text(encoding="utf-8").splitlines()]
     # With skipping disabled, both journals are eligible again.
     assert {row["journal"] for row in rows} == {"jvim", "javma"}
+
+
+# In plain English: confirms --output-subdir redirects the readable output
+# into data/dev_summaries_jsonl/<name>/ instead of the top level, and that
+# the subfolder tracks its OWN incremental "already done" pool — a paper
+# already summarized straight into the parent dev folder is still eligible
+# to be re-picked and written into the subfolder.
+def test_cmd_summarize_dev_output_subdir_redirects_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--output-subdir writes into a subfolder with its own independent
+    skip-existing pool, leaving the parent dev folder untouched."""
+    manifest_path, summaries_path, dev_dir, dois_by_journal = _setup_dev_summarize(
+        tmp_path, monkeypatch
+    )
+    # All javma papers already summarised directly in the parent dev folder.
+    for doi in dois_by_journal["javma"]:
+        _write_dev_readable_txt(dev_dir, doi)
+
+    assert _run_dev_summarize(manifest_path, ["--output-subdir", "mod_summaries"]) == 0
+
+    # New output lands in the subfolder, not the parent.
+    mod_dir = dev_dir / "mod_summaries"
+    assert list(mod_dir.glob("*.txt")), "expected readable files in mod_summaries/"
+    # The parent still holds only the 3 pre-seeded javma files — nothing new
+    # was written there by this run.
+    assert len(list(dev_dir.glob("*.txt"))) == 3
+
+    rows = [json.loads(l) for l in summaries_path.read_text(encoding="utf-8").splitlines()]
+    # javma papers already "done" in the PARENT folder are still eligible
+    # here, since mod_summaries/ tracks its own independent pool.
+    assert {row["journal"] for row in rows} == {"jvim", "javma"}
+
+
+# ---------------------------------------------------------------------------
+# summarize --mode single: readable output into data/single_summaries_jsonl/
+# ---------------------------------------------------------------------------
+
+def _setup_single_summarize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dois: list[str],
+):
+    """Shared wiring for the single-mode summarize tests. Returns paths.
+
+    In plain English: sets up a fake manifest (with however many DOIs the
+    test passes in) pointed at scratch folders, mirroring
+    ``_setup_dev_summarize`` above but for `summarize --mode single`.
+    """
+    import prepare_texts
+    import run_phase3
+    import summarizer
+    from file_paths import doi_to_slug
+
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setattr(summarizer, "DRY_RUN", True)
+
+    manifest_path = tmp_path / "manifest.jsonl"
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    summaries_path = tmp_path / "summaries.jsonl"
+    single_dir = tmp_path / "single_summaries_jsonl"
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        for doi in dois:
+            f.write(json.dumps({"doi": doi, "journal": "jvim", "title": f"Paper {doi}"}) + "\n")
+            slug = doi_to_slug(doi)
+            (processed / f"{slug}.jsonl").write_text(
+                json.dumps({"doi": doi, "slug": slug, "text": "Body text. " * 30}) + "\n",
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(run_phase3, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(summarizer, "PROCESSED_DIR", processed)
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", summaries_path)
+    monkeypatch.setattr(run_phase3, "SINGLE_SUMMARIES_JSONL_DIR", single_dir)
+    monkeypatch.setattr(summarizer, "LOGS_DIR", tmp_path / "logs")
+    return manifest_path, summaries_path, single_dir
+
+
+def _run_single_summarize(manifest_path: Path, extra: list[str] | None = None) -> int:
+    """In plain English: pretends to type
+    `python llm-sum/run_phase3.py summarize --mode single --manifest ... --providers openai --force`
+    (plus any `extra` flags), through the real argparse parser, and runs it."""
+    import run_phase3
+
+    parser = run_phase3.build_parser()
+    args = parser.parse_args(
+        ["summarize", "--mode", "single", "--manifest", str(manifest_path),
+         "--providers", "openai", "--force"] + (extra or [])
+    )
+    return run_phase3.cmd_summarize(args)
+
+
+def test_cmd_summarize_single_writes_readable_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`summarize --mode single` writes exactly one readable .txt into
+    data/single_summaries_jsonl/, for the one paper it actually summarized.
+
+    In plain English: single mode's paper_limit is 1, so out of two
+    manifest papers only the first should get summarized -- and only that
+    one should show up in the readable single-summaries folder.
+    """
+    dois = ["10.9999/single.0001", "10.9999/single.0002"]
+    manifest_path, summaries_path, single_dir = _setup_single_summarize(
+        tmp_path, monkeypatch, dois
+    )
+
+    assert _run_single_summarize(manifest_path) == 0
+
+    rows = [json.loads(l) for l in summaries_path.read_text(encoding="utf-8").splitlines()]
+    assert {row["doi"] for row in rows} == {dois[0]}
+
+    txt_files = list(single_dir.glob("*.txt"))
+    assert len(txt_files) == 1
+    text = txt_files[0].read_text(encoding="utf-8")
+    assert text.startswith(f"DOI: {dois[0]}")
+    assert "summarize --mode single" in text
+    assert dois[1] not in text
+
+    # Prose sibling under prose/, with the word-count header; bullet file above
+    # stays at the top level for the discovery readers.
+    prose_files = list((single_dir / "prose").glob("*.txt"))
+    assert len(prose_files) == 1
+    prose_text = prose_files[0].read_text(encoding="utf-8")
+    assert prose_text.startswith(f"DOI: {dois[0]}")
+    assert "Summary (prose):" in prose_text
+
+
+def test_cmd_summarize_single_no_new_paper_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-mode run over an empty manifest touches no paper, so nothing
+    is written to data/single_summaries_jsonl/ (no empty/junk files)."""
+    manifest_path, _summaries_path, single_dir = _setup_single_summarize(
+        tmp_path, monkeypatch, []
+    )
+
+    assert _run_single_summarize(manifest_path) == 0
+    assert not single_dir.exists() or not list(single_dir.glob("*.txt"))
 
 
 # In plain English: checks the safety net for crashes — if something goes

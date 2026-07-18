@@ -1056,6 +1056,182 @@ def test_format_human_readable_produces_ordered_sections() -> None:
     assert text.index("Limitations") < text.index("Conclusions")
 
 
+def test_format_human_readable_truncates_oversized_lists() -> None:
+    """Lists beyond the per-section cap are truncated, not just displayed in full.
+
+    Regression test: a provider that ignores the "at most N items" prompt
+    guidance must not blow the readable .txt output's word budget back open.
+    """
+    structured = _valid_summary_dict(
+        key_methods=[f"Method item {i}." for i in range(1, 9)],  # cap is 4
+        key_findings=[f"Finding item {i}." for i in range(1, 10)],  # cap is 5
+        limitations=[f"Limitation item {i}." for i in range(1, 8)],  # cap is 4
+    )
+    text = summarizer._format_human_readable(structured)
+
+    assert "- Method item 1." in text
+    assert "- Method item 4." in text
+    assert "- Method item 5." not in text
+    assert "- Finding item 5." in text
+    assert "- Finding item 6." not in text
+    assert "- Limitation item 4." in text
+    assert "- Limitation item 5." not in text
+
+
+def test_format_human_readable_stays_within_word_budget_for_oversized_input() -> None:
+    """The bullet render's item caps hold its length down on oversized input.
+
+    This validates the STRUCTURED BULLET surface (_format_human_readable), not the
+    prose summary. The prose ``summary_text`` (the field the 400-word rule and the
+    blind judge actually target) is rendered separately by
+    _format_provider_prose_section and is not what this test bounds; the ~420-word
+    ceiling here reflects the list-cap backstop for the bullet .txt, which is a
+    distinct output surface from the prose file.
+    """
+    structured = _valid_summary_dict(
+        objective="Evaluate treatment response in client-owned dogs with a chronic condition of interest.",
+        key_methods=[
+            "Client-owned dogs were enrolled from multiple referral hospitals over two years.",
+            "Blinded assessors scored outcomes at baseline and at each follow-up visit.",
+            "Statistical comparisons used mixed-effects models adjusting for site and baseline severity.",
+            "Adverse events were recorded and graded using a standardized veterinary toxicity scale.",
+            "A subset of dogs underwent additional imaging to confirm disease staging.",
+            "Owners completed validated quality-of-life questionnaires at each study visit.",
+        ],
+        key_findings=[
+            "Clinical signs improved in 30 of 42 dogs receiving the treatment.",
+            "Adverse events were mild and self-limiting in the majority of cases.",
+            "Quality-of-life scores improved significantly from baseline to final visit.",
+            "No significant difference was observed between treatment sites.",
+            "Imaging-confirmed responders showed the greatest symptom improvement.",
+            "Two dogs were withdrawn from the study due to unrelated illness.",
+            "Effect size was consistent across age and body-weight subgroups.",
+        ],
+        limitations=[
+            "Retrospective design limits causal inference from the reported associations.",
+            "Single-country population may limit generalizability to other regions.",
+            "Follow-up duration was insufficient to assess long-term relapse risk.",
+            "Owner-reported quality-of-life measures are inherently subjective.",
+            "Sample size may have been underpowered for subgroup comparisons.",
+            "Blinding of owners was not possible given the treatment's visible administration.",
+        ],
+        clinical_significance=(
+            "Clinicians may consider this treatment for similar cases, while monitoring for "
+            "mild adverse effects and counseling owners about expected timelines."
+        ),
+    )
+    text = summarizer._format_human_readable(structured)
+
+    assert len(text.split()) < 420
+
+
+# ---------------------------------------------------------------------------
+# Readable prose rendering (prose/ subfolder output)
+# ---------------------------------------------------------------------------
+
+def _prose_slot(summary_text: str, **overrides) -> dict:
+    """A successful data/summaries.jsonl provider slot for prose-render tests."""
+    slot = {
+        "status": "success",
+        "summary": summary_text,
+        "structured_summary": _valid_summary_dict(),
+        "model_version": "test-model-v1",
+        "timestamp": "2026-07-18T00:00:00+00:00",
+        "input_tokens": 100,
+        "output_tokens": 200,
+    }
+    slot.update(overrides)
+    return slot
+
+
+def test_prettify_prose_puts_each_section_on_its_own_line() -> None:
+    blob = (
+        "Pre-illness dietary risk factors Jane Doe, John Roe "
+        "Background The clinical problem. "
+        "Methods We reviewed records. "
+        "Results We found an effect. "
+        "Limitations Recall bias applies. "
+        "Conclusions Obtain a diet history."
+    )
+    text = summarizer._prettify_prose(blob)
+
+    # Leading title/author text is preserved as a preamble before the first header.
+    assert text.startswith("Pre-illness dietary risk factors Jane Doe, John Roe")
+    # Every section header lands on its own line with a blank line before it.
+    for header in ("Background", "Methods", "Results", "Limitations", "Conclusions"):
+        assert f"\n\n{header}\n" in text
+    # Bodies follow their header on the next line, in order.
+    assert "Background\nThe clinical problem." in text
+    assert text.index("Background") < text.index("Methods") < text.index("Conclusions")
+
+
+def test_prettify_prose_only_matches_a_header_once_and_in_order() -> None:
+    # "Results" appears again inside the Conclusions body; it must not be split
+    # into a second section boundary.
+    blob = (
+        "Background Setup. Methods Did things. Results Found things. "
+        "Limitations Caveats. Conclusions The Results support practice change."
+    )
+    text = summarizer._prettify_prose(blob)
+
+    assert text.count("\n\nResults\n") == 1
+    # The in-body "Results" stays inside the Conclusions paragraph.
+    assert "Conclusions\nThe Results support practice change." in text
+
+
+def test_provider_prose_section_shows_word_count_and_no_bullets() -> None:
+    prose = (
+        "Background The problem. Methods We did things. Results We found things. "
+        "Limitations Some caveats. Conclusions A clear takeaway."
+    )
+    section = "\n".join(summarizer._format_provider_prose_section("anthropic", _prose_slot(prose)))
+
+    assert "ANTHROPIC SUMMARY" in section
+    assert f"Summary (prose): {len(prose.split())} words" in section
+    assert "[OVER 400]" not in section  # short summary, no flag
+    assert "- " not in section  # prose only, never the bullet render
+    assert "Background\nThe problem." in section
+
+
+def test_provider_prose_section_flags_over_budget_summary() -> None:
+    long_prose = "Background " + "word " * 405  # > 400 words
+    section = "\n".join(summarizer._format_provider_prose_section("openai", _prose_slot(long_prose)))
+
+    assert "Summary (prose): 406 words  [OVER 400]" in section
+
+
+def test_provider_prose_section_reports_failure_slot() -> None:
+    failed = {"status": "failed", "error": "boom", "model_version": None, "timestamp": None}
+    section = "\n".join(summarizer._format_provider_prose_section("gemini", failed))
+
+    assert "No readable summary was produced. Error: boom" in section
+    assert "Summary (prose):" not in section
+
+
+def test_format_dev_prose_entry_includes_header_and_each_provider() -> None:
+    prose = (
+        "Background The problem. Methods We did things. Results We found things. "
+        "Limitations Some caveats. Conclusions A clear takeaway."
+    )
+    entry = {
+        "doi": "10.1234/example",
+        "journal": "JVIM",
+        "title": "Example article",
+        "species": ["Canine"],
+        "study_design": "RCT",
+        "clinical_topic": "Cardiology",
+        "input_source": "processed",
+        "models": {p: _prose_slot(prose) for p in summarizer.all_providers()},
+    }
+    text = summarizer._format_dev_prose_entry_as_text(entry, run_kind="single")
+
+    assert "DOI: 10.1234/example" in text
+    for provider in summarizer.all_providers():
+        assert f"{provider.upper()} SUMMARY" in text
+    assert "Summary (prose):" in text
+    assert "\n- " not in text  # no bullet render leaked into the prose file
+
+
 def test_enrich_result_adds_human_readable_on_success() -> None:
     result = summarizer._mock_summary("openai", "Some article text.")
     enriched = summarizer._enrich_result_with_human_readable(result)

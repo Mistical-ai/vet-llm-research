@@ -53,6 +53,7 @@ import copy
 import importlib
 import json
 import os
+import re
 import sys
 import random
 import time
@@ -131,8 +132,9 @@ class VeterinarySummary(BaseModel):
     )
     objective: str = Field(
         description=(
-            "The article's research question, objective, or hypothesis. Write "
-            "'Not reported' if the article does not state one clearly."
+            "The article's research question, objective, or hypothesis, in 1-2 "
+            "concise sentences. Write 'Not reported' if the article does not "
+            "state one clearly."
         ),
     )
     study_design: str = Field(
@@ -158,37 +160,40 @@ class VeterinarySummary(BaseModel):
     key_methods: list[str] = Field(
         description=(
             "Main methods, interventions, exposures, measurements/outcomes "
-            "assessed, statistical analysis approach, or comparisons. Each item "
-            "must be directly supported by the article text."
+            "assessed, statistical analysis approach, or comparisons. At most 4 "
+            "items, each one concise sentence. Each item must be directly "
+            "supported by the article text."
         ),
     )
     key_findings: list[str] = Field(
         description=(
-            "Most important findings, prioritizing quantitative results and "
-            "clinically meaningful outcomes. Include exact numbers only when "
-            "they appear in the source text."
+            "The most important findings, prioritizing quantitative results and "
+            "clinically meaningful outcomes. At most 5 items, each one concise "
+            "sentence — pick the headline results rather than being exhaustive. "
+            "Include exact numbers only when they appear in the source text."
         ),
     )
     clinical_significance: str = Field(
         description=(
             "How a practicing veterinarian should interpret or apply the "
-            "findings. Avoid advice that goes beyond the article."
+            "findings, in 1-2 concise sentences. Avoid advice that goes beyond "
+            "the article."
         ),
     )
     limitations: list[str] = Field(
         description=(
             "Important limitations, caveats, population constraints, or sources "
-            "of uncertainty stated or directly implied by the article."
+            "of uncertainty stated or directly implied by the article. At most 4 "
+            "items, each one concise sentence."
         ),
     )
     summary_text: str = Field(
         description=(
-            "A short plain-language prose summary under 400 words (target 300-380), "
-            "written for a busy veterinary clinician. Flowing paragraphs only — no "
+            "A short plain-language prose summary of 300-340 words; do not exceed 360 "
+            "words. Written for a busy veterinary clinician. Flowing paragraphs only — no "
             "numbered lists, no bullet points, no bold headers — one paragraph each "
             "for Background, Methods, Results, Limitations, and Conclusions, in that "
-            "order. Mention only headline numbers; keep exhaustive statistics in "
-            "key_findings instead. Must not include unsupported facts."
+            "order. Mention only headline numbers. Must not include unsupported facts."
         ),
     )
 
@@ -1599,6 +1604,18 @@ class SummaryRunStats(dict[str, int]):
         self.budget_spent = budget_spent
 
 
+# Caps mirror the "at most N items" guidance in the VeterinarySummary field
+# descriptions above. Applied here too as a render-time backstop so the
+# readable .txt output stays within its word budget even if a model overshoots
+# the prompt guidance — the full, uncapped list still gets written to
+# data/summaries.jsonl untouched, since that file remains the source of truth.
+_HUMAN_READABLE_LIST_CAPS = {
+    "key_methods": 4,
+    "key_findings": 5,
+    "limitations": 4,
+}
+
+
 def _format_human_readable(structured: dict) -> str:
     """
     Format a VeterinarySummary structured dict into plain clinical sections.
@@ -1607,7 +1624,8 @@ def _format_human_readable(structured: dict) -> str:
     (Background, Methods, Results, Limitations, Conclusions) so every readable
     output — this inspection dump and the actual summaries alike — looks the
     same regardless of which provider produced it. List fields are
-    bullet-pointed; scalar fields are left as prose.
+    bullet-pointed and capped (see ``_HUMAN_READABLE_LIST_CAPS``); scalar
+    fields are left as prose.
 
     The section order is copied literally from ``_summary_text_from_payload``
     (the ``(label, key)`` tuple) so the two renderers can never drift apart.
@@ -1625,7 +1643,9 @@ def _format_human_readable(structured: dict) -> str:
     ):
         value = structured.get(key)
         if isinstance(value, list):
-            body = "\n".join(f"- {item}" for item in value) if value else "Not reported"
+            cap = _HUMAN_READABLE_LIST_CAPS.get(key)
+            items = value[:cap] if cap else value
+            body = "\n".join(f"- {item}" for item in items) if items else "Not reported"
         else:
             body = str(value or "Not reported").strip()
         parts.append(f"{label}\n{body}")
@@ -1684,6 +1704,99 @@ def _format_provider_section(provider: str, result: dict) -> list[str]:
     return lines
 
 
+# Section headers the model is instructed to lead each prose paragraph with, in
+# order (see summarization_v1.txt's summary_text spec). _prettify_prose keys off
+# this exact order so a header word that also appears inside body prose is never
+# mistaken for a second section boundary.
+_PROSE_SECTION_HEADERS = ("Background", "Methods", "Results", "Limitations", "Conclusions")
+
+# summary_text word ceiling surfaced in the readable prose file. The prompt now
+# asks for 300-340 words (hard ceiling 360), but LLMs only approximate word
+# counts, so this display-only flag makes any overshoot past 400 obvious on
+# inspection. It never edits the summary — enforcement stays prompt-side only.
+_PROSE_WORD_FLAG_THRESHOLD = 400
+
+
+def _prettify_prose(text: str) -> str:
+    """
+    Reflow a stored ``summary_text`` blob into readable, sectioned prose.
+
+    The provider returns one flowing string where each section lead
+    (Background/Methods/Results/Limitations/Conclusions) runs straight into the
+    previous paragraph (e.g. "...disease.  Methods This retrospective..."). This
+    puts every recognised header on its own line with a blank line before it,
+    and preserves any leading title/author text as a preamble. Purely cosmetic —
+    no words are added, removed, or reordered.
+    """
+    collapsed = " ".join(str(text or "").split())
+    if not collapsed:
+        return ""
+
+    # Find each header once, in order, each after the previous match, so a header
+    # word appearing inside body prose can't be picked up as a new boundary.
+    positions: list[tuple[int, str]] = []
+    search_from = 0
+    for header in _PROSE_SECTION_HEADERS:
+        match = re.search(rf"\b{header}\b", collapsed[search_from:])
+        if match:
+            start = search_from + match.start()
+            positions.append((start, header))
+            search_from = start + len(header)
+
+    if not positions:
+        return collapsed
+
+    chunks: list[str] = []
+    preamble = collapsed[: positions[0][0]].strip()
+    if preamble:
+        chunks.append(preamble)
+    for i, (pos, header) in enumerate(positions):
+        end = positions[i + 1][0] if i + 1 < len(positions) else len(collapsed)
+        body = collapsed[pos + len(header) : end].strip()
+        chunks.append(f"{header}\n{body}".rstrip())
+    return "\n\n".join(chunks)
+
+
+def _format_provider_prose_section(provider: str, result: dict) -> list[str]:
+    """
+    Build the readable prose block for one provider (prose-subfolder output).
+
+    Sibling of ``_format_provider_section`` but for the ``prose/`` files: it
+    renders the flowing ``summary_text`` (via ``_prettify_prose``) with a word
+    count and an over-budget flag, and emits NO bullets. The two renderers are
+    deliberately separate so the prose and the structured-bullet views live in
+    different files and the prose is never printed twice.
+    """
+    lines = [
+        "",
+        "=" * 78,
+        f"{provider.upper()} SUMMARY",
+        "=" * 78,
+        f"Status: {result.get('status') or 'unknown'}",
+        f"Model Version: {result.get('model_version') or 'Not recorded'}",
+        f"Timestamp: {result.get('timestamp') or 'Not recorded'}",
+    ]
+
+    if result.get("status") != "success":
+        lines.extend([
+            "",
+            f"No readable summary was produced. Error: {result.get('error') or 'Not recorded'}",
+        ])
+        return lines
+
+    prose = str(result.get("summary") or "").strip()
+    word_count = len(prose.split())
+    flag = f"  [OVER {_PROSE_WORD_FLAG_THRESHOLD}]" if word_count > _PROSE_WORD_FLAG_THRESHOLD else ""
+    lines.extend([
+        f"Input Tokens: {result.get('input_tokens') or 'Not recorded'}",
+        f"Output Tokens: {result.get('output_tokens') or 'Not recorded'}",
+        f"Summary (prose): {word_count} words{flag}",
+        "",
+        _prettify_prose(prose) or "No summary text returned.",
+    ])
+    return lines
+
+
 def _format_folder_entry_as_text(entry: dict) -> str:
     """
     Turn one multi-provider summary entry into a plain-English report.
@@ -1713,20 +1826,57 @@ def _format_folder_entry_as_text(entry: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _format_dev_summary_entry_as_text(entry: dict) -> str:
+# Intro paragraph for _format_dev_summary_entry_as_text, keyed by the caller's
+# run_kind. "dev" mirrors summarize --mode dev's journal-random sample; "single"
+# is a summarize --mode single one-paper smoke test. Both share everything else
+# (header fields, per-provider sections) since they write identically-shaped
+# data/summaries.jsonl entries — only how the paper got picked differs.
+_DEV_SUMMARY_INTRO_BY_RUN_KIND = {
+    "dev": (
+        "This file contains one summary from each configured model provider,\n"
+        "picked for the dev-mode journal-random sample (see PHASE3_DEV_SAMPLE_SEED\n"
+        "in .env.template). It mirrors data/summaries.jsonl for this DOI in a\n"
+        "human-readable form; the JSONL file remains the source of truth."
+    ),
+    "single": (
+        "This file contains one summary from each configured model provider,\n"
+        "generated by a `summarize --mode single` run. It mirrors data/summaries.jsonl\n"
+        "for this DOI in a human-readable form; the JSONL file remains the source of truth."
+    ),
+}
+
+
+def _format_dev_summary_entry_as_text(entry: dict, *, run_kind: str = "dev") -> str:
     """
     Turn one ``data/summaries.jsonl``-shaped entry (built by
     ``_new_summary_entry``) into a plain-English report for
-    ``data/dev_summaries_jsonl/``.
+    ``data/dev_summaries_jsonl/`` (``run_kind="dev"``) or
+    ``data/single_summaries_jsonl/`` (``run_kind="single"``).
 
-    This is the readable sibling of the real dev-mode ``summarize`` run: no
-    PDF is involved (see ``_format_folder_entry_as_text`` for the PDF-vs-
-    processed-text comparison version used by summarize-all), so the header
-    surfaces the manifest metadata (journal/species/study design/clinical
-    topic) that's actually available on this entry shape instead of a source
-    filename/slug that summarize's entries don't carry.
+    This is the readable sibling of a real-time ``summarize`` run: no PDF is
+    involved (see ``_format_folder_entry_as_text`` for the PDF-vs-processed-
+    text comparison version used by summarize-all), so the header surfaces
+    the manifest metadata (journal/species/study design/clinical topic) that's
+    actually available on this entry shape instead of a source filename/slug
+    that summarize's entries don't carry.
     """
-    lines = [
+    lines = _dev_entry_header_lines(entry, run_kind)
+
+    models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
+    for provider in all_providers():
+        result = models.get(provider) if isinstance(models.get(provider), dict) else _empty_model_slot()
+        lines.extend(_format_provider_section(provider, result))
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _dev_entry_header_lines(entry: dict, run_kind: str) -> list[str]:
+    """
+    Build the shared header block (DOI/journal/metadata + run-kind intro) used by
+    both the bullet-render and prose-render dev/single ``.txt`` files, so the two
+    surfaces always carry an identical header for the same paper.
+    """
+    return [
         f"DOI: {entry.get('doi') or 'Not recorded'}",
         f"Journal: {entry.get('journal') or 'Not recorded'}",
         f"Title: {entry.get('title') or 'Not recorded'}",
@@ -1735,16 +1885,26 @@ def _format_dev_summary_entry_as_text(entry: dict) -> str:
         f"Clinical Topic: {entry.get('clinical_topic') or 'Not recorded'}",
         f"Input Source: {entry.get('input_source') or 'processed'}",
         "",
-        "This file contains one summary from each configured model provider,",
-        "picked for the dev-mode journal-random sample (see PHASE3_DEV_SAMPLE_SEED",
-        "in .env.template). It mirrors data/summaries.jsonl for this DOI in a",
-        "human-readable form; the JSONL file remains the source of truth.",
+        _DEV_SUMMARY_INTRO_BY_RUN_KIND.get(run_kind, _DEV_SUMMARY_INTRO_BY_RUN_KIND["dev"]),
     ]
+
+
+def _format_dev_prose_entry_as_text(entry: dict, *, run_kind: str = "dev") -> str:
+    """
+    Readable prose sibling of ``_format_dev_summary_entry_as_text``.
+
+    Same header block, but each provider section shows the flowing clinician
+    ``summary_text`` (the field the blind judge actually scores and the 400-word
+    rule governs) with a word count and over-budget flag, instead of the
+    structured bullet lists. Written to the ``prose/`` subfolder alongside the
+    top-level bullet file (see ``write_dev_summary_jsonl_outputs``).
+    """
+    lines = _dev_entry_header_lines(entry, run_kind)
 
     models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
     for provider in all_providers():
         result = models.get(provider) if isinstance(models.get(provider), dict) else _empty_model_slot()
-        lines.extend(_format_provider_section(provider, result))
+        lines.extend(_format_provider_prose_section(provider, result))
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1785,11 +1945,14 @@ def write_dev_summary_jsonl_outputs(
     input_source: str = "processed",
     output_suffix: str | None = None,
     summaries_path: Path | None = None,
+    run_kind: str = "dev",
 ) -> int:
     """
-    Render a plain-English ``.txt`` file per DOI into ``data/dev_summaries_jsonl/``.
+    Render a plain-English ``.txt`` file per DOI into ``output_dir`` — either
+    ``data/dev_summaries_jsonl/`` (``run_kind="dev"``, the default) or
+    ``data/single_summaries_jsonl/`` (``run_kind="single"``).
 
-    This is the readable sibling of a dev-mode ``summarize`` run: it reads
+    This is the readable sibling of a real-time ``summarize`` run: it reads
     back the entries ``run_realtime`` just wrote to ``data/summaries.jsonl``
     (via ``load_existing_summaries``) for the given ``dois`` + ``input_source``,
     and writes one file per paper so a human can sanity-check the run without
@@ -1809,7 +1972,15 @@ def write_dev_summary_jsonl_outputs(
         _write_folder_output(
             output_dir, stem, entry,
             output_suffix=output_suffix,
-            formatter=_format_dev_summary_entry_as_text,
+            formatter=lambda e: _format_dev_summary_entry_as_text(e, run_kind=run_kind),
+        )
+        # Readable prose sibling: same paper, one level down in prose/. Kept in a
+        # subfolder so the top-level *.txt glob used by the dev-eval source /
+        # resume-skip / pilot-review readers never picks it up.
+        _write_folder_output(
+            output_dir / "prose", stem, entry,
+            output_suffix=output_suffix,
+            formatter=lambda e: _format_dev_prose_entry_as_text(e, run_kind=run_kind),
         )
         written += 1
     return written

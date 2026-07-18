@@ -84,6 +84,12 @@ DEV_TESTS_SUMMARIES_TXT_DIR = DEV_TESTS_DIR / "summaries_txt"
 # processed-text *comparison* output — see .env.template section 11 for the
 # full explanation of when to use which folder.
 DEV_SUMMARIES_JSONL_DIR = DATA_DIR / "dev_summaries_jsonl"
+# Readable sibling of data/summaries.jsonl for `summarize --mode single` runs
+# (a one-paper smoke test of the live pipeline/prompt). Single mode doesn't
+# pre-select a DOI the way dev mode does — it just walks the manifest and
+# stops after paper_limit papers — so cmd_summarize figures out which DOI(s)
+# actually got (re)written this run via `_dois_touched_since` instead.
+SINGLE_SUMMARIES_JSONL_DIR = DATA_DIR / "single_summaries_jsonl"
 # Readable judge-side sibling of DEV_SUMMARIES_JSONL_DIR: `evaluate --mode dev`
 # writes one .txt per judged dev paper here (see _cmd_evaluate_from_dev_jsonl).
 # data/evaluations.jsonl stays the append-only source of truth; this is the
@@ -191,6 +197,50 @@ def _read_dois_from_dev_folder(folder: Path) -> set[str]:
         except OSError:
             continue
     return dois
+
+
+def _dois_touched_since(
+    summaries_path: Path, since: datetime, input_source: str,
+) -> set[str]:
+    """Return DOIs in ``summaries_path`` that got a provider result timestamped
+    at/after ``since``, restricted to entries matching ``input_source``.
+
+    `summarize --mode single` doesn't pre-select a DOI the way dev mode does
+    (see ``SINGLE_SUMMARIES_JSONL_DIR``) — it just walks the manifest and
+    stops after ``paper_limit`` papers. This is how ``cmd_summarize`` figures
+    out, after the fact, which paper(s) that run actually touched so it can
+    render them into the readable single-summaries folder.
+    """
+    touched: set[str] = set()
+    if not summaries_path.exists():
+        return touched
+    with open(summaries_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(entry.get("input_source") or "processed") != input_source:
+                continue
+            doi = str(entry.get("doi", "")).strip()
+            if not doi:
+                continue
+            models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
+            for result in models.values():
+                ts_raw = result.get("timestamp") if isinstance(result, dict) else None
+                if not ts_raw:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_raw)
+                except ValueError:
+                    continue
+                if ts >= since:
+                    touched.add(doi)
+                    break
+    return touched
 
 
 def _summarize_all_output_set() -> str:
@@ -307,6 +357,15 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     doi_filter_dois: set[str] | None = None
     dev_run_suffix: str | None = None
     if profile.name == "dev" and args.input_source != "pdf":
+        # --output-subdir redirects this run's readable output (and its
+        # incremental skip-existing check) into a subfolder with its own
+        # independent pool, without touching the module-level
+        # DEV_SUMMARIES_JSONL_DIR constant that other commands (e.g.
+        # `evaluate --mode dev`) still read.
+        dev_output_dir = (
+            DEV_SUMMARIES_JSONL_DIR / args.output_subdir
+            if args.output_subdir else DEV_SUMMARIES_JSONL_DIR
+        )
         effective_limit = args.limit if args.limit is not None else profile.paper_limit
         manifest_path = args.manifest if args.manifest else MANIFEST_PATH
         by_journal = _load_manifest_by_journal(manifest_path, args.input_source)
@@ -322,7 +381,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         # stays deterministic (seed + the fixed exclusion set); the round-robin
         # sampler just re-draws over the smaller remaining pool per journal.
         if not args.no_skip_existing:
-            done = _read_dois_from_dev_folder(DEV_SUMMARIES_JSONL_DIR)
+            done = _read_dois_from_dev_folder(dev_output_dir)
             if done:
                 by_journal = {
                     journal: [
@@ -333,11 +392,11 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                 }
                 by_journal = {j: recs for j, recs in by_journal.items() if recs}
                 print(f"[phase3:summarize] skipping {len(done)} paper(s) already in "
-                      f"{DEV_SUMMARIES_JSONL_DIR}; picking from the remainder.")
+                      f"{dev_output_dir}; picking from the remainder.")
                 if not by_journal:
                     print("[phase3:summarize] No un-summarised journal-mapped papers "
                           "remain. Pass --no-skip-existing to re-pick already-done "
-                          f"papers, or clear {DEV_SUMMARIES_JSONL_DIR}.")
+                          f"papers, or clear {dev_output_dir}.")
                     return 1
 
         dev_seed = int(os.getenv("PHASE3_DEV_SAMPLE_SEED", "42"))
@@ -385,6 +444,9 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         delegate += ["--input-source", args.input_source]
     if args.guide_summary:
         delegate += ["--guide-summary", str(args.guide_summary)]
+    # Captured just before the live/mock call so `_dois_touched_since` (single
+    # mode only, below) can tell which paper this specific run touched.
+    run_started_at = datetime.now(timezone.utc)
     result = summarize_main(delegate)
 
     if doi_filter_dois is not None and result == 0:
@@ -396,12 +458,36 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         from summarizer import write_dev_summary_jsonl_outputs
         written = write_dev_summary_jsonl_outputs(
             doi_filter_dois,
-            output_dir=DEV_SUMMARIES_JSONL_DIR,
+            output_dir=dev_output_dir,
             input_source=args.input_source,
             output_suffix=dev_run_suffix,
         )
         print(f"[phase3:summarize] wrote {written} readable dev summary "
-              f"file(s) to {DEV_SUMMARIES_JSONL_DIR}")
+              f"file(s) to {dev_output_dir}")
+    elif profile.name == "single" and result == 0:
+        # Single mode has no pre-selected DOI (unlike dev, above) — it just
+        # walks the manifest and stops after paper_limit papers — so figure
+        # out which paper(s) actually got a fresh provider result this run.
+        # Read the live summarizer.SUMMARIES_PATH (not this module's own copy
+        # of the constant) so this stays correct under test monkeypatching,
+        # which only ever redirects the former.
+        import summarizer as summarizer_module
+        touched_dois = _dois_touched_since(
+            summarizer_module.SUMMARIES_PATH, run_started_at, args.input_source
+        )
+        if touched_dois:
+            from summarizer import write_dev_summary_jsonl_outputs
+            written = write_dev_summary_jsonl_outputs(
+                touched_dois,
+                output_dir=SINGLE_SUMMARIES_JSONL_DIR,
+                input_source=args.input_source,
+                run_kind="single",
+            )
+            print(f"[phase3:summarize] wrote {written} readable single summary "
+                  f"file(s) to {SINGLE_SUMMARIES_JSONL_DIR}")
+        else:
+            print("[phase3:summarize] no newly-summarized paper detected; nothing "
+                  f"written to {SINGLE_SUMMARIES_JSONL_DIR}.")
 
     return result
 
@@ -1572,6 +1658,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Dev mode only: reconsider papers already written to "
                             "data/dev_summaries_jsonl/ instead of skipping them. "
                             "By default dev runs are incremental and pick new papers.")
+    p_sum.add_argument("--output-subdir", default=None,
+                       help="Dev mode only: write the readable output into "
+                            "data/dev_summaries_jsonl/<name>/ instead of the top "
+                            "level, and track incremental skip-existing against "
+                            "that subfolder only (papers already done in the "
+                            "parent folder can still be re-picked).")
     p_sum.add_argument("--providers", default=None,
                        help="Comma-separated subset of providers.")
     p_sum.add_argument("--manifest", type=Path, default=None)

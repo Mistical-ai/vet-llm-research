@@ -17,7 +17,7 @@ Schema field guidance (facts from the paper only; use "Not reported" when absent
 - summary_text: the full structured summary in paragraph format (see format below).
 
 summary_text format (a short, plain-language prose summary for a busy veterinary clinician
-who has about a minute to read it; under 400 words total, target 300-380; flowing paragraphs
+who has about a minute to read it; 300-340 words (never exceed 360 words); flowing paragraphs
 only — no numbered headers, no bullet points, no markdown bold):
 
 [Article title, as reported in the text — omit this line if not present]
@@ -49,7 +49,7 @@ Rules:
 - For missing sample_size, use null. Do not use 0 unless the article explicitly reports zero.
 - Keep each summary_text section as a flowing prose paragraph — no bullet points, no numbered
   lists, no bold headers.
-- summary_text must stay under 400 words (target 300-380) and must not simply restate the
+- summary_text must be 300-340 words (never exceed 360 words) and must not simply restate the
   key_findings list.
 
 Article text:

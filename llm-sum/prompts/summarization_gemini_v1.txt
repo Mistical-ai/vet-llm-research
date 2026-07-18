@@ -37,7 +37,7 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
   [The bottom-line takeaway and its clinical relevance.]
 
 Rules:
-- summary_text must be under 400 words (target 300-380) and contain only flowing prose
+- summary_text must be 300-340 words (never exceed 360 words) and contain only flowing prose
   paragraphs in the section order above — no numbered lists, no bullet points, no bold headers.
 - summary_text must not simply restate the key_findings list; describe results in plain
   language and save exact statistics for key_findings.
