@@ -30,18 +30,12 @@ Stdout only — no files are written. (If you want the report saved, redirect to
 
 ## CLI
 
-This script is normally invoked indirectly:
+This module has **no standalone CLI entry point** — it has no `if __name__ == "__main__":` block, so `python llm-sum/cost_estimator.py` runs the file and produces no observable output. It is always invoked indirectly: either imported (`from cost_estimator import run`) or reached through `run_phase3.py summarize --estimate`, which calls `run()` for you:
 
 ```powershell
 python llm-sum/run_phase3.py summarize --estimate
 python llm-sum/run_phase3.py summarize --estimate --input-source raw_text
 # Not supported: python llm-sum/run_phase3.py summarize --estimate --input-source pdf
-```
-
-You can also call it directly:
-
-```powershell
-python llm-sum/cost_estimator.py     # works if you import + invoke its run() function
 ```
 
 ## Behaviour per PHASE3_MODE

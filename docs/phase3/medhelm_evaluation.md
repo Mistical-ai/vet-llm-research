@@ -272,6 +272,28 @@ So this summary would get **`jury_score = 4.02`**. Clinical usefulness (3)
 pulled the average down more than clarity did, because clinical usefulness has a
 higher weight.
 
+### What happens when a criterion is missing
+
+The worked example above assumes the judge returned all five criterion scores.
+When a judge's response is missing one (a partial parse, a criterion the model
+skipped), that criterion drops out of **both** the numerator and the
+denominator — `calculate_jury_score` in `llm-sum/evaluator.py` renormalizes
+over whichever criteria actually have a usable score, rather than padding the
+missing one to a default value. For example, if faithfulness (weight 1.5) is
+absent and the other four criteria are all scored 4, the result is `4.00` —
+the same as if faithfulness had never been part of the rubric for that row —
+not a value dragged down by an imputed score. This matches how
+`human_review.py` scores a partially-filled human reviewer sheet (see
+[human_validation.md](../phase5/human_validation.md#why-both-jury-modes-weighted-and-unweighted-are-validated)),
+which is what lets the human and LLM composites be correlated against each
+other at all.
+
+Every row also carries a `missing_criteria` field — the list of criterion
+names (if any) that were absent for that row, so a partially-scored judgement
+is visible in the data rather than only in the arithmetic. It is computed by
+the sibling function `missing_criteria()` in `llm-sum/evaluator.py`, kept
+separate so `calculate_jury_score` keeps returning a bare number.
+
 **Best possible score:** if every criterion is 5:
 
 ```text
@@ -481,6 +503,9 @@ Important fields:
 - `jury_score`: the primary score (aliases weighted or unweighted per `JURY_AGGREGATION_MODE`).
 - `jury_score_weighted` / `jury_score_unweighted`: both aggregation methods, always present.
 - `jury_aggregation_mode`: which one was primary for this row (`weighted` or `unweighted`).
+- `missing_criteria`: list of criterion names the judge did not score for this
+  row (empty when all five were scored). See ["What happens when a criterion
+  is missing"](#what-happens-when-a-criterion-is-missing).
 - `quality_score`: derived legacy 1 to 10 score.
 - `hallucination_claims`: quoted unsupported claims.
 - `automatic_metrics`: local secondary metrics.
@@ -537,6 +562,7 @@ unless `JURY_AGGREGATION_MODE=weighted`.
   "jury_score_weighted": 4.02,
   "jury_score_unweighted": 4.0,
   "jury_aggregation_mode": "unweighted",
+  "missing_criteria": [],
   "judge_count": 1,
   "valid_judge_count": 1,
   "judge_disagreement": 0.0,

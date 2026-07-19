@@ -3766,6 +3766,21 @@ real reviewer, see
 pipeline — gathering articles through this step — see
 [`docs/COMMANDS.md`](../COMMANDS.md).
 
+**Rehearsing first: the pilot loop, briefly.** The pilot has its own three
+commands and its own ledger, kept strictly separate from the real one above:
+`export-pilot-human-review` → fill scoresheet(s) → `ingest-pilot-human-review`
+writes to **`data/pilot_human_reviews.jsonl`**, never to the real
+`data/human_reviews.jsonl`. Every pilot export stamps a `.pilot_export`
+marker in its output folder, and the real `ingest-human-review` command
+refuses to run against a pilot-marked folder when its own output is left at
+the default `data/human_reviews.jsonl` — a rehearsal score can't
+accidentally contaminate the real study ledger. Point `eval-report` /
+`report-figures` / `stats-engine` at
+`--human-reviews data/pilot_human_reviews.jsonl` to inspect pilot results the
+same way the commands above inspect the real study. Full detail, including
+exactly when that guard does and doesn't fire, is in
+[`docs/phase5/pilot_human_review.md`](../phase5/pilot_human_review.md) §5.
+
 ---
 
 

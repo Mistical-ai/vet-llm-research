@@ -130,10 +130,55 @@ number of articles, split evenly across the study's 5 journals, each
 expanded to every provider's summary of it). Full flag reference and
 methods rationale (blind protocol, why articles repeat, overlap ratio,
 Krippendorff's alpha, Spearman/Pearson/Bland-Altman):
-[docs/phase5/human_validation.md](phase5/human_validation.md). To rehearse
-this whole loop on the small dev pool first, see
-[docs/phase5/pilot_human_review.md](phase5/pilot_human_review.md)
-(`export-pilot-human-review`).
+[docs/phase5/human_validation.md](phase5/human_validation.md).
+
+**Rehearse the whole loop first, on the small dev pool, before spending a
+real reviewer's time:**
+
+```powershell
+python llm-sum/run_phase3.py export-pilot-human-review --sample-size 10
+#   -> data/pilot_human_review/human1/  (marked with a .pilot_export file)
+#   -> data/pilot_human_review/unblinding_key_human1.json   PRIVATE
+
+python llm-sum/run_phase3.py ingest-pilot-human-review
+#   -> data/pilot_human_reviews.jsonl   (never merged into the real human_reviews.jsonl)
+```
+
+Same flags as `export-human-review`/`ingest-human-review` (`--sample-size`,
+`--overlap-ratio`, `--seed`, `--review-dir`, `--output`), but reading from
+the dev-summary pool and writing to a separate pilot ledger. See
+[docs/phase5/pilot_human_review.md](phase5/pilot_human_review.md).
+
+---
+
+## 6. Publication reporting (Phase 6) — free, offline
+
+```powershell
+python llm-sum/run_phase3.py eval-report --publication
+#   -> data/results/publication_report_<ts>.json / .md / _tables/*.csv
+
+python llm-sum/run_phase3.py report-figures
+#   -> data/results/*.png / *.svg + VetHELM-style leaderboard JSON/Markdown
+
+python llm-sum/run_phase3.py stats-engine
+#   -> information density, Cohen's Kappa IRR, subscription economics,
+#      provider x covariate tables (species/study_design/journal)
+```
+
+`report-figures` and `stats-engine` both take `--evaluations`, `--summaries`,
+`--human-reviews`, and `--results-dir` overrides (defaults: `data/evaluations.jsonl`,
+`data/summaries.jsonl`, `data/human_reviews.jsonl`, `data/results/`). Point
+`--human-reviews` at `data/pilot_human_reviews.jsonl` to inspect a pilot
+rehearsal instead of the real study. Full details:
+[docs/phase6/reporting.md](phase6/reporting.md).
+
+---
+
+## Maintenance
+
+```powershell
+python llm-sum/run_phase3.py clean      # delete temporary batch JSONL files
+```
 
 ---
 
@@ -165,4 +210,16 @@ python llm-sum/run_phase3.py status
 python llm-sum/run_phase3.py export-human-review --sample-size 10
 python llm-sum/run_phase3.py ingest-human-review
 python llm-sum/run_phase3.py eval-report --markdown
+
+# Phase 5 — pilot/rehearsal human validation (free)
+python llm-sum/run_phase3.py export-pilot-human-review --sample-size 10
+python llm-sum/run_phase3.py ingest-pilot-human-review
+
+# Phase 6 — publication reporting (free)
+python llm-sum/run_phase3.py eval-report --publication
+python llm-sum/run_phase3.py report-figures
+python llm-sum/run_phase3.py stats-engine
+
+# Maintenance
+python llm-sum/run_phase3.py clean
 ```

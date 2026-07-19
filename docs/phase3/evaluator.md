@@ -45,6 +45,8 @@ python llm-sum/evaluator.py --no-resume              # re-evaluate everything
 python llm-sum/evaluator.py --limit 3                # override mode's paper_limit
 ```
 
+`--force` writes an audit line to `data/logs/phase3_safety.log`.
+
 ### Choosing the judges (default is the full 3-judge panel)
 
 The default is the full **3-judge panel** `openai,anthropic,gemini` — evaluation

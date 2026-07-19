@@ -1379,6 +1379,8 @@ def cmd_eval_report(args: argparse.Namespace) -> int:
         delegate.append("--no-save")
     if args.human_validation_mode is not None:
         delegate += ["--human-validation-mode", args.human_validation_mode]
+    if args.human_reviews is not None:
+        delegate += ["--human-reviews", str(args.human_reviews)]
     return report_main(delegate)
 
 
@@ -1507,6 +1509,25 @@ def cmd_export_pilot_human_review(args: argparse.Namespace) -> int:
     if args.seed is not None:
         delegate += ["--seed", str(args.seed)]
     return pilot_human_review_main(delegate)
+
+
+def cmd_ingest_pilot_human_review(args: argparse.Namespace) -> int:
+    """Ingest filled pilot reviewer scoresheets into data/pilot_human_reviews.jsonl.
+
+    Offline only — no API calls. Delegates to pilot_human_review.ingest_main,
+    which writes to the pilot-only ledger so rehearsal scores can never be
+    mistaken for real study results (see human_review.ingest_human_reviews'
+    pilot-folder guard). See docs/phase5/pilot_human_review.md.
+    """
+    print(resolve_mode(args.mode).banner())
+    from pilot_human_review import ingest_main as pilot_ingest_main
+
+    delegate: list[str] = []
+    if args.review_dir is not None:
+        delegate += ["--review-dir", str(args.review_dir)]
+    if args.output is not None:
+        delegate += ["--output", str(args.output)]
+    return pilot_ingest_main(delegate)
 
 
 # ---------------------------------------------------------------------------
@@ -1839,6 +1860,12 @@ def build_parser() -> argparse.ArgumentParser:
                                "(default; each reviewer validated on their own scores), "
                                "pooled (all reviewers averaged), or both. Overrides "
                                "HUMAN_VALIDATION_MODE from .env.")
+    p_report.add_argument("--human-reviews", type=Path, default=None,
+                          help="Normalized human-review rows to validate against "
+                               "(default: data/human_reviews.jsonl; missing is fine). "
+                               "Point at data/pilot_human_reviews.jsonl to inspect a "
+                               "pilot rehearsal instead of the real study. Does not "
+                               "apply with --publication.")
     p_report.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                           help="Where to save the report snapshot (default: data/results/).")
     p_report.add_argument("--no-save", action="store_true",
@@ -1954,6 +1981,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Base sampling seed (default: PILOT_HUMAN_REVIEW_SEED "
                               "from .env, or 42).")
     p_pilot.set_defaults(func=cmd_export_pilot_human_review)
+
+    p_pilot_ingest = sub.add_parser(
+        "ingest-pilot-human-review",
+        help="Ingest filled PILOT reviewer scoresheets into data/pilot_human_reviews.jsonl "
+             "-- never the real study ledger.",
+    )
+    _add_mode_arg(p_pilot_ingest)
+    p_pilot_ingest.add_argument("--review-dir", type=Path, default=None,
+                                help="Pilot export directory with humanN/ folders and their "
+                                     "sibling unblinding_key_human*.json files "
+                                     "(default: data/pilot_human_review/).")
+    p_pilot_ingest.add_argument("--output", type=Path, default=None,
+                                help="Normalized pilot JSONL output path "
+                                     "(default: data/pilot_human_reviews.jsonl).")
+    p_pilot_ingest.set_defaults(func=cmd_ingest_pilot_human_review)
 
     p_clean = sub.add_parser("clean", help="Delete temporary batch JSONL files.")
     p_clean.set_defaults(func=cmd_clean)

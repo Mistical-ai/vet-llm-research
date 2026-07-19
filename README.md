@@ -171,8 +171,12 @@ pytest tests/ -q
 | 4 | `python llm-sum/run_phase3.py eval-report` | Stratified scoreboard + save to `data/results/` |
 | 5 | `python llm-sum/run_phase3.py eval-report --publication` | Paper-ready tables with stats (Phase 6) |
 | 6 | `python llm-sum/run_phase3.py report-figures` | Charts and leaderboard (Phase 6) |
-| 7 | `python llm-sum/run_phase3.py export-human-review` | Blind review packets for vets (Phase 5) |
-| 8 | `python llm-sum/run_phase3.py ingest-human-review` | Load filled vet scoresheets (Phase 5) |
+| 7 | `python llm-sum/run_phase3.py stats-engine` | Information density, Cohen's Kappa IRR, subscription economics (Phase 6) |
+| 8 | `python llm-sum/run_phase3.py export-human-review` | Blind review packets for vets (Phase 5) |
+| 9 | `python llm-sum/run_phase3.py ingest-human-review` | Load filled vet scoresheets (Phase 5) |
+| 10 | `python llm-sum/run_phase3.py export-pilot-human-review` | Rehearse the review workflow on the dev pool (Phase 5) |
+| 11 | `python llm-sum/run_phase3.py ingest-pilot-human-review` | Load filled pilot scoresheets into `data/pilot_human_reviews.jsonl` (Phase 5) |
+| 12 | `python llm-sum/run_phase3.py clean` | Delete temporary batch JSONL files (maintenance) |
 
 **Quick dev test (six summaries, one paper, PDF vs processed text):**
 
@@ -463,6 +467,7 @@ vet-llm-research/
 │   ├── summaries.jsonl           ← Phase 3: one row per paper, all provider summaries
 │   ├── evaluations.jsonl         ← Phase 3: blind judge scores (append-only)
 │   ├── human_reviews.jsonl       ← Phase 5: normalized vet scoresheets
+│   ├── pilot_human_reviews.jsonl ← Phase 5: rehearsal/pilot twin of human_reviews.jsonl, kept in a separate ledger — see docs/phase5/pilot_human_review.md
 │   ├── rubric_scores.jsonl       ← Phase 4: offline heuristic scores (optional)
 │   ├── error_log.jsonl           ← All errors with details (never deleted)
 │   ├── missing_papers.csv        ← What's still needed (rewritten each supplement run)
@@ -484,6 +489,7 @@ vet-llm-research/
 │   ├── dev_detailEval_reports/   ← Phase 3: deep-dive Markdown reports from evaluate --mode dev
 │   ├── dev_tests/                ← Phase 3: summarize-all dev-mode PDF-vs-processed comparison output
 │   ├── human_review/             ← Phase 5: exported blind review packets
+│   ├── pilot_human_review/       ← Phase 5: rehearsal/pilot twin of human_review/, kept in a separate ledger — see docs/phase5/pilot_human_review.md
 │   ├── run_manifests/            ← Phase 4: provenance records per evaluation run
 │   ├── results/                  ← Phase 3/6: timestamped eval and publication reports
 │   └── logs/
@@ -626,7 +632,7 @@ Copy `.env.template` to `.env` and fill in your values. The most important ones:
 | `MIN_EXTRACTED_WORDS` | `3000` | Reject PDFs with fewer words after removing references |
 | `PDFPLUMBER_USE_TEXT_FLOW` | `true` | Preserve reading order in two-column PDFs |
 | `PUBLICATION_BOOTSTRAP_RESAMPLES` | `2000` | Bootstrap resamples for Phase 6 confidence intervals |
-| `HUMAN_REVIEW_SAMPLE_SIZE` | `15` | How many summaries to export for Phase 5 |
+| `HUMAN_REVIEW_SAMPLE_SIZE` | `5` | How many summaries to export for Phase 5 (falls back to an interactive 5/10/25 prompt, defaulting to 5, when unset and running at a real terminal) |
 
 Full list in `.env.template`.
 

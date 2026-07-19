@@ -26,7 +26,7 @@ Type `yes` at the confirmation prompt for paid modes (`single`, `dev`).
 
 ## What it does
 
-The Phase 3 orchestrator CLI. One entry point with twelve subcommands; every subcommand prints the active `PHASE3_MODE` banner before doing anything so you cannot run a paid call without seeing the mode first.
+The Phase 3 orchestrator CLI. One entry point with thirteen subcommands; every subcommand prints the active `PHASE3_MODE` banner before doing anything so you cannot run a paid call without seeing the mode first.
 
 ```
 run_phase3.py extract                     → prepare_texts.main()
@@ -39,6 +39,7 @@ run_phase3.py stats-engine                → stats_engine.main()  (Phase 6 sign
 run_phase3.py export-human-review         → human_review.main()  (Phase 5 blind review packets)
 run_phase3.py ingest-human-review         → human_review.ingest_main()  (Phase 5 load vet scoresheets)
 run_phase3.py export-pilot-human-review   → pilot_human_review.main()  (Phase 5 dev-pool trial run, see pilot_human_review.md)
+run_phase3.py ingest-pilot-human-review   → pilot_human_review.ingest_main()  (Phase 5 load pilot scoresheets into data/pilot_human_reviews.jsonl, see pilot_human_review.md)
 run_phase3.py status                      → reads jsonl files, prints counts
 run_phase3.py clean                       → deletes data/batch/*.jsonl scratch files
 ```
@@ -71,6 +72,8 @@ Set in `.env` or override per command with `--mode {test,single,dev,batch}`.
 | `batch`  | Real      | all                 | Yes (50% off) | Yes (`yes`) |
 
 **Important:** `summarize-all` uses different defaults than `summarize` in `single` and `dev`. For `summarize-all`, both `single` and `dev` default to **one matched article pair** (not `PHASE3_DEV_LIMIT`), which produces **six summaries** — see below.
+
+**Also important:** for `evaluate` in its default `jsonl` input mode, the "Default paper limit" above (and any `--limit` override) is a **per-journal quota**, not a flat total — `_sample_by_journal` draws that many papers from *each* journal represented in `data/summaries.jsonl`. So `evaluate --mode single` with no `--limit` judges 1 paper × (number of journals present), not 1 paper total, and `evaluate --mode dev` judges `PHASE3_DEV_LIMIT` papers × (number of journals). This quota behavior is specific to `evaluate`'s default `jsonl` mode; `evaluate --mode test` and `summarize`'s paper limit remain flat caps.
 
 ---
 
@@ -223,6 +226,7 @@ python llm-sum/run_phase3.py summarize-all --mode single --providers openai,gemi
 | `--resume` | Skip provider slots already at `status=success` |
 | `--force` | Bypass interactive confirmation |
 | `--providers` | Comma-separated subset |
+| `--output-set {auto,regular,dev-tests}` | Where readable `.txt` outputs are written. `auto` (default, or `SUMMARIZE_ALL_OUTPUT_SET` from `.env`) sends `dev` mode to `data/dev_tests/` and other modes to the original `data/summaries_pdf`/`data/summaries_txt` folders; `regular` always uses the original top-level folders; `dev-tests` always uses `data/dev_tests/`, regardless of mode. |
 
 **Not supported:** `--mode batch` (direct PDF summarisation is real-time only).
 
@@ -270,7 +274,7 @@ python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular
 
 | Flag | Purpose |
 |------|---------|
-| `--limit N` | Override mode's paper limit |
+| `--limit N` | Override mode's paper limit. In the default `jsonl` input mode this is a **per-journal quota** — N papers are judged from *each* journal in `data/summaries.jsonl`, so total judged = N × number of journals present (see the "Also important" note under **Modes** above). |
 | `--judges` | Comma-separated judge provider keys. Overrides `--jury` and `JURY_PRESET`. Default judges: the full 3-judge panel `openai,anthropic,gemini`. |
 | `--jury` | Full 3-judge panel (`openai,anthropic,gemini`); same as `JURY_PRESET=panel`. Presets: `panel` (3, default) / `duo` (2: `openai,anthropic`) / `solo` (1: `openai`). |
 | `--input-mode` | `jsonl` (default), `dev-jsonl`, `dev`, `regular`, or `auto` — where to read summaries from. `--mode dev` defaults to `dev-jsonl` regardless of `EVAL_INPUT_MODE`. See [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate). |
@@ -296,6 +300,49 @@ python llm-sum/run_phase3.py eval-report --no-save
 | `--json` | Print the full report as JSON |
 | `--results-dir PATH` | Where to save the report snapshot (default: `data/results/`) |
 | `--no-save` | Print only; skip writing to `data/results/` |
+
+### `report-figures` (always free, read-only)
+
+Renders Phase 6 publication figures (PNG/SVG) and exports a VetHELM-style
+leaderboard (JSON + Markdown) from `data/evaluations.jsonl`. See
+[`docs/phase6/reporting.md`](../phase6/reporting.md) for the full flag
+reference and figure catalog.
+
+### `stats-engine` (always free, read-only)
+
+Phase 6 significance and secondary-analysis suite: information density,
+Cohen's Kappa inter-rater reliability, subscription economics, and
+provider × covariate (species/study_design/journal) tables. See
+[`docs/phase6/reporting.md`](../phase6/reporting.md) for the full flag
+reference.
+
+### `export-human-review` (always free, read-only)
+
+Exports one more blind human-validation reviewer folder (`humanN/`) from
+`data/evaluations.jsonl` for the real study ledger. See
+[`docs/phase5/human_validation.md`](../phase5/human_validation.md) for the
+full workflow and flag reference.
+
+### `ingest-human-review` (always free, read-only)
+
+Ingests filled reviewer scoresheets into `data/human_reviews.jsonl`, the
+real study ledger. Refuses to run against a pilot export folder. See
+[`docs/phase5/human_validation.md`](../phase5/human_validation.md) for the
+full workflow and flag reference.
+
+### `export-pilot-human-review` (always free, read-only)
+
+Exports one more pilot reviewer folder (`humanN/`) from the dev-summary
+pool, to trial the human-validation workflow before the real export. See
+[`docs/phase5/pilot_human_review.md`](../phase5/pilot_human_review.md) for
+the full workflow and flag reference.
+
+### `ingest-pilot-human-review` (always free, read-only)
+
+Ingests filled pilot reviewer scoresheets into `data/pilot_human_reviews.jsonl`
+— never the real study ledger. See
+[`docs/phase5/pilot_human_review.md`](../phase5/pilot_human_review.md) for
+the full workflow and flag reference.
 
 ### `status` (always free, read-only)
 

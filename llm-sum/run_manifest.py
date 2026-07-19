@@ -4,7 +4,7 @@ llm-sum/run_manifest.py — reproducible evaluation run provenance
 
 Every evaluation run should answer: which code, prompt, dataset, and models
 produced these scores? A ``RunManifest`` is written to
-``data/processed/run_manifest_<run_id>.json`` before any judge is called, and
+``data/run_manifests/run_manifest_<run_id>.json`` before any judge is called, and
 patched with terminal status after the run finishes (success, partial
 failure, or a raised exception).
 

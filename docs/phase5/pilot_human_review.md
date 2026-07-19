@@ -13,9 +13,14 @@ folder layout work for a veterinarian reviewer. The authoritative study score
 is still Phase 3's blind LLM jury; real human validation still runs through
 `export-human-review` → `ingest-human-review` → `eval-report`.
 
+The pilot has its own full loop, kept strictly separate so a rehearsal never
+touches the real study's numbers:
+`export-pilot-human-review` → fill scoresheet(s) → `ingest-pilot-human-review`
+→ `eval-report --human-reviews data/pilot_human_reviews.jsonl` (§5 below).
+
 ```text
-summarize --mode dev  →  evaluate --mode dev  →  export-pilot-human-review
-  data/dev_summaries_jsonl/   data/evaluations.jsonl   data/pilot_human_review/humanN/
+summarize --mode dev  →  evaluate --mode dev  →  export-pilot-human-review  →  ingest-pilot-human-review
+  data/dev_summaries_jsonl/   data/evaluations.jsonl   data/pilot_human_review/humanN/   data/pilot_human_reviews.jsonl
 ```
 
 ---
@@ -179,7 +184,55 @@ model.
 
 ---
 
-## 5. When the dev pool is small
+## 5. Ingesting scores + rehearsing the analysis
+
+Once a tester has filled in `scoresheet_humanN.xlsx` (1-5 per criterion,
+yes/no for hallucination), ingest it — this reads every filled scoresheet
+under `data/pilot_human_review/`, un-blinds each row against its sibling
+`unblinding_key_humanN.json`, and writes one normalized JSONL file:
+
+```powershell
+python llm-sum/run_phase3.py ingest-pilot-human-review
+```
+
+| Flag | Default |
+|---|---|
+| `--review-dir PATH` | `data/pilot_human_review/` |
+| `--output PATH` | `data/pilot_human_reviews.jsonl` |
+
+This writes to **`data/pilot_human_reviews.jsonl`** — a separate file from
+the real study's `data/human_reviews.jsonl` (see
+[human_validation.md](human_validation.md)). The two are kept apart on
+purpose: every `export-pilot-human-review` run stamps a `.pilot_export`
+marker at the root of `data/pilot_human_review/`, and the real
+`ingest-human-review` command checks for that marker (or the fixed
+`pilot_human_review` folder name). But the guard's real condition is
+narrower than "refuses any pilot folder": it only raises when **both**
+`--review-dir` resolves to a pilot-marked folder **and** `--output` is left
+at its exact default, `data/human_reviews.jsonl` (`HUMAN_REVIEWS_PATH`) —
+which is exactly what `ingest-pilot-human-review` avoids by always passing
+`--output data/pilot_human_reviews.jsonl`. Point `--output` at any other
+path yourself and the guard does not fire, pilot folder or not — so don't
+rely on it for safety beyond the default-output case.
+
+To rehearse the analysis `eval-report` will eventually run for real, point it
+at the pilot file explicitly:
+
+```powershell
+python llm-sum/run_phase3.py eval-report --human-reviews data/pilot_human_reviews.jsonl
+```
+
+`report-figures` and `stats-engine` accept the same `--human-reviews`
+override. With a small pilot sample (e.g. 5 articles ≈ 15 items) expect
+`eval-report` to show real Krippendorff's α / Spearman / Pearson numbers but
+flag the human-vs-jury verdict as underpowered — `reliability.MIN_CORRELATION_N`
+is 30 comparable items, well above what one pilot round supplies. That is
+expected and does not indicate a bug; it is exactly the shape the real study
+sample is sized to avoid.
+
+---
+
+## 6. When the dev pool is small
 
 The pilot draws from however many dev articles you've summarized+evaluated. A
 5-article request (1/journal) gives each tester **15 scored items** — all
@@ -196,7 +249,7 @@ journal(s).
 
 ---
 
-## 6. Tests
+## 7. Tests
 
 ```powershell
 python -m pytest tests/test_pilot_human_review.py -q
@@ -206,11 +259,14 @@ Covers the dev-pool scoping, the self-contained folder, the blind protocol on
 both `packet.md` and the `.xlsx`, the overlap fraction (and the `1.0`/`0.0`
 regimes), that a later export never mutates an earlier folder, the
 prerequisite/empty-pool handling, PDF copy (including the missing-PDF warning),
-and the pool-exhaustion backfill. All offline against mock fixtures.
+the pool-exhaustion backfill, the `.pilot_export` marker, and that
+`ingest-human-review` refuses a pilot export directory while
+`ingest-pilot-human-review` round-trips one into `data/pilot_human_reviews.jsonl`.
+All offline against mock fixtures.
 
 ---
 
-## 7. Related reading
+## 8. Related reading
 
 - [human_validation.md](human_validation.md) — the **real** export/ingest/analysis loop this rehearses
 - [../booklet/08_human_validation_guide.md](../booklet/08_human_validation_guide.md) — the zero-jargon reviewer guide shipped in every folder

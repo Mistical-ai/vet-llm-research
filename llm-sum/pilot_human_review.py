@@ -96,10 +96,12 @@ from eval_instances import read_dois_from_dev_folder  # noqa: E402  (shared dev-
 from eval_report import iter_evaluation_rows  # noqa: E402  (same row source as the real export)
 from human_review import (  # noqa: E402  (single source of truth for sampling/render/keys)
     ARTICLE_COUNT_CHOICES,
+    PILOT_REVIEWS_PATH,
     JournalQuotaError,
     _build_instance_lookup,
     _build_review_items,
     build_unblinding_key,
+    ingest_human_reviews,
     load_previous_unblinding_key,
     next_human_number,
     prompt_article_count_choice,
@@ -306,6 +308,17 @@ def export_pilot_human_review(
     # PDFs). write_review_folder is the same code the real export uses, so the two
     # folder shapes can never drift.
     resolved_output.mkdir(parents=True, exist_ok=True)
+    # Mark this folder as a pilot export so `human_review.ingest_human_reviews`
+    # can refuse to merge rehearsal scores into the real study ledger — see
+    # the guard in human_review.py and `ingest_main` below.
+    marker_path = resolved_output / ".pilot_export"
+    if not marker_path.exists():
+        marker_path.write_text(
+            "This folder holds pilot (dress-rehearsal) human-review exports, not "
+            "the real study. Ingest it with 'ingest-pilot-human-review', not "
+            "'ingest-human-review' — see docs/phase5/pilot_human_review.md.\n",
+            encoding="utf-8",
+        )
     human_dir = resolved_output / f"human{human_number}"
     scoresheet_name = f"scoresheet_human{human_number}.xlsx"
     copied, missing = write_review_folder(
@@ -510,6 +523,47 @@ def main(argv: list[str] | None = None) -> int:
     # A command-line program signals success/failure with a number: 0 means
     # "everything worked", any non-zero number means "something went wrong".
     return 0 if result is not None else 1
+
+
+def ingest_main(argv: list[str] | None = None) -> int:
+    """CLI for the pilot ingest step — the pilot's twin of ``human_review.ingest_main``.
+
+    Reads filled pilot scoresheets from ``data/pilot_human_review/`` into
+    ``data/pilot_human_reviews.jsonl`` — never into the real study's
+    ``data/human_reviews.jsonl``. Delegates the actual work to
+    ``human_review.ingest_human_reviews`` (no duplicated ingest logic); only
+    the default paths differ from the real ingest command.
+    """
+    parser = argparse.ArgumentParser(
+        description="Pilot human validation — ingest filled pilot scoresheets into "
+                     "data/pilot_human_reviews.jsonl.",
+    )
+    parser.add_argument("--review-dir", type=Path, default=None,
+                        help="Pilot export directory holding humanN/ folders and their "
+                             "sibling unblinding_key_human*.json files "
+                             "(default: data/pilot_human_review/).")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Where to write the normalized pilot JSONL "
+                             "(default: data/pilot_human_reviews.jsonl).")
+    args = parser.parse_args(argv)
+
+    resolved_review_dir = args.review_dir if args.review_dir is not None else PILOT_REVIEW_DIR
+    resolved_output = args.output if args.output is not None else PILOT_REVIEWS_PATH
+
+    try:
+        result = ingest_human_reviews(review_dir=resolved_review_dir, output_path=resolved_output)
+    except (FileNotFoundError, ValueError) as exc:
+        # No unblinding_key_human*.json in the given folder, or (if --output
+        # was overridden to point at the real ledger) the contamination
+        # guard fired — report it plainly instead of a raw traceback.
+        print(f"[pilot_human_review] {exc}")
+        return 1
+
+    if result.rows_written == 0:
+        print("[pilot_human_review] No scored rows found — have testers fill in the "
+              "scoresheet(s) (1-5 per criterion) before ingesting.")
+        return 1
+    return 0
 
 
 # This is a standard Python pattern meaning "only run main() when this file

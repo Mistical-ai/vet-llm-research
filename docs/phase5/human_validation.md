@@ -245,9 +245,11 @@ humans. The **unweighted** overall doubles as the *MedHELM-comparable* anchor �
 MedHELM's own `jury_score` is an unweighted pooled mean — giving the benchmark a
 recognised external reference point. The human weighted composite is computed
 with the jury's **own** formula (`evaluator.calculate_jury_score` +
-`MEDHELM_CRITERION_WEIGHTS`, the single source of truth), and only when a
-reviewer filled **all five** criteria — because a missing criterion would be
-clamped to 1 and silently deflate the weighted average.
+`MEDHELM_CRITERION_WEIGHTS`, the single source of truth), renormalized over
+whichever criteria the reviewer actually filled in — the same rule the
+unweighted mean uses — so a partial row still yields a real weighted score
+instead of a missing criterion silently deflating the average (see
+`_normalize_scoresheet_row` in `llm-sum/human_review.py`).
 
 ### Why the output is reproducible and offline
 
@@ -373,7 +375,7 @@ spanning three regimes (identical to the pilot's, see
 same fraction is carried from each journal, so the leftover "new" draw is
 always a valid per-journal count too.
 
-All three env knobs live in `.env.template` section 19. Like `EVAL_SAMPLE_SEED`,
+All three env knobs live in `.env.template` section 18. Like `EVAL_SAMPLE_SEED`,
 keeping `HUMAN_REVIEW_SEED` fixed makes the sample reproducible — re-running
 the export (e.g. to regenerate a lost reviewer sheet) selects the identical
 items.
@@ -544,6 +546,30 @@ merged, global `item_id` table — so this can't get crossed.
 
 ## 7. Ingesting filled scoresheets
 
+**Quick answer — what to actually do the moment a scoresheet comes back:**
+
+1. Drop the returned `scoresheet_humanN.xlsx` back into its own `humanN/`
+   folder under `data/human_review/` (it should already be there if you
+   followed §6) — do **not** rename it or move it out of its folder, and
+   keep every reviewer's `unblinding_key_human{N}.json` sitting alongside it.
+2. Run `python llm-sum/run_phase3.py ingest-human-review`. This reads
+   every filled sheet it can find and writes `data/human_reviews.jsonl` —
+   safe to re-run any time a new sheet comes in or a correction is made (see
+   "derived snapshot" below).
+3. Run `python llm-sum/run_phase3.py eval-report --markdown`. The report now
+   gains a **"Human Validation"** section — inter-reviewer agreement and
+   human-vs-jury correlation — explained in full in §8 below.
+4. When you're ready to fold these numbers into the study's final,
+   paper-ready output (not just a quick look), see §9,
+   **"What happens after that"** — it covers `report-figures` and
+   `eval-report --publication`, the two commands that pick up
+   `data/human_reviews.jsonl` automatically and turn it into the leaderboard
+   and the Cohen's Kappa tables a manuscript actually cites.
+
+The rest of this section explains exactly how ingest works under the hood,
+for anyone who wants the detail; skip ahead to §8/§9 if the quick answer
+above is all you need right now.
+
 Once reviewers return their filled scoresheets (dropped back into their
 `humanN/` folders under `data/human_review/`):
 
@@ -629,8 +655,10 @@ Both views report the pooled-overall score for **both jury modes**:
     (faithfulness/safety count more), so the safety-oriented metric the study
     actually reports is validated too, not left unchecked. The human weighted
     composite is computed with the jury's *own* formula
-    (`evaluator.calculate_jury_score` + `MEDHELM_CRITERION_WEIGHTS`), and only
-    when a reviewer filled all five criteria (a partial row would deflate it).
+    (`evaluator.calculate_jury_score` + `MEDHELM_CRITERION_WEIGHTS`),
+    renormalized over whichever criteria the reviewer filled in — so a
+    partial row still yields a real weighted score, computed over the same
+    items as the unweighted mean, rather than being deflated or dropped.
 
   Per-criterion correlations are kept as a subordinate **diagnostic** block
   (which criteria the jury tracks experts on), not the headline.
@@ -660,7 +688,62 @@ comparable items; with fewer it reports `-`.
 
 ---
 
-## 9. Tests
+## 9. What happens after that — the downstream reporting path
+
+`eval-report --markdown` (§7-8) is the quick look. `data/human_reviews.jsonl`
+also feeds two other commands automatically, without any extra flag, and
+those are the ones whose output actually goes in a manuscript:
+
+### `report-figures` — folds human validation into the leaderboard
+
+```powershell
+python llm-sum/run_phase3.py report-figures
+```
+
+Every leaderboard entry gets a **human-validation cell** per provider —
+`_human_validation_entry` in `llm-sum/report_figures.py` calls
+`human_review.human_vs_jury_by_provider(rows)` (`llm-sum/human_review.py`),
+which scopes the same Spearman/Pearson correlation from §8 to *that
+provider's* summaries only. If no reviewer has scored that provider's
+summaries yet, the leaderboard entry says so in plain English
+(`"No human_reviews.jsonl rows for this provider yet. Run
+'export-human-review', have reviewers fill the scoresheets, then
+'ingest-human-review'."`) instead of silently omitting the field — so an
+incomplete validation pass is always visible, never invisible. Output lands
+in `data/results/leaderboard_<ts>.json` and `.md` (see
+[phase6/reporting.md](../phase6/reporting.md) for the full leaderboard
+format and the four figures this command also renders).
+
+### `eval-report --publication` — the paper-ready Cohen's Kappa tables
+
+```powershell
+python llm-sum/run_phase3.py eval-report --publication
+```
+
+This is the command whose numbers actually go in a write-up. Its
+**covariate analysis** table (one row per provider × species / study_design
+/ journal cell) reports hallucination rate and mean quality alongside
+**Cohen's Kappa** — a chance-corrected agreement statistic between the LLM
+judge and the human reviewer on the *same* categorical calls
+(`llm-sum/stats_engine.py`, §2 "Cohen's Kappa + percent agreement"). This is
+a different, complementary number from §8's Spearman/Pearson: those measure
+whether the jury's *continuous* score tracks the human's; Cohen's Kappa
+measures categorical agreement (e.g. did both flag the same items as
+hallucinating) and is the one typically reported alongside the correlation
+in a methods section. Output lands in `data/results/publication_report_<ts>.md`
+(plus the JSON and a CSV-per-table folder) — see
+[phase6/reporting.md](../phase6/reporting.md) §1 for the complete table list.
+
+**Both commands degrade gracefully** if `data/human_reviews.jsonl` doesn't
+exist yet or has no rows for some provider — they still run and produce
+every other table, just with that one field marked unavailable rather than
+failing. You do not have to wait for every reviewer to finish before
+running either command; re-run them any time to pick up newly ingested
+scores.
+
+---
+
+## 10. Tests
 
 ```powershell
 python -m pytest tests/test_human_review.py tests/test_human_review_ingest.py -q
@@ -676,7 +759,7 @@ Both run against mock fixtures — `PHASE3_MODE=test`, `$0`, no network.
 
 ---
 
-## 10. Related reading
+## 11. Related reading
 
 - [pilot_human_review.md](pilot_human_review.md) — trial this whole workflow on the dev pool first (incremental `humanN/` folders, `.xlsx` scoresheet, copied source PDFs)
 - [phase3/README.md](../phase3/README.md) — Phase 3 doc map and pipeline overview

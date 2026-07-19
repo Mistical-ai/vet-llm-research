@@ -16,10 +16,11 @@ Healthy papers land at ratio 0.70-0.90 (references + publisher noise removed = ~
 
 | Path                       | Role                                       |
 |----------------------------|--------------------------------------------|
-| `data/raw/*.pdf`           | Source PDFs.                               |
-| `data/raw_text/*.jsonl`    | Raw extracted cache for manual side-by-side inspection. |
+| `data/raw/*.pdf`           | Source PDFs — re-extracted in memory via `extract_text_from_pdf()`, the same helper Phase 3 uses. Not read from any cache. |
 | `data/processed/*.jsonl`   | Cleaned cache files written by `prepare_texts.py`. |
 | `data/manifest.jsonl`      | Used to match PDF → cache filename.        |
+
+Note: `data/raw_text/*.jsonl` (if present) is **not** read by this script — the raw side of the comparison always comes from re-extracting the PDF directly, never from that cache. `data/raw_text/` exists only for humans to eyeball manually (see the "cleaning ate the body?" row below).
 
 ## Outputs
 

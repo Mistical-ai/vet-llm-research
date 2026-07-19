@@ -10,7 +10,7 @@ parsers in batch_utils.
 
 Run manually whenever you want to check progress:
     python llm-sum/check_batch_status.py
-    python llm-sum/check_batch_status.py --job-id batch_abc123 --download-only
+    python llm-sum/check_batch_status.py --no-download
 """
 
 from __future__ import annotations

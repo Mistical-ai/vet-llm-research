@@ -95,7 +95,7 @@ python llm-sum/run_phase3.py summarize-all --mode dev     # same one-pair defaul
 python llm-sum/summarizer.py --mode single --guide-summary llm-sum/prompts/guide_summary_template.txt
 ```
 
-`--limit N` always wins. `--input-source processed` is the default and is the production path. `--input-source raw_text` is for `test`, `single`, and `dev` comparison runs. `--input-source pdf` is stricter: it is only allowed in `test` and `single`, because it makes real-time provider-specific PDF calls and is meant for one-paper PDF-vs-JSONL comparisons. `--force` writes an audit line to `data/logs/phase3_safety.log`.
+`--limit N` always wins. `--input-source processed` is the default and is the production path. `--input-source raw_text` is for `test`, `single`, and `dev` comparison runs. `--input-source pdf` is stricter: it is only allowed in `test` and `single`, because it makes real-time provider-specific PDF calls and is meant for one-paper PDF-vs-JSONL comparisons. `--force` writes an audit line to `data/logs/phase3_safety.log`. `--doi-filter` (comma-separated DOIs) restricts the run to exactly those papers, bypassing `--limit`'s sequential slicing; it's set internally by `run_phase3.py`'s dev-mode journal-stratified selection and not usually passed by hand.
 
 ## Optional Format Guide
 

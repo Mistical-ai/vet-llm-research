@@ -196,6 +196,10 @@ REVIEWER_GUIDE_PATH = REPO_ROOT / "docs" / "booklet" / "08_human_validation_guid
 # every ingest), NOT append-only like evaluations.jsonl — re-ingesting the same
 # filled sheets must reproduce the same file, never grow it.
 HUMAN_REVIEWS_PATH = DATA_DIR / "human_reviews.jsonl"
+# The pilot-only twin of HUMAN_REVIEWS_PATH (see pilot_human_review.ingest_main).
+# Rehearsal scores never belong in the real study ledger above, so they get
+# their own file; ingest_human_reviews refuses to write pilot rows here.
+PILOT_REVIEWS_PATH = DATA_DIR / "pilot_human_reviews.jsonl"
 
 # Mirrors evaluator.MEDHELM_CRITERION_WEIGHTS's keys — the same five criteria a
 # human reviewer scores, kept as a local tuple so this module has no import-time
@@ -2083,6 +2087,20 @@ def ingest_human_reviews(
     resolved_dir = review_dir if review_dir is not None else HUMAN_REVIEW_DIR
     resolved_output = output_path if output_path is not None else HUMAN_REVIEWS_PATH
 
+    # Refuse to merge pilot (dress-rehearsal) scores into the real study
+    # ledger. A pilot export is identified by its ".pilot_export" marker
+    # (written by pilot_human_review.export_pilot_human_review) or, for
+    # exports made before that marker existed, by the pilot's fixed folder
+    # name — either way, use 'ingest-pilot-human-review' instead.
+    is_pilot_dir = (resolved_dir / ".pilot_export").exists() or resolved_dir.name == "pilot_human_review"
+    if is_pilot_dir and resolved_output == HUMAN_REVIEWS_PATH:
+        raise ValueError(
+            f"{resolved_dir} holds pilot (dress-rehearsal) exports, not the real "
+            f"study — ingesting it into {HUMAN_REVIEWS_PATH} would contaminate the "
+            "real results. Use 'ingest-pilot-human-review' instead (writes to "
+            f"{PILOT_REVIEWS_PATH})."
+        )
+
     # One key PER reviewer (see load_unblinding_keys) — deliberately never
     # merged into a single flat {item_id: identity} dict, since human2's
     # item_001 and human1's item_001 identify different summaries.
@@ -2843,9 +2861,10 @@ def ingest_main(argv: list[str] | None = None) -> int:
 
     try:
         result = ingest_human_reviews(review_dir=args.review_dir, output_path=args.output)
-    except FileNotFoundError as exc:
-        # No unblinding_key_human*.json in the given folder — report it
-        # plainly instead of showing a raw Python traceback.
+    except (FileNotFoundError, ValueError) as exc:
+        # No unblinding_key_human*.json in the given folder, or the pilot
+        # contamination guard fired — report it plainly instead of showing
+        # a raw Python traceback.
         print(f"[human_review] {exc}")
         return 1
 

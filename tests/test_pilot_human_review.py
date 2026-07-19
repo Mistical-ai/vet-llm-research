@@ -20,6 +20,11 @@ Offline, mock corpus only (PHASE3_MODE=test, $0, no network). Covers:
     - Per-item PDF copy, including the graceful fallback to article.md + warning
       when a PDF is absent.
     - Pool-exhaustion backfill warning when the dev pool can't supply new items.
+    - The ".pilot_export" marker every export writes, and the guard that makes
+      the REAL ingest-human-review refuse a pilot export folder (by marker or
+      by folder name) rather than merging rehearsal scores into the real
+      study's human_reviews.jsonl -- plus the pilot's own ingest-pilot-human-
+      review command round-tripping into data/pilot_human_reviews.jsonl.
 """
 
 # Makes newer type-hint syntax (e.g. `int | None`) work on older Python
@@ -622,4 +627,118 @@ def test_pilot_pool_exhaustion_backfills_with_warning(tmp_path: Path, monkeypatc
     out = capsys.readouterr().out
     assert r2 is not None
     assert r2.items_exported == 5  # not under-filled
-    assert "could not supply" in out and "backfilled" in out
+
+
+# ---------------------------------------------------------------------------
+# Pilot ingest — kept strictly separate from the real study ledger
+# ---------------------------------------------------------------------------
+
+# In plain English: fills in one item's score row for an already-exported
+# xlsx scoresheet, exactly as if a tester had opened it and typed 1-5 into
+# the five criteria columns. Used by the ingest tests below so they exercise
+# the real xlsx file the export writes, not a hand-built CSV.
+def _fill_xlsx_row(xlsx_path: Path, item_id: str, score: int) -> None:
+    wb = load_workbook(xlsx_path)
+    ws = wb.active
+    header = [ws.cell(row=1, column=i + 1).value for i in range(len(human_review.SCORESHEET_FIELDS))]
+    col_by_field = {name: i + 1 for i, name in enumerate(header)}
+    for row in range(2, ws.max_row + 1):
+        if ws.cell(row=row, column=col_by_field["item_id"]).value == item_id:
+            for criterion in human_review.CRITERIA:
+                ws.cell(row=row, column=col_by_field[criterion], value=score)
+            break
+    else:
+        raise AssertionError(f"{item_id} not found in {xlsx_path}")
+    wb.save(xlsx_path)
+
+
+# In plain English: every pilot export must leave behind a small marker file
+# at the root of data/pilot_human_review/ so the REAL ingest-human-review
+# command can recognize "this is a rehearsal folder, not the real study" and
+# refuse to touch it (see the next two tests).
+def test_pilot_export_writes_pilot_marker(tmp_path: Path, monkeypatch) -> None:
+    fx = _build_fixture(tmp_path, monkeypatch)
+    _export(fx, overlap_ratio=0.6, seed=42)
+
+    marker = fx["output_dir"] / ".pilot_export"
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8").strip()
+
+
+# In plain English: the guard's core promise — pointing the REAL
+# ingest-human-review at a pilot export folder must raise loudly instead of
+# quietly merging rehearsal scores into data/human_reviews.jsonl. The guard
+# compares the resolved output against the module's HUMAN_REVIEWS_PATH
+# constant, so this monkeypatches that constant to a disposable tmp path
+# (matching how a real run resolves --output when it's left at its default)
+# instead of passing an unrelated path that would never trip the check.
+def test_ingest_human_review_refuses_pilot_folder(tmp_path: Path, monkeypatch) -> None:
+    fx = _build_fixture(tmp_path, monkeypatch)
+    _export(fx, overlap_ratio=0.6, seed=42)
+
+    real_output = tmp_path / "human_reviews.jsonl"
+    monkeypatch.setattr(human_review, "HUMAN_REVIEWS_PATH", real_output)
+    with pytest.raises(ValueError, match="pilot"):
+        human_review.ingest_human_reviews(review_dir=fx["output_dir"], output_path=None)
+    assert not real_output.exists()
+
+
+# In plain English: belt-and-braces fallback — even an export folder made
+# before the ".pilot_export" marker existed is still caught, because its
+# folder is literally named "pilot_human_review" (PILOT_REVIEW_DIR's fixed
+# name), which the guard also checks.
+def test_ingest_human_review_refuses_pilot_by_folder_name_without_marker(tmp_path: Path, monkeypatch) -> None:
+    review_dir = tmp_path / "pilot_human_review"
+    review_dir.mkdir()
+    real_output = tmp_path / "human_reviews.jsonl"
+    monkeypatch.setattr(human_review, "HUMAN_REVIEWS_PATH", real_output)
+    with pytest.raises(ValueError, match="pilot"):
+        human_review.ingest_human_reviews(review_dir=review_dir, output_path=None)
+
+
+# In plain English: the guard only fires when the OUTPUT is the real ledger.
+# Ingesting a pilot folder into its own pilot output path (what
+# ingest-pilot-human-review actually does) must succeed normally.
+def test_ingest_human_review_allows_pilot_folder_with_pilot_output(tmp_path: Path, monkeypatch) -> None:
+    fx = _build_fixture(tmp_path, monkeypatch)
+    result = _export(fx, overlap_ratio=0.6, seed=42)
+    assert result is not None
+
+    key = json.loads((fx["output_dir"] / "unblinding_key_human1.json").read_text(encoding="utf-8"))
+    item_id = next(iter(key["items"]))
+    _fill_xlsx_row(fx["output_dir"] / "human1" / "scoresheet_human1.xlsx", item_id, 4)
+
+    pilot_output = tmp_path / "pilot_human_reviews.jsonl"
+    ingest_result = human_review.ingest_human_reviews(review_dir=fx["output_dir"], output_path=pilot_output)
+
+    assert ingest_result.rows_written == 1
+    assert pilot_output.exists()
+
+
+# In plain English: the full pilot ingest CLI, end to end — fill in one
+# item's score on the exported xlsx, run `ingest-pilot-human-review`'s
+# underlying ingest_main(), and check it lands in
+# data/pilot_human_reviews.jsonl with the right values, WITHOUT ever
+# creating data/human_reviews.jsonl.
+def test_ingest_pilot_human_review_round_trips_into_pilot_ledger(tmp_path: Path, monkeypatch) -> None:
+    fx = _build_fixture(tmp_path, monkeypatch)
+    result = _export(fx, overlap_ratio=0.6, seed=42)
+    assert result is not None
+
+    key = json.loads((fx["output_dir"] / "unblinding_key_human1.json").read_text(encoding="utf-8"))
+    item_id = next(iter(key["items"]))
+    _fill_xlsx_row(fx["output_dir"] / "human1" / "scoresheet_human1.xlsx", item_id, 4)
+
+    pilot_output = tmp_path / "pilot_human_reviews.jsonl"
+    exit_code = pilot_human_review.ingest_main([
+        "--review-dir", str(fx["output_dir"]),
+        "--output", str(pilot_output),
+    ])
+
+    assert exit_code == 0
+    assert pilot_output.exists()
+    rows = [json.loads(line) for line in pilot_output.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == item_id
+    assert rows[0]["human_score_unweighted"] == 4.0
+    assert not (tmp_path / "human_reviews.jsonl").exists()

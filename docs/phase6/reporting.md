@@ -89,7 +89,10 @@ python llm-sum/run_phase3.py stats-engine --markdown
 which accepts its own `--subscription-price-usd` / `--papers-per-month`
 overrides (see §5) alongside the same `--evaluations` / `--summaries` /
 `--human-reviews` / `--json` / `--markdown` / `--no-save` flags as the other
-Phase 6 commands.
+Phase 6 commands. Point `--human-reviews` at `data/pilot_human_reviews.jsonl`
+on any of `eval-report`, `report-figures`, or `stats-engine` to inspect pilot
+rehearsal results instead of the real study (see
+[`docs/phase5/pilot_human_review.md`](../phase5/pilot_human_review.md) §5).
 
 ## 3. How to read the numbers
 
@@ -188,12 +191,28 @@ rate live in different tables today; this section joins them **and** adds
 Cohen's Kappa, one table per (provider × species / study_design / journal)
 cell:
 
-- **Hallucination rate** — share of that provider's summaries in that stratum
-  value with at least one unsupported claim.
+- **Hallucination rate** — the headline number is a **majority-of-judges
+  verdict**: share of that provider's summaries in that stratum value where
+  *more than half* of the judges who scored the item flagged an unsupported
+  claim (with a single judge — normal on this corpus, since resume is per
+  `(doi, summariser, judge)` — that judge's call stands alone). Majority
+  rather than "any judge flagged it" because inter-judge agreement on
+  hallucination is low: on this project's corpus "any judge flagged it" marks
+  80.6% of items while "most judges agreed" marks only 6.5%, so OR would
+  mostly report "at least one judge was worried" rather than "this summary
+  contains a hallucination." The old any-judge behavior is kept alongside as
+  a separate, explicitly upper-bound companion column,
+  `hallucination_rate_any_judge` — read both together rather than the
+  majority number alone. See `_collapse_flags` in
+  [`llm-sum/report_tables.py`](../../llm-sum/report_tables.py) for the exact
+  logic.
 - **Mean quality** — same unweighted jury score as the rest of this report,
   scoped to that cell.
 - **Cohen's Kappa** (+ n) — agreement between the LLM judge and a human
   reviewer on that cell's items, from `data/human_reviews.jsonl` (Phase 5).
+  Point `--human-reviews` at `data/pilot_human_reviews.jsonl` instead to
+  inspect pilot rehearsal results rather than the real study (see
+  [`docs/phase5/pilot_human_review.md`](../phase5/pilot_human_review.md) §5).
   See [`docs/statistics_explained.md`](../statistics_explained.md#part-45--cohens-kappa-and-percent-agreement)
   for what Kappa measures and why it's different from Krippendorff's alpha.
 
@@ -304,6 +323,9 @@ nothing here is a new statistic:
   small — the coefficient is shown for transparency but the same
   underpowered-sample caveat from `reliability.MIN_CORRELATION_N` applies
   (see [`docs/phase5/human_validation.md`](../phase5/human_validation.md)).
+  Point `--human-reviews` at `data/pilot_human_reviews.jsonl` to inspect
+  pilot rehearsal results instead of the real study (see
+  [`docs/phase5/pilot_human_review.md`](../phase5/pilot_human_review.md) §5).
 
 **The figures**, one per PNG/SVG pair:
 

@@ -151,9 +151,14 @@ below can do that.
 | Safety | 4.67 | 1 | 3 |
 ```
 
-This table only appears when more than one judge scored this summary (the
-default setup uses a 3-judge panel). It answers: **for this one summary, how
-much did the AI judges agree with each other?**
+The table header and the two overall **Jury score** rows always appear, even
+with a single judge (the default setup uses a 3-judge panel). Each of the
+five per-criterion rows below them is shown only when **2 or more** judges
+scored *that specific criterion* — a criterion only one judge scored is
+skipped for that row, since a spread of one value is meaningless, but the
+other criteria (and the two Jury score rows) still print normally. It
+answers: **for this one summary, how much did the AI judges agree with each
+other?**
 
 | Column | Meaning |
 |---|---|
