@@ -11,6 +11,8 @@ Critical assertions:
 
 from __future__ import annotations
 
+import pytest
+
 import reliability
 from reliability import (
     compute_reliability,
@@ -167,3 +169,90 @@ def test_multi_judge_handles_missing_judge_on_some_items() -> None:
     assert result["n_judges"] == 3
     assert result["n_comparable_items"] == 2
     assert has_multiple_judges(rows)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b.8 — the alpha verdict needs a minimum-n gate, like its sibling
+# ---------------------------------------------------------------------------
+
+def test_interpret_alpha_bands() -> None:
+    """Krippendorff's own cutoffs, at and around each boundary (n large enough
+    that the underpowered gate never fires)."""
+    from reliability import _interpret_alpha
+
+    n = 50
+    assert "Strong agreement" in _interpret_alpha(0.80, n)
+    assert "Strong agreement" in _interpret_alpha(0.95, n)
+    assert "Acceptable agreement" in _interpret_alpha(0.667, n)
+    assert "Acceptable agreement" in _interpret_alpha(0.79, n)
+    assert "Weak agreement" in _interpret_alpha(0.0, n)
+    assert "Weak agreement" in _interpret_alpha(0.5, n)
+    assert "Systematic disagreement" in _interpret_alpha(-0.1, n)
+    assert "No agreement estimate" in _interpret_alpha(None, n)
+
+
+def test_interpret_alpha_withholds_verdict_below_min_n() -> None:
+    """A 3-paper pilot must not headline 'jury scores are reliable'."""
+    from reliability import MIN_ALPHA_N, _interpret_alpha
+
+    verdict = _interpret_alpha(0.9, 3)
+    assert "Underpowered" in verdict
+    assert "Strong agreement" not in verdict
+    assert str(MIN_ALPHA_N) in verdict
+    # The coefficient itself stays visible for transparency.
+    assert "0.9" in verdict
+
+
+def test_interpret_alpha_ungated_without_n() -> None:
+    """Omitting n keeps the old behaviour for callers that have no count."""
+    from reliability import _interpret_alpha
+
+    assert "Strong agreement" in _interpret_alpha(0.9)
+
+
+def test_compute_reliability_withholds_verdict_on_small_sample() -> None:
+    """The gate must be wired through compute_reliability, not just available."""
+    from reliability import compute_reliability
+
+    scores = {c: 4 for c in
+              ("faithfulness", "completeness", "clinical_usefulness", "clarity", "safety")}
+    rows = [_jury_row("10.1/x", judge, scores, 4.0) for judge in ("openai", "anthropic")]
+    result = compute_reliability(rows)
+    assert result["available"] is True
+    assert result["n_comparable_items"] == 1
+    assert "Underpowered" in result["interpretation"]
+
+
+# ---------------------------------------------------------------------------
+# External validation of the one hand-rolled statistic
+# ---------------------------------------------------------------------------
+
+def test_krippendorff_alpha_matches_published_reference_value() -> None:
+    """Reproduce Krippendorff's own published worked example.
+
+    krippendorff_alpha_interval is the ONLY statistic in this codebase that is
+    hand-rolled rather than delegated to scipy/sklearn — legitimately, since
+    scipy has no implementation. Every other test of it checks self-consistency
+    or edge cases (all-identical -> 1.0, no variance -> None), which would all
+    still pass if the formula itself were subtly wrong.
+
+    This one pins it to an externally published number: the canonical
+    3-observer x 15-unit reliability matrix from Krippendorff (2011),
+    "Computing Krippendorff's Alpha-Reliability", for which the paper reports
+    alpha_interval = 0.811. Twelve units carry two or more observations; the
+    three singly-observed units drop out, as alpha requires.
+
+    If this fails, the estimator is wrong — not the test data.
+    """
+    observer_a = [None, None, None, None, None, 3, 4, 1, 2, 1, 1, 3, 3, None, 3]
+    observer_b = [1, None, 2, 1, 3, 3, 4, 3, None, None, None, None, None, None, None]
+    observer_c = [None, None, 2, 1, 3, 4, 4, None, 2, 1, 1, 3, 3, None, 4]
+
+    units = [
+        [v for v in triple if v is not None]
+        for triple in zip(observer_a, observer_b, observer_c)
+    ]
+    assert sum(1 for u in units if len(u) >= 2) == 12
+
+    alpha = krippendorff_alpha_interval(units)
+    assert alpha == pytest.approx(0.811, abs=0.001)

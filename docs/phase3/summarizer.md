@@ -72,6 +72,10 @@ Two paths inside the same script:
 | `data/summaries.jsonl`        | One row per paper/input source. Each `models.<provider>` slot: `status`, `summary`, `structured_summary`, `input_tokens`, `output_tokens`, `model_version`, optional `system_fingerprint`, `timestamp`. |
 | `data/summaries_pdf/*.txt`    | Readable `summarize-all` reports for raw PDFs (`single`/`test`); one file per matched article source. `dev` mode writes to `data/dev_tests/summaries_pdf/*.txt` instead. |
 | `data/summaries_txt/*.txt`    | Readable `summarize-all` reports for processed JSONL text (`single`/`test`); one file per matched article source. `dev` mode writes to `data/dev_tests/summaries_txt/*.txt` instead. |
+| `data/dev_summaries_jsonl/*.txt` | Readable **structured-bullet** view of `summaries.jsonl`, one file per paper, written after a `summarize --mode dev` run. List fields are capped for readability (`key_methods` 4, `key_findings` 5, `limitations` 4); `summaries.jsonl` keeps the full lists. `--output-subdir NAME` redirects this to a `NAME/` subfolder with its own skip-existing pool. |
+| `data/dev_summaries_jsonl/prose/*.txt` | Readable **flowing-prose** view of the same papers: the `summary_text` the blind judge scores and human reviewers grade, with a `Summary (prose): N words` line and an `[OVER 400]` flag. The 300-340-word budget applies only here. Kept in a subfolder so the non-recursive `*.txt` readers never count a paper twice. |
+| `data/single_summaries_jsonl/` | Same two surfaces for `summarize --mode single`, for whichever paper that run actually touched. A fully-resumed run writes nothing here and says so. |
+| `data/batch_summaries_jsonl/` | Same two surfaces for `batch` mode, written by `check_batch_status.py` as each provider's results merge back — so the finished corpus is ready for judging and human validation. Rewritten per provider merge (gemini is not batched). |
 | `data/batch_jobs.jsonl`       | One row per submitted batch job (only in `batch` mode).                                 |
 | `data/error_log.jsonl`        | Any retry-exhausted failure.                                                            |
 
@@ -110,9 +114,9 @@ Use this when you want all LLM summaries to follow your preferred structure whil
 | Mode     | What happens                                                                    |
 |----------|---------------------------------------------------------------------------------|
 | `test`   | All API calls return deterministic `_mock_summary(...)` dicts. Output schema is identical to live runs so downstream code never branches. No spend. |
-| `single` | 1 paper, real-time, 3 providers → 3 API calls. For `summarize-all`, 1 matched PDF/JSONL pair → 6 summaries. Prompts for `yes` before the first call. |
+| `single` | 1 paper, real-time, 3 providers → 3 API calls. For `summarize-all`, 1 matched PDF/JSONL pair → 6 summaries. Prompts for `yes` before the first call. Also writes readable output to `data/single_summaries_jsonl/` (+ `prose/`) for the paper it touched. |
 | `dev`    | `PHASE3_DEV_LIMIT` papers for normal `summarize`; for `summarize-all`, the default is also 1 matched PDF/JSONL pair → 6 summaries unless `--limit N` is passed, written to `data/dev_tests/summaries_pdf/` and `data/dev_tests/summaries_txt/` instead of the top-level folders. Same confirm prompt. Budget-guarded. |
-| `batch`  | Full corpus. Builds and submits OpenAI + Anthropic batch JSONL; Gemini still goes through real-time in the same run. Confirm prompt required. |
+| `batch`  | Full corpus. Builds and submits OpenAI + Anthropic batch JSONL; Gemini still goes through real-time in the same run. Confirm prompt required. Readable output appears later, when `check_batch_status.py` merges results back into `data/batch_summaries_jsonl/` (+ `prose/`). |
 
 PDF-vs-JSONL comparison workflow for one matched DOI/title:
 

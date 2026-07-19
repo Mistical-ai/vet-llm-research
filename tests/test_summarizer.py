@@ -138,6 +138,38 @@ def test_shared_prompt_mode_returns_same_template_for_each_provider(
     assert "{ARTICLE_TEXT}" in templates["openai"]
 
 
+# Under PROMPT_MODE=provider_specific each provider gets its own prompt file.
+# Those files are allowed to differ in voice and structure — that is the point
+# of the mode — but they must not differ in the SUBSTANTIVE instructions, or the
+# providers are no longer being compared on equal terms and the study's
+# head-to-head result stops meaning what it claims to mean.
+#
+# This drifted once already: anthropic and gemini were stale copies missing the
+# key_findings guidance, the EEG/histopathology limitations instruction, and the
+# word budget, because a later edit only touched the shared prompt's Rules line.
+@pytest.mark.parametrize("required", [
+    # (what it governs, a phrase that must appear in every prompt)
+    ("word budget ceiling", "400 words"),
+    ("word budget target", "300-340 words"),
+    ("confirmatory-test limitations", "electroencephalography"),
+])
+def test_every_summarisation_prompt_carries_the_same_substantive_guidance(
+    required: tuple[str, str],
+) -> None:
+    label, phrase = required
+    prompt_paths = [summarizer.PROMPT_FILE, *summarizer.PROVIDER_PROMPT_FILES.values()]
+
+    missing = [
+        p.name for p in prompt_paths
+        if phrase.lower() not in p.read_text(encoding="utf-8").lower()
+    ]
+    assert not missing, (
+        f"{label}: {missing} do not mention {phrase!r}. Provider prompts may "
+        f"differ in wording and structure, but dropping a substantive "
+        f"instruction makes the provider comparison unfair."
+    )
+
+
 def test_provider_specific_prompt_mode_loads_distinct_templates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1348,6 +1380,73 @@ def test_summarize_all_pdfs_resume_skips_successful_slots(
     assert counts_resume["success"] == 0
 
 
+# The test above feeds resume a hand-written legacy paper.json — a file the
+# writer never actually produces. That proved the legacy *reader* worked while
+# leaving the real round-trip untested, which is how --resume stayed a no-op:
+# _write_folder_output wrote .txt, _load_folder_output looked for .json, and
+# every "resumed" run silently re-paid for all three providers.
+#
+# This test closes that gap by running summarize-all for real and then resuming
+# from whatever it actually left on disk.
+def test_summarize_all_pdfs_resume_round_trips_its_own_output(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "paper.pdf").write_bytes(b"%PDF-1.4")
+    pdf_output = tmp_path / "summaries_pdf"
+
+    first = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai", "anthropic", "gemini"],
+        resume=True,
+    )
+    assert first["success"] == 3, "first run should summarise all three providers"
+    assert first["skipped"] == 0
+
+    second = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output,
+        raw_dir=raw_dir,
+        providers=["openai", "anthropic", "gemini"],
+        resume=True,
+    )
+    assert second["skipped"] == 3, (
+        "resume did not recognise the previous run's own output — every "
+        "provider would be called and paid for a second time."
+    )
+    assert second["success"] == 0
+
+
+# Under the default SUMMARIZE_ALL_UNIQUE_OUTPUT=true each run writes a NEW
+# timestamped .txt, so resume state cannot live in the .txt filename. The
+# sidecar is keyed on the unsuffixed stem precisely so resume survives that.
+def test_summarize_all_pdfs_resume_works_with_unique_output_suffix(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "paper.pdf").write_bytes(b"%PDF-1.4")
+    pdf_output = tmp_path / "summaries_pdf"
+
+    summarizer.summarize_all_pdfs(
+        output_dir=pdf_output, raw_dir=raw_dir, providers=["openai"],
+        resume=True, output_suffix="run_20260101T000000Z",
+    )
+    second = summarizer.summarize_all_pdfs(
+        output_dir=pdf_output, raw_dir=raw_dir, providers=["openai"],
+        resume=True, output_suffix="run_20260102T000000Z",
+    )
+
+    assert second["skipped"] == 1, (
+        "a differently-suffixed run could not find the earlier result"
+    )
+    # Both runs still leave their own visible .txt behind.
+    assert len(sorted(pdf_output.glob("*.txt"))) == 2
+    # ...and the sidecar stays out of the readable surface.
+    assert not any(p.name.startswith(".") for p in pdf_output.glob("*.txt"))
+
+
 def test_summarize_all_pdfs_limit_respected(tmp_path: Path) -> None:
     """limit= processes only the first N PDFs."""
     raw_dir = tmp_path / "raw"
@@ -2013,3 +2112,170 @@ def test_load_folder_output_reads_legacy_json(tmp_path: Path) -> None:
 
 def test_load_folder_output_returns_none_when_missing(tmp_path: Path) -> None:
     assert summarizer._load_folder_output(tmp_path, "nonexistent") is None
+
+
+# ---------------------------------------------------------------------------
+# Dry-run guard on the summaries rewrite path
+# ---------------------------------------------------------------------------
+#
+# WHY THIS MATTERS MORE THAN THE EVALUATIONS GUARD: data/summaries.jsonl is
+# NOT append-only. _write_all_summaries rewrites the whole file, and
+# load_existing_summaries merges new results into existing rows per
+# (doi, provider) slot. So a dry-run summarize would splice "[MOCK ...]" text
+# into the real rows and replace production IN PLACE, destroying the
+# originals. The 2026-07-09 evaluations incident was diagnosable only because
+# appending left the real rows intact beside the mocks; here there would be
+# nothing left to compare against.
+
+
+def _real_entry(doi: str = "10.9999/real.0001") -> dict:
+    return {
+        "doi": doi, "input_source": "processed",
+        "models": {"openai": {"model_version": "gpt-5.4-2026-03-05",
+                              "summary_text": "Real clinician summary.",
+                              "status": "success"}},
+    }
+
+
+def _mock_entry(doi: str = "10.9999/mock.0001") -> dict:
+    return {
+        "doi": doi, "input_source": "processed",
+        "models": {"openai": {"model_version": "gpt-5.4-DRYRUN",
+                              "summary_text": "[MOCK gpt-5.4] placeholder",
+                              "status": "success"}},
+    }
+
+
+def test_dry_run_write_leaves_production_summaries_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hazard is in-place slot overwrite, which a row COUNT would miss.
+
+    Asserting on bytes is deliberate: a mock slot spliced into an existing
+    row leaves the file with exactly the same number of lines.
+    """
+    production = tmp_path / "summaries.jsonl"
+    original = json.dumps(_real_entry()) + "\n"
+    production.write_text(original, encoding="utf-8")
+    before = production.read_bytes()
+
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", production)
+    monkeypatch.setattr(summarizer, "resolve_mode",
+                        lambda *a, **k: SimpleNamespace(dry_run=True))
+
+    # A merged payload where the mock has overwritten the real slot — exactly
+    # what a dry-run resume would produce.
+    payload = {"k1": _mock_entry("10.9999/real.0001")}
+    summarizer._write_all_summaries(production, payload)
+
+    assert production.read_bytes() == before, "dry-run overwrote production"
+    redirected = tmp_path / "summaries_dryrun.jsonl"
+    assert redirected.exists()
+    assert "[MOCK" in redirected.read_text(encoding="utf-8")
+
+
+def test_dry_run_slot_diverts_even_when_mode_reports_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Second, independent signal: the payload itself.
+
+    Mode alone is sufficient today; this catches a future bug that stamps
+    mock slots while the mode still reports live.
+    """
+    production = tmp_path / "summaries.jsonl"
+    production.write_text(json.dumps(_real_entry()) + "\n", encoding="utf-8")
+    before = production.read_bytes()
+
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", production)
+    monkeypatch.setattr(summarizer, "resolve_mode",
+                        lambda *a, **k: SimpleNamespace(dry_run=False))
+
+    summarizer._write_all_summaries(production, {"k1": _mock_entry()})
+
+    assert production.read_bytes() == before
+    assert (tmp_path / "summaries_dryrun.jsonl").exists()
+
+
+def test_dry_run_writes_normally_when_nothing_real_to_destroy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard is narrow ON PURPOSE: no real work, no diversion.
+
+    Diverting every dry-run write would leave the run writing one file while
+    every downstream step (readable-folder writers, evaluate's dataset hash,
+    batch merge, status) read another — a fragmented pipeline bought for no
+    extra safety, since overwriting an absent or already-mock file destroys
+    nothing.
+    """
+    production = tmp_path / "summaries.jsonl"  # does not exist yet
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", production)
+    monkeypatch.setattr(summarizer, "resolve_mode",
+                        lambda *a, **k: SimpleNamespace(dry_run=True))
+
+    summarizer._write_all_summaries(production, {"k1": _mock_entry()})
+
+    assert production.exists()
+    assert not (tmp_path / "summaries_dryrun.jsonl").exists()
+
+    # A second dry-run over a mock-only file is likewise free to proceed.
+    summarizer._write_all_summaries(production, {"k1": _mock_entry("10.9999/mock.0002")})
+    assert not (tmp_path / "summaries_dryrun.jsonl").exists()
+
+
+def test_live_run_still_writes_production_summaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard must not block a real run."""
+    production = tmp_path / "summaries.jsonl"
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", production)
+    monkeypatch.setattr(summarizer, "resolve_mode",
+                        lambda *a, **k: SimpleNamespace(dry_run=False))
+
+    summarizer._write_all_summaries(production, {"k1": _real_entry()})
+
+    assert production.exists()
+    assert not (tmp_path / "summaries_dryrun.jsonl").exists()
+
+
+def test_resume_treats_mock_slot_as_work_still_to_do() -> None:
+    """A dry-run leftover must not stand in for a real summary on --resume.
+
+    Answered here rather than by filtering load_existing_summaries: that
+    loader also feeds the readable-folder writers, evaluate's candidate
+    lookup and the batch merge, so blanking slots there would empty the whole
+    dry-run pipeline.
+    """
+    mock_slot = {"status": "success", "model_version": "gpt-5.4-DRYRUN",
+                 "summary_text": "[MOCK gpt-5.4] placeholder"}
+    real_slot = {"status": "success", "model_version": "gpt-5.4-2026-03-05",
+                 "summary_text": "Real clinician summary."}
+
+    with patch.object(summarizer, "resolve_mode",
+                      lambda *a, **k: SimpleNamespace(dry_run=False)):
+        assert summarizer._slot_is_done(mock_slot) is False  # live: redo it
+        assert summarizer._slot_is_done(real_slot) is True
+        assert summarizer._slot_is_done({"status": "failed"}) is False
+
+    # Inside a dry run the mock IS the expected output, so resume accepts it —
+    # otherwise test mode could never resume at all.
+    with patch.object(summarizer, "resolve_mode",
+                      lambda *a, **k: SimpleNamespace(dry_run=True)):
+        assert summarizer._slot_is_done(mock_slot) is True
+
+
+def test_load_existing_summaries_returns_slots_verbatim(tmp_path: Path) -> None:
+    """The shared loader must not filter — downstream readers need mock rows.
+
+    In dry-run every slot is a mock; a loader that dropped them would leave
+    readable output and evaluate candidates empty.
+    """
+    ledger = tmp_path / "summaries.jsonl"
+    ledger.write_text(json.dumps(_mock_entry()) + "\n"
+                      + json.dumps(_real_entry()) + "\n", encoding="utf-8")
+
+    loaded = summarizer.load_existing_summaries(ledger)
+
+    assert len(loaded) == 2
+    texts = {e["models"]["openai"]["summary_text"] for e in loaded.values()}
+    assert "[MOCK gpt-5.4] placeholder" in texts
+    assert "Real clinician summary." in texts

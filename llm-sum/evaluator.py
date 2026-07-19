@@ -351,11 +351,60 @@ def _clamp(value: Any, lo: int, hi: int) -> int:
     An LLM occasionally returns 0 or a value outside the specified range.
     Without clamping, a score of 0 on a 1-3 scale would silently lower the
     composite and skew all downstream statistics.
+
+    Unparseable input falls back to ``lo``. That is right for the legacy
+    Vet-Score v2.0 path (see calculate_composite_score) which has no way to
+    represent "absent", but WRONG for the MedHELM criteria — use
+    ``_coerce_score`` there, which distinguishes the two.
     """
     try:
         return max(lo, min(hi, int(value)))
     except (TypeError, ValueError):
         return lo
+
+
+def _hallucination_count(halluc_block: dict, claims: list) -> int:
+    """Reconcile the judge's stated count against the claims it actually listed.
+
+    Two traps here. First, ``dict.get("count", default)`` does NOT fall back
+    when the key is present but null — a judge answering ``"count": null``
+    reached ``int(None)`` and crashed the whole response. Second, the stated
+    count and the claims list can disagree; the claims are the evidence, so a
+    count that undercounts them is raised to match. A count ABOVE the listed
+    claims is kept, since a judge may legitimately report claims it did not
+    enumerate individually.
+    """
+    stated = halluc_block.get("count")
+    try:
+        stated_int = int(stated)
+    except (TypeError, ValueError):
+        return len(claims)
+    return max(stated_int, len(claims))
+
+
+def _coerce_score(value: Any, lo: int, hi: int) -> float | int | None:
+    """Clamp a score to [lo, hi], or return None when it isn't a score at all.
+
+    The distinction ``_clamp`` cannot make: a judge that returned 9 gave a
+    score (clamp it to 5); a judge that returned null, "n/a" or "4/5", or
+    omitted the criterion entirely, gave NO score. Collapsing the second case
+    onto the floor states the worst possible result on the judge's behalf and
+    keeps full weight in the denominator, so a parse failure is indistinguishable
+    from a genuine 1 and drags every downstream mean toward it.
+
+    Fractional values are preserved rather than truncated, and an integral
+    result is returned as an ``int`` so ordinary judge output (1-5 integers)
+    keeps its existing shape in the JSONL. Truncating would silently corrupt
+    the averaged criterion scores that report_tables produces when one judge
+    rated the same item twice — a merged 4.5 must not become 4.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        clamped = max(float(lo), min(float(hi), float(value)))
+    except (TypeError, ValueError):
+        return None
+    return int(clamped) if clamped.is_integer() else clamped
 
 
 def calculate_composite_score(scores: dict) -> float:
@@ -411,19 +460,56 @@ def calculate_jury_score(criteria_scores: dict, *,
     # 1.5) — look up the judge's score for that criterion, clamp it into
     # range, and add "score x weight" to a running total (and the weight
     # itself to a separate running total, used as the divisor below).
+    #
+    # A criterion the judge never scored contributes to NEITHER total, so the
+    # average renormalizes over the criteria actually present. Previously a
+    # missing criterion was imputed as 1 while keeping its full weight in the
+    # divisor: with faithfulness (weight 1.5 of 5.5) absent and the other four
+    # scored 4, that produced 3.18 instead of 4.00. This matches how
+    # human_review scores a partially-filled reviewer sheet, which is what lets
+    # the human and LLM composites be correlated against each other at all.
     for criterion, weight in resolved_weights.items():
         raw_value = criteria_scores.get(criterion)
         if isinstance(raw_value, dict):
             raw_value = raw_value.get("score")
-        score = _clamp(raw_value, 1, 5)
+        score = _coerce_score(raw_value, 1, 5)
+        if score is None:
+            continue
         weighted_sum += score * weight
         weight_total += weight
     if weight_total == 0:
-        return 0.0
+        # No criterion was scored at all — there is no composite to report.
+        # None (not 0.0) so downstream means exclude it instead of averaging in
+        # a value below the bottom of the 1-5 scale.
+        return None
     return round(weighted_sum / weight_total, 2)
 
 
-def scale_jury_to_quality_score(jury_score: float) -> int:
+def missing_criteria(criteria_scores: dict,
+                     *, weights: dict[str, float] | None = None) -> list[str]:
+    """Which criteria carry no usable score, in the canonical weight order.
+
+    Companion to ``calculate_jury_score`` — that function silently renormalizes
+    over what is present, so this reports what was absent. Written onto every
+    parsed row as ``missing_criteria`` so a partially-scored judgement is
+    visible in the data rather than only in the arithmetic.
+
+    Kept as a sibling rather than a second return value from
+    ``calculate_jury_score`` so that function keeps returning a bare score and
+    its callers (and their tests) do not have to unpack a tuple.
+    """
+    resolved_weights = weights or MEDHELM_CRITERION_WEIGHTS
+    absent: list[str] = []
+    for criterion in resolved_weights:
+        raw_value = criteria_scores.get(criterion)
+        if isinstance(raw_value, dict):
+            raw_value = raw_value.get("score")
+        if _coerce_score(raw_value, 1, 5) is None:
+            absent.append(criterion)
+    return absent
+
+
+def scale_jury_to_quality_score(jury_score: float | None) -> int:
     """Map the 1-5 jury scale to the legacy 1-10 quality_score field.
 
     IN PLAIN ENGLISH: Converts the current 1-5 jury_score into the older
@@ -433,7 +519,9 @@ def scale_jury_to_quality_score(jury_score: float) -> int:
     The legacy field is retained so older analysis scripts do not crash, but
     new analysis should prefer `jury_score` for MedHELM-style rows.
     """
-    if jury_score <= 0:
+    # None means no criterion was scored at all, which is exactly the
+    # "unreadable judgement" case the 99 sentinel exists to mark.
+    if jury_score is None or jury_score <= 0:
         return SCORE_SENTINEL_MALFORMED
     return int(round(((jury_score - 1) / 4) * 9 + 1))
 
@@ -506,13 +594,21 @@ def _normalize_criteria_scores(raw_scores: Any) -> dict[str, dict[str, Any]]:
 
     IN PLAIN ENGLISH: Cleans up whatever the judge sent back for the five
     criteria into one consistent, predictable shape — always exactly five
-    criteria, each with a valid 1-5 score and a reasoning note (even if the
-    judge's raw answer was missing a criterion or used the wrong data type).
+    criteria, each with a reasoning note and either a valid 1-5 score or None
+    when the judge did not give one.
 
     Judges occasionally omit a criterion or return a string instead of an
-    integer. We fill missing criteria with the lowest valid score rather than
-    dropping the row, because a malformed partial response should be
-    conservative and visible in downstream review.
+    integer. The score is then ``None``, NOT 1. Filling it with the lowest
+    valid score reads as "the judge said this summary is terrible on
+    faithfulness" when the judge in fact said nothing, and — because the
+    criterion kept full weight in the composite's divisor — dragged every
+    downstream mean toward the floor with no flag to find it by.
+
+    All five keys are always present so the record shape never varies; absence
+    is expressed by ``score: None`` and reported separately by
+    ``missing_criteria``. Consumers must therefore isinstance-check the score
+    before arithmetic (report_tables._criterion_scores and
+    reliability._criterion_value both already do).
     """
     normalized: dict[str, dict[str, Any]] = {}
     source = raw_scores if isinstance(raw_scores, dict) else {}
@@ -528,7 +624,7 @@ def _normalize_criteria_scores(raw_scores: Any) -> dict[str, dict[str, Any]]:
             score = item
             reasoning = ""
         normalized[criterion] = {
-            "score": _clamp(score, 1, 5),
+            "score": _coerce_score(score, 1, 5),
             "reasoning": reasoning,
         }
     return normalized
@@ -644,20 +740,25 @@ def parse_judge_response(raw_text: str) -> dict:
             "jury_score": jury_score,
             "jury_score_weighted": jury_score_weighted,
             "jury_score_unweighted": jury_score_unweighted,
+            # Which criteria the judge left unscored. Empty on the happy path.
+            # The composite above renormalizes over what IS present, so without
+            # this the renormalization would be invisible in the stored row.
+            "missing_criteria": missing_criteria(criteria_scores),
             "jury_aggregation_mode": JURY_AGGREGATION_MODE,
             "judge_count": 1,
             "valid_judge_count": 1,
             "judge_disagreement": 0.0,
             # Legacy dimensional aliases keep existing notebooks readable. They
             # are not the primary MedHELM scores; new analysis should use
-            # criteria_scores and jury_score.
+            # criteria_scores and jury_score. None when the judge omitted that
+            # criterion — the aliases inherit the same absent-vs-1 distinction.
             "factual_accuracy": criteria_scores["faithfulness"]["score"],
             "completeness": criteria_scores["completeness"]["score"],
             "clinical_relevance": criteria_scores["clinical_usefulness"]["score"],
             "organization": criteria_scores["clarity"]["score"],
             "composite_score": jury_score,
             "hallucination_present": bool(halluc_block.get("present", len(claims) > 0)),
-            "hallucination_count": int(halluc_block.get("count", len(claims))),
+            "hallucination_count": _hallucination_count(halluc_block, claims),
             "hallucination_claims": claims,
             "hallucination_categories": list({c.get("category", "") for c in claims if c.get("category")}),
             "confidence_score": confidence,
@@ -691,7 +792,7 @@ def parse_judge_response(raw_text: str) -> dict:
             "organization":       _clamp(obj.get("organization",       1), 1, 3),
             "composite_score":    composite,
             "hallucination_present":   bool(halluc_block.get("present", len(claims) > 0)),
-            "hallucination_count":     int(halluc_block.get("count", len(claims))),
+            "hallucination_count":     _hallucination_count(halluc_block, claims),
             "hallucination_claims":    claims,
             "hallucination_categories": list({c.get("category", "") for c in claims if c.get("category")}),
             "confidence_score": confidence,
@@ -907,8 +1008,92 @@ def _mock_judge_response(provider: str, reference_text: str,
         "raw_text": json.dumps(fake_payload),
         "input_tokens": max(200, len(reference_text) // 4),
         "output_tokens": 120,
-        "model_version": f"{spec.model_id}-DRYRUN",
+        "model_version": f"{spec.model_id}{DRY_RUN_MODEL_SUFFIX}",
     }
+
+
+# ---------------------------------------------------------------------------
+# Dry-run contamination guards
+# ---------------------------------------------------------------------------
+
+# WHY THIS EXISTS: on 2026-07-09 a PHASE3_MODE=test run appended 16 mock rows
+# to data/evaluations.jsonl. Nothing downstream distinguished them from real
+# judge output, so every report for the next five days averaged hash-derived
+# scores in with real ones, and one paper (10.1111/jvim.16872) was locked out
+# of ever being judged because the resume check saw its mock row and skipped
+# it. These predicates are the single definition of "this came from a mock",
+# shared by every reader and writer so the two can never drift apart.
+
+# The suffix _mock_judge_response (above) and summarizer._mock_summary_payload
+# both stamp onto model_version. Matching the suffix rather than a specific
+# model id means a model upgrade cannot silently defeat the filter.
+DRY_RUN_MODEL_SUFFIX = "-DRYRUN"
+
+# Secondary signal: the mock's fixed reasoning string. Catches a row that
+# somehow lost its model_version but kept its body.
+DRY_RUN_REASONING = "[MOCK] dry-run evaluation"
+
+
+def dry_run_sibling(path: Path) -> Path:
+    """Where a dry-run write goes instead of ``path``: a ``_dryrun`` sibling.
+
+    Derived from the target rather than hardcoded to data/, so redirecting
+    stays inside whatever directory the caller was already writing to. A
+    fixed constant would send a test writing to a tmp path into the real
+    data/ folder instead — the guard must not itself become a way to write
+    somewhere unexpected.
+    """
+    return path.with_name(f"{path.stem}_dryrun{path.suffix}")
+
+
+def is_dry_run_row(row: Any) -> bool:
+    """True when an evaluation row came from the dry-run mock, not a judge.
+
+    IN PLAIN ENGLISH: answers "was this score made up by the offline test
+    stand-in instead of a real AI judge?" Mock rows must never reach a report,
+    a resume decision, or the production ledger.
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("judge_model_version") or "").endswith(DRY_RUN_MODEL_SUFFIX):
+        return True
+    return str(row.get("reasoning") or "").strip() == DRY_RUN_REASONING
+
+
+def is_dry_run_slot(slot: Any) -> bool:
+    """True when a summaries.jsonl per-provider model slot holds mock output.
+
+    Summaries carry the dry-run marker one level down — inside each provider's
+    slot under ``models`` — rather than at row level, so the row-shaped
+    predicate above does not apply.
+    """
+    if not isinstance(slot, dict):
+        return False
+    return str(slot.get("model_version") or "").endswith(DRY_RUN_MODEL_SUFFIX)
+
+
+def is_production_path(candidate: Path | None, canonical: Path) -> bool:
+    """True when ``candidate`` refers to the same file as ``canonical``.
+
+    IN PLAIN ENGLISH: "is the caller about to write to the real data file?"
+
+    Compares fully resolved, case-normalised paths rather than the Path
+    objects themselves. A bare ``==`` would let ``DATA_DIR / "evaluations.jsonl"``
+    slip past ``EVALUATIONS_PATH`` even though both name one file, and this
+    repo lives on a OneDrive-backed Windows path where case-insensitivity and
+    reparse points make raw Path equality unreliable. A path that cannot be
+    resolved (permissions, a vanished parent) is treated as NOT production:
+    the guard should never crash a run, and the fallback is a redirect target
+    rather than the real ledger.
+    """
+    if candidate is None:
+        return True  # None means "use the default", which is the production file
+    try:
+        left = os.path.normcase(os.path.realpath(str(candidate)))
+        right = os.path.normcase(os.path.realpath(str(canonical)))
+    except (OSError, ValueError):
+        return False
+    return left == right
 
 
 def call_judge(provider: str, reference_text: str, candidate_summary: str,
@@ -1135,6 +1320,17 @@ def build_evaluation_row(*, doi: str, summariser: str, judge: str,
 # written, this function never goes back and edits or deletes older rows.
 def append_evaluation(row: dict, path: Path | None = None) -> None:
     resolved = path if path is not None else EVALUATIONS_PATH
+
+    # Dry-run rows must never enter the production ledger. This is keyed off
+    # "is the target the real file?" rather than "was path omitted?" because
+    # check_batch_status calls append_evaluation(row, EVALUATIONS_PATH) with
+    # the path explicit — a `path is None` test would miss it entirely.
+    # Redirect rather than drop, so test mode still leaves an audit trail.
+    # Never raises: a test-mode run must still complete.
+    if is_dry_run_row(row) and is_production_path(path, EVALUATIONS_PATH):
+        resolved = dry_run_sibling(EVALUATIONS_PATH)
+        print(f"[phase3] dry-run row → {resolved.name} (not production)")
+
     resolved.parent.mkdir(parents=True, exist_ok=True)
     with open(resolved, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1175,8 +1371,23 @@ def _rows_by_doi_for(
     are grouped identically regardless of which mirror is being written.
     """
     source = evaluations_path if evaluations_path is not None else EVALUATIONS_PATH
+
+    # In a LIVE run, mock rows are strays and must never print "[MOCK] ..."
+    # reasoning beside real judge output. In a DRY run they are the expected
+    # content — and they live in the _dryrun sibling the write guard diverted
+    # them to — so read that instead and keep them. Otherwise test mode would
+    # always produce empty mirrors.
+    dry_run = resolve_mode().dry_run
+    sources = [source]
+    if dry_run:
+        sibling = dry_run_sibling(source)
+        if sibling != source:
+            sources.append(sibling)
+
     rows_by_doi: dict[str, list[dict]] = {}
-    for row in _iter_summaries(source):  # generic JSONL iterator, reused here
+    for row in (r for s in sources for r in _iter_summaries(s)):
+        if not dry_run and is_dry_run_row(row):
+            continue
         doi = str(row.get("doi", "")).strip()
         if doi and doi in dois:
             # `.setdefault(doi, [])` means "if this DOI doesn't have a list
@@ -1624,6 +1835,12 @@ def already_evaluated(doi: str, summariser: str, judge: str,
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            # A mock row is not evidence that this pair was ever judged.
+            # Before this check existed, a dry-run row satisfied the resume
+            # key exactly (same doi/summarizer/judge/rubric_version) and made
+            # a real, unjudged paper look complete forever.
+            if is_dry_run_row(row):
                 continue
             if (row.get("doi") == doi
                     and (row.get("input_source") or "processed") == input_source

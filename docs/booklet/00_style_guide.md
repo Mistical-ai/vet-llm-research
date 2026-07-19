@@ -6,6 +6,14 @@ separate chat sessions, add up to one coherent booklet instead of nine
 documents stapled together. If you are about to write a chapter, read this
 whole file before touching source material.
 
+> **`BOOKLET.md` is a hand-merged copy, not a generated one.** There is no
+> build script that concatenates the numbered chapter files into
+> `BOOKLET.md` — the merge was done by hand and must be maintained by hand.
+> Any edit to a chapter file must be mirrored into the corresponding section
+> of `BOOKLET.md` **in the same commit**, or the two silently drift and
+> readers of the merged copy get stale instructions. When in doubt, grep the
+> exact sentence you changed in `BOOKLET.md` before you commit.
+
 ---
 
 ## 1. How to use this booklet

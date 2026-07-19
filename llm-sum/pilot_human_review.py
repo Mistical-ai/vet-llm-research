@@ -123,6 +123,32 @@ DEFAULT_OVERLAP_RATIO = 0.6  # 60% of the previous tester's articles carry over 
 DEFAULT_SEED = 42  # the "random seed": using the same number always reproduces the same sample
 
 
+def _warn_about_unread_subfolders(folder: Path) -> list[str]:
+    """Warn when ``folder`` has subdirectories holding .txt files we won't read.
+
+    ``read_dois_from_dev_folder`` globs ``*.txt`` non-recursively so the
+    ``prose/`` sibling of the same papers is never counted twice — but that
+    also hides a ``summarize --mode dev --output-subdir NAME`` pool, whose
+    papers then look like they were never summarised. Naming them here points
+    the user at ``--dev-summaries-dir`` (the review-side twin of ``evaluate``'s
+    ``--source-dir``).
+
+    Returns the subfolder names warned about, so tests can assert on it.
+    """
+    if not folder.exists():
+        return []
+    skipped = sorted(
+        child.name for child in folder.iterdir()
+        if child.is_dir() and child.name != "prose" and any(child.glob("*.txt"))
+    )
+    if skipped:
+        print(f"[pilot_human_review] NOTE: {folder} has subfolder(s) with readable "
+              f"summaries that are NOT part of this pool: {', '.join(skipped)}. "
+              f"Only top-level *.txt files are read. To use one of them, pass "
+              f"--dev-summaries-dir {folder / skipped[0]}")
+    return skipped
+
+
 # ---------------------------------------------------------------------------
 # Export entry point
 # ---------------------------------------------------------------------------
@@ -190,6 +216,7 @@ def export_pilot_human_review(
     # tell the user what to run first.
     # 1. Scope to DOIs that have dev-mode summaries.
     eligible_dois = read_dois_from_dev_folder(resolved_dev_dir)
+    _warn_about_unread_subfolders(resolved_dev_dir)
     if not eligible_dois:
         print(f"[pilot_human_review] No dev summaries found in {resolved_dev_dir}. "
               "Run 'summarize --mode dev' (then 'evaluate --mode dev') first.")

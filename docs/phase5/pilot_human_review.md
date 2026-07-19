@@ -24,7 +24,7 @@ summarize --mode dev  →  evaluate --mode dev  →  export-pilot-human-review
 
 | | `export-human-review` (real) | `export-pilot-human-review` (this) |
 |---|---|---|
-| Sampling pool | whole `data/evaluations.jsonl` corpus | only articles in `data/dev_summaries_jsonl/` |
+| Sampling pool | whole `data/evaluations.jsonl` corpus | only articles in the **top level** of `data/dev_summaries_jsonl/` (see the note below `--dev-summaries-dir`) |
 | Reviewers per run | **one** more `humanN/` per run, incremental | **one** more `humanN/` per run, incremental |
 | When a journal is too thin for its exact quota | errors (`JournalQuotaError`), never samples unevenly | backfills from other journals with a warning |
 | Output | `data/human_review/humanN/` | `data/pilot_human_review/humanN/` |
@@ -92,7 +92,7 @@ The path-override flags below are **not** exposed through `run_phase3.py`
 | Flag (module-direct only) | Default |
 |---|---|
 | `--evaluations PATH` | `data/evaluations.jsonl` |
-| `--dev-summaries-dir PATH` | `data/dev_summaries_jsonl/` |
+| `--dev-summaries-dir PATH` | `data/dev_summaries_jsonl/` — top-level `*.txt` only, non-recursive. Point it at `data/dev_summaries_jsonl/NAME/` (an `--output-subdir` pool), `data/single_summaries_jsonl/`, or `data/batch_summaries_jsonl/` to draw the pool from there instead. This is the review-side twin of `evaluate --source-dir`. |
 | `--raw-dir PATH` | `data/raw/` |
 | `--output-dir PATH` | `data/pilot_human_review/` |
 

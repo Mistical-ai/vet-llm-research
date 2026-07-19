@@ -33,6 +33,7 @@ from report_figures import (
 )
 import report_tables as rt
 import stats_engine
+from conftest import make_eval_row
 
 
 @pytest.fixture(autouse=True)
@@ -55,34 +56,9 @@ def _isolate_stats_engine_lookups(monkeypatch, tmp_path):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _eval_row(
-    doi: str, summarizer: str, judge: str, unweighted: float, weighted: float,
-    *, faithfulness: int = 4, completeness: int = 4, clinical_usefulness: int = 4,
-    clarity: int = 4, safety: int = 4, input_source: str = "processed",
-) -> dict:
-    """One evaluations.jsonl row with both jury modes, strata, and criteria_scores."""
-    return {
-        "benchmark_name": "vet_lit_summary_medhelm",
-        "doi": doi,
-        "summarizer": summarizer,
-        "judge": judge,
-        "input_source": input_source,
-        "jury_score": unweighted,
-        "jury_score_unweighted": unweighted,
-        "jury_score_weighted": weighted,
-        "judge_disagreement": 0.0,
-        "criteria_scores": {
-            "faithfulness": {"score": faithfulness, "reasoning": "ok"},
-            "completeness": {"score": completeness, "reasoning": "ok"},
-            "clinical_usefulness": {"score": clinical_usefulness, "reasoning": "ok"},
-            "clarity": {"score": clarity, "reasoning": "ok"},
-            "safety": {"score": safety, "reasoning": "ok"},
-        },
-        "strata": {
-            "species": ["Canine"], "study_design": "RCT", "clinical_topic": "Oncology",
-            "journal": "JVIM", "input_source": input_source,
-        },
-    }
+# The shared row factory lives in tests/conftest.py so report_tables,
+# report_figures, stats_engine and eval_report all build rows the same way.
+_eval_row = make_eval_row
 
 
 def _separated_corpus() -> list[dict]:
@@ -400,3 +376,22 @@ def test_import_report_figures_has_no_provider_side_effects() -> None:
     """Importing the module must not require API keys, the network, or matplotlib."""
     import importlib
     importlib.reload(rf)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b.5 — heatmap and leaderboard must not contradict each other
+# ---------------------------------------------------------------------------
+
+def test_criterion_means_are_item_weighted() -> None:
+    """Criterion means must average judges within a paper first, exactly like
+    the composite. Row-weighting here is what lets the heatmap and the
+    leaderboard bar disagree within a single report_figures.main() run."""
+    rows = [
+        _eval_row("10.1/x", "openai", "openai", 5.0, 5.0, faithfulness=5),
+        _eval_row("10.1/x", "openai", "anthropic", 5.0, 5.0, faithfulness=5),
+        _eval_row("10.1/x", "openai", "gemini", 5.0, 5.0, faithfulness=5),
+        _eval_row("10.1/y", "openai", "openai", 1.0, 1.0, faithfulness=1),
+    ]
+    means = aggregate_criterion_means(rows)
+    # Row-weighted gives (5+5+5+1)/4 = 4.0; item-weighted gives (5.0+1.0)/2 = 3.0.
+    assert means["openai"]["faithfulness"] == 3.0

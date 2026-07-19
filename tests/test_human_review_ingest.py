@@ -558,15 +558,23 @@ def test_weighted_human_composite_matches_jury_formula(tmp_path: Path) -> None:
     assert row["human_score_weighted"] == expected
 
 
-def test_partial_row_has_no_weighted_composite(tmp_path: Path) -> None:
-    """A missing criterion must not deflate the weighted composite -> None.
+def test_partial_row_renormalizes_weighted_composite(tmp_path: Path) -> None:
+    """A partially-filled sheet renormalizes over the criteria present.
 
-    In plain English: if a reviewer leaves even one of the five criteria
-    blank, the weighted overall score must come back as ``None`` (unknown)
-    rather than quietly averaging only the criteria that WERE filled in —
-    which would unfairly make an incomplete row look worse (or better) than
-    it really is. The plain (unweighted) average, by contrast, is fine to
-    compute from just the criteria that were actually filled in.
+    In plain English: if a reviewer leaves one of the five criteria blank, both
+    overall scores are computed from the four they DID fill in — the weighted
+    one divides by the weights of those four rather than by all five.
+
+    This replaces an earlier contract where the weighted score was withheld
+    (None) on any partial row. That withholding existed only to dodge a bug:
+    calculate_jury_score used to impute a missing criterion as 1 while keeping
+    its full weight in the divisor, which deflated partial rows. Now that it
+    renormalizes, withholding would leave the weighted composite computed over
+    FEWER items than the unweighted one — and those two are correlated against
+    their LLM counterparts, so they have to cover the same items.
+
+    Same rule on both sides: evaluator.calculate_jury_score is the single
+    implementation, used here and for the LLM jury.
     """
     review_dir = tmp_path / "human_review"
     _write_key(review_dir)
@@ -577,8 +585,9 @@ def test_partial_row_has_no_weighted_composite(tmp_path: Path) -> None:
     ingest_human_reviews(review_dir=review_dir, output_path=output)
     row = next(r for r in iter_human_review_rows(output) if r["item_id"] == "item_001")
 
-    assert row["human_score_weighted"] is None       # partial -> withheld
-    assert row["human_score_unweighted"] == 4.0        # unweighted still averages present ones
+    # All four present criteria scored 4, so any weighting of them averages 4.0.
+    assert row["human_score_weighted"] == 4.0
+    assert row["human_score_unweighted"] == 4.0
 
 
 def test_analyze_reports_both_jury_modes(tmp_path: Path) -> None:

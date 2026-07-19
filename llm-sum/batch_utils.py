@@ -33,7 +33,7 @@ from typing import Any
 
 from models_config import get_model_spec  # noqa: E402
 from file_paths import doi_to_slug  # noqa: E402
-from utils import log_error  # noqa: E402
+from utils import BudgetGuard, log_error  # noqa: E402
 
 BATCH_JOBS_PATH = DATA_DIR / "batch_jobs.jsonl"
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
@@ -48,6 +48,33 @@ MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
 
 def _timestamp_slug() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _assert_budget_authorised(stage: str, request_count: int) -> None:
+    """Refuse to submit a batch when no budget has been authorised.
+
+    Batch is the one paid path whose cost cannot be charged at call time: the
+    provider bills for work that completes hours later, so the real spend is
+    only knowable at merge (see check_batch_status._charge_batch_result). That
+    makes submission the last point where a runaway can still be prevented for
+    free — once the job is accepted, the money is committed no matter what the
+    guard does afterwards.
+
+    Deliberately a floor check, not an estimate: BUDGET_HARD_STOP defaults to
+    $0.00 precisely so an unconfigured environment cannot spend anything, and
+    batch is the full-corpus mode where an accidental submission is most
+    expensive. Estimating the cost here to pre-charge it would violate the rule
+    that token counts come from provider responses, never from guesses.
+    """
+    guard = BudgetGuard()
+    if guard.hard_stop <= 0:
+        raise SystemExit(
+            f"[phase3:batch] REFUSING to submit {request_count} {stage} request(s): "
+            f"BUDGET_HARD_STOP is ${guard.hard_stop:.2f}. Batch results are billed "
+            f"even though their cost is only recorded when you later merge them, "
+            f"so set BUDGET_HARD_STOP in .env to the amount you intend to spend "
+            f"before submitting."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +340,16 @@ def run_batch_summarisation(
     )
     if guide_summary:
         print(f"[phase3:batch] using format guide: {resolved_guide_path}")
-    existing = load_existing_summaries() if resume else {}
+    # Always keep rows from other papers and other input sources. ``resume``
+    # only decides whether an already-successful model slot is skipped or
+    # refreshed (the check inside the provider loop below).
+    #
+    # Loading conditionally here would be silent data loss: _write_all_summaries
+    # further down rewrites the WHOLE file from this dict, so starting empty
+    # drops every raw_text/pdf row and every gemini result — gemini is never
+    # batched, so its summaries only ever exist in the file we would clobber.
+    # summarizer.run_realtime does the same thing for the same reason.
+    existing = load_existing_summaries()
     summaries_by_doi: dict[str, dict] = dict(existing)
 
     rows_per_provider: dict[str, list[dict]] = {p: [] for p in providers}
@@ -370,6 +406,7 @@ def run_batch_summarisation(
         if not rows:
             print(f"[phase3:batch] no requests to submit for {provider}")
             continue
+        _assert_budget_authorised("summarize", len(rows))
         jsonl_path = BATCH_DIR / f"{provider}_sum_{timestamp}.jsonl"
         write_batch_jsonl(rows, jsonl_path)
 
@@ -481,6 +518,7 @@ def run_batch_evaluation(
         if not rows:
             print(f"[phase3:batch] no evaluation requests to submit for judge {judge}")
             continue
+        _assert_budget_authorised("evaluate", len(rows))
         jsonl_path = BATCH_DIR / f"{judge}_eval_{timestamp}.jsonl"
         write_batch_jsonl(rows, jsonl_path)
 

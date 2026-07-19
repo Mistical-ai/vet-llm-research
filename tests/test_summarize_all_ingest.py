@@ -175,6 +175,29 @@ def _write_processed_cache(
     )
 
 
+# This input mode judges the flowing summary_text out of data/summaries.jsonl,
+# not the bulleted body carried by the summarize-all .txt (see
+# ingest._load_prose_by_doi_provider). So every test that expects instances to
+# come back has to seed a summaries.jsonl too.
+def _write_summaries_jsonl(
+    path: Path, entries: list[tuple[str, dict[str, str]]],
+) -> Path:
+    """Write a summaries.jsonl of ``(doi, {provider: prose})`` rows."""
+    import json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for doi, prose_by_provider in entries:
+            f.write(json.dumps({
+                "doi": doi,
+                "input_source": "processed",
+                "models": {
+                    provider: {"status": "success", "summary": prose}
+                    for provider, prose in prose_by_provider.items()
+                },
+            }) + "\n")
+    return path
+
+
 def test_iter_instances_builds_one_per_successful_provider(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -194,13 +217,18 @@ def test_iter_instances_builds_one_per_successful_provider(
         }),
         encoding="utf-8",
     )
+    summaries = _write_summaries_jsonl(
+        tmp_path / "summaries.jsonl",
+        [("10.1111/jvim.16872", {"openai": "Openai PROSE summary_text."})],
+    )
 
-    instances = list(iter_summarize_all_instances(txt_dir))
+    instances = list(iter_summarize_all_instances(txt_dir, summaries_path=summaries))
     assert len(instances) == 1  # anthropic failed -> not judged
     inst = instances[0]
     assert inst.doi == "10.1111/jvim.16872"
     assert inst.summarizer == "openai"
-    assert inst.candidate_summary == "Openai summary text."
+    # The prose from summaries.jsonl, NOT the bulleted body in the .txt.
+    assert inst.candidate_summary == "Openai PROSE summary_text."
     assert "Full cleaned article body." in inst.reference_text
     assert inst.input_source == "processed"
 
@@ -259,12 +287,46 @@ def test_iter_instances_respects_paper_limit(tmp_path: Path, monkeypatch) -> Non
 
     txt_dir = tmp_path / "summaries_txt"
     txt_dir.mkdir()
+    rows: list[tuple[str, dict[str, str]]] = []
     for i in range(5):
         doi = f"10.9999/paper.{i:04d}"
         filename = f"journal__title{i}__{doi.replace('.', '_').replace('/', '_')}.jsonl"
         _write_processed_cache(processed_dir, filename, f"Body of paper {i}. " * 20, doi=doi)
         text = _txt(doi=doi, source_file=filename)
         (txt_dir / f"paper{i}.txt").write_text(text, encoding="utf-8")
+        rows.append((doi, {"openai": f"Prose for paper {i}."}))
+    summaries = _write_summaries_jsonl(tmp_path / "summaries.jsonl", rows)
 
-    instances = list(iter_summarize_all_instances(txt_dir, paper_limit=2))
+    instances = list(
+        iter_summarize_all_instances(txt_dir, paper_limit=2, summaries_path=summaries)
+    )
     assert len({i.doi for i in instances}) == 2
+
+
+# The point of routing this mode through summaries.jsonl: a provider slot with
+# no prose is dropped (with a warning) rather than silently judged on the
+# bulleted body, which would make this mode disagree with every other one.
+def test_iter_instances_skips_slots_with_no_prose(tmp_path: Path, monkeypatch, capsys) -> None:
+    processed_dir = tmp_path / "processed"
+    monkeypatch.setattr(ingest, "PROCESSED_DIR", processed_dir)
+    import prepare_texts
+    monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
+
+    txt_dir = tmp_path / "summaries_txt"
+    txt_dir.mkdir()
+    filename = "javma__some_title__10_1111_jvim_16872.jsonl"
+    _write_processed_cache(processed_dir, filename, "Full cleaned article body. " * 20)
+    (txt_dir / "paperA.txt").write_text(
+        _txt(source_file=filename, providers={
+            "openai": {"status": "success", "body": "Bulleted body only."},
+        }),
+        encoding="utf-8",
+    )
+    # summaries.jsonl exists but has no row for this DOI -> nothing to judge.
+    summaries = _write_summaries_jsonl(tmp_path / "summaries.jsonl", [])
+
+    instances = list(iter_summarize_all_instances(txt_dir, summaries_path=summaries))
+    assert instances == []
+    out = capsys.readouterr().out
+    assert "no prose summary_text" in out
+    assert "10.1111/jvim.16872 (openai)" in out

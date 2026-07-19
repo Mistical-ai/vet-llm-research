@@ -13,6 +13,7 @@ the covariate report's underpowered-flagging. Everything here is pure/offline
 from __future__ import annotations
 
 import stats_engine
+from conftest import make_eval_row
 from stats_engine import (
     build_covariate_report,
     build_information_density_report,
@@ -89,8 +90,13 @@ def test_categorical_agreement_rounds_continuous_composites() -> None:
 
 
 def test_categorical_agreement_none_below_n_two() -> None:
+    # Asserts the contract (n echoed, every statistic withheld) rather than exact
+    # dict equality, which broke whenever the return shape gained a field.
     result = categorical_agreement([4.0], [4.0])
-    assert result == {"n": 1, "cohen_kappa": None, "cohen_kappa_quadratic": None, "percent_agreement": None}
+    assert result["n"] == 1
+    assert result["cohen_kappa"] is None
+    assert result["cohen_kappa_quadratic"] is None
+    assert result["percent_agreement"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -224,18 +230,27 @@ def test_build_subscription_efficiency_ranks_by_efficiency() -> None:
 # ---------------------------------------------------------------------------
 
 def _eval_row(doi: str, provider: str, species: str, hallucinations: int) -> dict:
-    return {
-        "doi": doi,
-        "summarizer": provider,
-        "hallucination_count": hallucinations,
-        "strata": {"species": [species], "study_design": "RCT", "journal": "JVIM"},
-    }
+    """Covariate-shaped row. Thin adapter over the shared conftest factory so
+    this file's positional call sites stay unchanged."""
+    return make_eval_row(
+        doi, provider, species=species, hallucination_count=hallucinations,
+    )
 
 
-def _item_scores_entry(doi: str, provider: str, species: str, unweighted: float) -> tuple:
+def _item_scores_entry(doi: str, provider: str, species: str, unweighted: float,
+                       *, hallucination: bool | None = None) -> tuple:
+    """One collect_item_scores entry. `hallucination` is the collapsed
+    majority verdict for the item; None means no judge reported usable data."""
     key = (doi, "processed")
     strata = {"species": [species], "study_design": "RCT", "journal": "JVIM"}
-    return key, {provider: {"unweighted": unweighted, "strata": strata}}
+    flags = (
+        {"value": None, "any_value": None, "mean_rate": None, "n_missing": 1, "n_reporting": 0}
+        if hallucination is None else
+        {"value": hallucination, "any_value": hallucination,
+         "mean_rate": 1.0 if hallucination else 0.0, "n_missing": 0, "n_reporting": 1}
+    )
+    return key, {provider: {"unweighted": unweighted, "strata": strata,
+                            "hallucination": flags}}
 
 
 def test_build_covariate_report_hallucination_and_quality() -> None:
@@ -245,9 +260,9 @@ def test_build_covariate_report_hallucination_and_quality() -> None:
         _eval_row("10.1/c", "openai", "Feline", 0),
     ]
     item_scores = dict([
-        _item_scores_entry("10.1/a", "openai", "Canine", 5.0),
-        _item_scores_entry("10.1/b", "openai", "Canine", 3.0),
-        _item_scores_entry("10.1/c", "openai", "Feline", 4.0),
+        _item_scores_entry("10.1/a", "openai", "Canine", 5.0, hallucination=False),
+        _item_scores_entry("10.1/b", "openai", "Canine", 3.0, hallucination=True),
+        _item_scores_entry("10.1/c", "openai", "Feline", 4.0, hallucination=False),
     ])
     report = build_covariate_report(evaluation_rows, [], item_scores, ["openai"])
     canine_cell = next(c for c in report["by_field"]["species"] if c["value"] == "Canine")
@@ -281,3 +296,70 @@ def test_build_covariate_report_empty_inputs_yields_empty_tables() -> None:
     report = build_covariate_report([], [], {}, [])
     assert report["fields"] == list(stats_engine.COVARIATE_FIELDS)
     assert all(rows == [] for rows in report["by_field"].values())
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b.6 / 1b.7 — ordinal kappa, and undefined-vs-perfect
+# ---------------------------------------------------------------------------
+
+def test_quadratic_and_unweighted_kappa_can_disagree_in_sign() -> None:
+    """The reason quadratic is the headline for ordinal 1-5 rubric data.
+
+    On a jury that is mostly off-by-one from the human, unweighted kappa reads
+    "worse than chance" while quadratic reads "fair agreement" — opposite
+    conclusions about whether the LLM tracks expert judgment, from one dataset.
+    Unweighted treats 4-vs-5 as severely as 1-vs-5, which is the wrong question
+    to ask of an ordinal clinical rubric.
+    """
+    human = [3, 4, 5, 4, 3, 5, 4, 3, 5, 4]
+    jury = [4, 5, 5, 3, 4, 5, 3, 4, 4, 5]
+    result = categorical_agreement(human, jury)
+    assert result["cohen_kappa"] < 0
+    assert result["cohen_kappa_quadratic"] > 0
+
+
+def test_categorical_agreement_reports_all_three_statistics() -> None:
+    """Quadratic must not be computed then discarded, as it was at the caller."""
+    result = categorical_agreement([4, 5, 3, 4], [4, 5, 3, 5])
+    assert result["cohen_kappa_quadratic"] is not None
+    assert result["cohen_kappa"] is not None
+    assert result["percent_agreement"] is not None
+
+
+def test_kappa_undefined_flag_distinguishes_perfect_from_uninformative() -> None:
+    """All ratings identical -> kappa is undefined, reported as 1.0 + a flag."""
+    uninformative = categorical_agreement([4, 4, 4, 4], [4, 4, 4, 4])
+    assert uninformative["cohen_kappa"] == 1.0
+    assert uninformative["kappa_undefined"] is True
+
+    genuine = categorical_agreement([3, 4, 5, 3], [3, 4, 5, 3])
+    assert genuine["cohen_kappa"] == 1.0
+    assert genuine["kappa_undefined"] is False
+
+
+def test_divergent_constant_raters_are_not_perfect_agreement() -> None:
+    """Both raters constant but DIFFERENT is kappa 0.0, never a false 1.0."""
+    result = categorical_agreement([3, 3, 3], [4, 4, 4])
+    assert result["cohen_kappa"] == 0.0
+    assert result["kappa_undefined"] is False
+
+
+def test_covariate_report_reports_quadratic_kappa_and_missing_hallucinations() -> None:
+    rows = [
+        _eval_row("10.1/a", "openai", "Canine", 1),
+        _eval_row("10.1/b", "openai", "Canine", 0),
+        make_eval_row("10.1/c", "openai", species="Canine"),   # no hallucination data
+    ]
+    item_scores = dict([
+        _item_scores_entry("10.1/a", "openai", "Canine", 5.0, hallucination=True),
+        _item_scores_entry("10.1/b", "openai", "Canine", 3.0, hallucination=False),
+        _item_scores_entry("10.1/c", "openai", "Canine", 4.0),   # no judge reported
+    ])
+    report = build_covariate_report(rows, [], item_scores, ["openai"])
+    cell = next(c for c in report["by_field"]["species"] if c["value"] == "Canine")
+    stats = cell["providers"]["openai"]
+    assert "cohen_kappa_quadratic" in stats
+    assert "percent_agreement" in stats
+    # 1 of the 2 rows that reported, not 1 of 3.
+    assert stats["hallucination_rate"] == 0.5
+    assert stats["hallucination_n_missing"] == 1

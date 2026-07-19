@@ -109,19 +109,39 @@ def descriptive_stem(record_or_doi: Mapping[str, object] | str) -> str:
     return descriptive_pdf_filename(record_or_doi).removesuffix(".pdf")
 
 
+# Prefix stamped onto a PDF that passed validation but was classified as
+# secondary research (review, meta-analysis, commentary). See
+# download._classify_article_type, which renames the file in place.
+SECONDARY_PREFIX = "2_"
+
+
 def pdf_path_candidates(
     raw_dir: Path,
     record_or_doi: Mapping[str, object] | str,
 ) -> list[Path]:
     """
     Return possible paths, preferring the new descriptive name over legacy DOI.
+
+    Each name is offered both bare and with the ``2_`` secondary-research
+    prefix, because that rename happens *after* download and is otherwise
+    invisible to every lookup that goes through here. Without the prefixed
+    variants a reclassified paper looks permanently missing: it gets
+    re-downloaded on every run, never counts toward its journal's success
+    quota, and on Windows the second download raises FileExistsError when
+    rename() finds the target already there.
+
+    Bare names come first so an ordinary primary-research PDF is still matched
+    on the first candidate.
     """
     doi = _record_value(record_or_doi, "doi").strip()
-    candidates: list[Path] = []
+    names: list[str] = []
     if not isinstance(record_or_doi, str):
-        candidates.append(raw_dir / descriptive_pdf_filename(record_or_doi))
+        names.append(descriptive_pdf_filename(record_or_doi))
     if doi:
-        candidates.append(raw_dir / legacy_doi_filename(doi))
+        names.append(legacy_doi_filename(doi))
+
+    candidates: list[Path] = [raw_dir / name for name in names]
+    candidates += [raw_dir / f"{SECONDARY_PREFIX}{name}" for name in names]
 
     unique: list[Path] = []
     seen: set[Path] = set()

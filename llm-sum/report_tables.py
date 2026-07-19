@@ -69,6 +69,10 @@ from scenarios import VET_TAXONOMY_V1, VeterinarySummaryQualityScenario
 from eval_report import iter_evaluation_rows
 from eval_instances import load_manifest_index
 import stats_engine  # noqa: E402  (information density, subscription economics, covariates)
+# calculate_jury_score is the single implementation of the composite formula,
+# reused here to recompute composites from criteria at read time (see
+# _apply_recomputed_composites) rather than reimplementing the weighting.
+import evaluator  # noqa: E402
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
@@ -314,49 +318,251 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _criterion_scores(row: dict[str, Any]) -> dict[str, float]:
+    """One judge's numeric criterion scores from the nested criteria_scores block.
+
+    A criterion the judge omitted, or returned unparseably, is simply absent
+    from the result — never imputed. Imputing the floor (1) would be a strong
+    claim the judge never made; see evaluator.calculate_jury_score for the
+    matching rule on the composite side.
+    """
+    block = row.get("criteria_scores")
+    if not isinstance(block, dict):
+        return {}
+    scores: dict[str, float] = {}
+    for criterion in stats_engine.CRITERIA:
+        item = block.get(criterion)
+        value = item.get("score") if isinstance(item, dict) else item
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            scores[criterion] = float(value)
+    return scores
+
+
+def _hallucination_flag(row: dict[str, Any]) -> bool | None:
+    """Did this judge report a hallucination? ``None`` when it never said.
+
+    An absent or unparseable ``hallucination_count`` is missing data, NOT a
+    clean bill of health. Counting it as clean biases the rate downward in the
+    study's own favour — worse parse rates would read as fewer hallucinations.
+    """
+    value = row.get("hallucination_count")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) > 0
+
+
+def _major_hallucination_flag(row: dict[str, Any]) -> bool | None:
+    """Same missing-vs-clean distinction for major-severity claims."""
+    claims = row.get("hallucination_claims")
+    if not isinstance(claims, list):
+        return None
+    return any(isinstance(c, dict) and c.get("severity") == "major" for c in claims)
+
+
+def _low_confidence_flag(row: dict[str, Any]) -> bool | None:
+    value = row.get("confidence_score")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) < 3
+
+
+def _collapse_flags(values: list[bool | None]) -> dict[str, Any]:
+    """Collapse one item's per-judge booleans into a single panel verdict.
+
+    ``value`` (the headline) is the MAJORITY verdict: the item counts as
+    positive when more than half the judges that reported flagged it. With a
+    3-judge panel that needs 2; with a single judge — normal on this corpus,
+    since resume is per (doi, summariser, judge) — that judge's call stands
+    alone, which must be stated wherever the rate is published.
+
+    Majority rather than OR because inter-judge agreement on hallucination is
+    low: on this project's corpus, "any judge flagged it" marks 80.6% of items
+    while "most judges agreed" marks 6.5% and no item ever drew a unanimous
+    flag. Under that much disagreement, OR reports "at least one judge was
+    worried", which is a much weaker claim than "this summary contains a
+    hallucination" and would dominate the headline on lone-judge calls.
+
+    ``any_value`` and ``mean_rate`` are kept alongside as the upper bound and
+    the per-judgement comparator (the latter is close to the pre-fix figure,
+    which was judge-row-weighted). All three are published: the spread between
+    them IS the inter-judge disagreement, and hiding it would be the mistake.
+
+    The verdict is None ONLY when every judge on the item is missing data — a
+    partially-missing item still yields a verdict from those that did report.
+    ``n_missing`` counts the unusable rows so coverage stays visible.
+    """
+    usable = [v for v in values if v is not None]
+    if not usable:
+        return {"value": None, "any_value": None, "mean_rate": None,
+                "n_missing": len(values), "n_reporting": 0}
+    n_flagged = sum(1 for v in usable if v)
+    return {
+        "value": n_flagged * 2 > len(usable),
+        "any_value": n_flagged > 0,
+        "mean_rate": n_flagged / len(usable),
+        "n_missing": len(values) - len(usable),
+        "n_reporting": len(usable),
+    }
+
+
+def _collapse_duplicate_judge_rows(judge_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collapse repeat judgements from ONE judge on ONE item into one rating.
+
+    A re-run (``--no-resume``, or a crashed run retried) appends a second row
+    for the same (item, provider, judge). Both are complete judgements, so both
+    are treated as observations and averaged, rather than one being declared to
+    supersede the other — see reliability._units_for for the full rationale.
+
+    Averaging happens PER CRITERION, and the composites are then recomputed from
+    those averaged criteria rather than averaging the stored composites. The two
+    differ whenever a criterion is missing from one row but not the other: only
+    recomputation applies the current renormalize-over-present rule to the
+    merged result. This is also what makes the missing-criterion fix retroactive
+    to rows written before it, since the stored jury_score_* on those rows was
+    computed with the old impute-to-1 behaviour.
+    """
+    if len(judge_rows) == 1:
+        row = dict(judge_rows[0])
+        row["criteria_scores"] = _normalize_criteria_block(row.get("criteria_scores"))
+        _apply_recomputed_composites(row)
+        return row
+
+    merged = dict(judge_rows[-1])  # non-score metadata (strata, doi, ...) from any row
+
+    # Per-criterion mean across the duplicates, skipping rows that omitted it.
+    per_criterion: dict[str, list[float]] = defaultdict(list)
+    for row in judge_rows:
+        for criterion, value in _criterion_scores(row).items():
+            per_criterion[criterion].append(value)
+    merged["criteria_scores"] = {
+        criterion: {"score": sum(values) / len(values), "reasoning": ""}
+        for criterion, values in per_criterion.items()
+    }
+
+    # Hallucination flags are booleans — OR them across the duplicate pair
+    # rather than averaging. Missing only when EVERY duplicate lacked data.
+    counts = [c for row in judge_rows
+              if isinstance(c := row.get("hallucination_count"), (int, float))
+              and not isinstance(c, bool)]
+    merged["hallucination_count"] = max(counts) if counts else None
+    claims: list[Any] = []
+    for row in judge_rows:
+        if isinstance(row.get("hallucination_claims"), list):
+            claims.extend(row["hallucination_claims"])
+    merged["hallucination_claims"] = claims if any(
+        isinstance(r.get("hallucination_claims"), list) for r in judge_rows
+    ) else None
+
+    _apply_recomputed_composites(merged)
+    return merged
+
+
+def _normalize_criteria_block(block: Any) -> dict[str, dict[str, Any]]:
+    """Keep only criteria carrying a usable numeric score."""
+    if not isinstance(block, dict):
+        return {}
+    return {
+        criterion: {"score": value}
+        for criterion, value in _criterion_scores({"criteria_scores": block}).items()
+    }
+
+
+def _apply_recomputed_composites(row: dict[str, Any]) -> None:
+    """Recompute jury_score_* from criteria_scores, in place, when possible.
+
+    The reporting layer never rewrites data/evaluations.jsonl — it is
+    append-only — so retroactivity has to happen at read time. Rows written
+    before the missing-criterion fix carry composites computed with the old
+    impute-to-1 rule; recomputing here applies the current renormalization to
+    historical data without touching the file.
+
+    Rows whose criteria_scores block is empty (the sentinel/malformed parse
+    paths) keep their stored composites: there is nothing to recompute from,
+    and dropping them silently would be worse than reporting them as-is.
+    """
+    criteria = row.get("criteria_scores")
+    if not isinstance(criteria, dict) or not criteria:
+        return
+    unweighted = evaluator.calculate_jury_score(
+        criteria, weights=evaluator.UNWEIGHTED_CRITERION_WEIGHTS,
+    )
+    weighted = evaluator.calculate_jury_score(
+        criteria, weights=evaluator.MEDHELM_CRITERION_WEIGHTS,
+    )
+    if unweighted is not None:
+        row["jury_score_unweighted"] = unweighted
+    if weighted is not None:
+        row["jury_score_weighted"] = weighted
+
+
 def collect_item_scores(rows: Iterable[dict[str, Any]]) -> dict[tuple[str, str], dict[str, dict[str, Any]]]:
     """Collapse rows into ``{(doi, input_source): {provider: aggregate}}``.
 
     Multiple judges scoring the same summary are averaged first, so every
-    provider contributes one unweighted score, one weighted score, and one mean
-    judge-disagreement per item. This is the shared substrate every table and
-    every significance test is built from — computing it once keeps the pairing
-    identical across the whole report.
+    provider contributes one unweighted score, one weighted score, one mean
+    judge-disagreement, one per-criterion mean, and one hallucination verdict
+    per item. This is the shared substrate every table, figure and significance
+    test is built from — computing it once keeps the pairing identical across
+    the whole report, and is what stops two reports printing different means
+    from the same evaluations.jsonl.
+
+    One judge gets at most one opinion per (item, provider). If a --no-resume
+    rerun appended a second row for the same judge, the two rows are AVERAGED
+    into one panelist rating rather than one superseding the other — see
+    ``_collapse_duplicate_judge_rows``. Without any collapsing a rerun would be
+    counted as an extra panelist and inflate n_judges.
+    Mirrors reliability._units_for, which applies the identical rule.
     """
-    # (doi, input_source) -> provider -> list of per-judge rows' values
-    buckets: dict[tuple[str, str], dict[str, dict[str, list[float]]]] = defaultdict(
-        lambda: defaultdict(lambda: {"unweighted": [], "weighted": [], "disagreement": []})
+    # (doi, input_source) -> provider -> judge -> [rows from that judge]
+    deduped: dict[tuple[str, str], dict[str, dict[str, list[dict[str, Any]]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
     )
     # Keep one representative strata block per item for later stratum grouping.
     strata_by_item: dict[tuple[str, str], dict[str, Any]] = {}
 
-    for row in rows:
+    for index, row in enumerate(rows):
         doi = str(row.get("doi", "")).strip()
         summarizer = str(row.get("summarizer", "")).strip()
         if not doi or not summarizer:
             continue
         item = (doi, _input_source(row))
         strata_by_item.setdefault(item, row.get("strata") or {})
-        provider_bucket = buckets[item][summarizer]
-        uw = _unweighted(row)
-        if uw is not None:
-            provider_bucket["unweighted"].append(uw)
-        w = _weighted(row)
-        if w is not None:
-            provider_bucket["weighted"].append(w)
-        dis = _disagreement(row)
-        if dis is not None:
-            provider_bucket["disagreement"].append(dis)
+        # A row with no judge identity cannot be deduped against anything, so
+        # it keeps a unique key rather than silently displacing another row.
+        judge = str(row.get("judge", "")).strip() or f"__unkeyed_{index}"
+        deduped[item][summarizer][judge].append(row)
 
     result: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
-    for item, providers in buckets.items():
+    for item, providers in deduped.items():
         result[item] = {}
-        for provider, vals in providers.items():
+        for provider, by_judge in providers.items():
+            judge_rows = [_collapse_duplicate_judge_rows(rs) for rs in by_judge.values()]
+            unweighted = [v for r in judge_rows if (v := _unweighted(r)) is not None]
+            weighted = [v for r in judge_rows if (v := _weighted(r)) is not None]
+            disagreement = [v for r in judge_rows if (v := _disagreement(r)) is not None]
+
+            # Per-criterion: average the judges that scored each criterion,
+            # independently per criterion, so one judge omitting `safety` does
+            # not discard its opinion on the other four.
+            criterion_values: dict[str, list[float]] = defaultdict(list)
+            for r in judge_rows:
+                for criterion, value in _criterion_scores(r).items():
+                    criterion_values[criterion].append(value)
+
             result[item][provider] = {
-                "unweighted": _mean(vals["unweighted"]),
-                "weighted": _mean(vals["weighted"]),
-                "disagreement": _mean(vals["disagreement"]),
-                "n_judges": max(len(vals["unweighted"]), len(vals["weighted"])),
+                "unweighted": _mean(unweighted),
+                "weighted": _mean(weighted),
+                "disagreement": _mean(disagreement),
+                "n_judges": max(len(unweighted), len(weighted)),
+                "criteria": {c: _mean(v) for c, v in criterion_values.items()},
+                "hallucination": _collapse_flags([_hallucination_flag(r) for r in judge_rows]),
+                "major_hallucination": _collapse_flags(
+                    [_major_hallucination_flag(r) for r in judge_rows]
+                ),
+                "low_confidence": _collapse_flags([_low_confidence_flag(r) for r in judge_rows]),
+                "parse_failure": _collapse_flags(
+                    [r.get("parse_method") == "sentinel" for r in judge_rows]
+                ),
                 "strata": strata_by_item.get(item, {}),
                 "doi": item[0],
                 "input_source": item[1],
@@ -998,20 +1204,34 @@ def render_markdown(report: dict[str, Any]) -> str:
         for provider in report["providers"]:
             lines.append(f"**{provider}**")
             lines.append("")
-            lines.append(f"| {field.replace('_', ' ').title()} | N | Hallucination rate | Mean quality | Cohen's Kappa (n) |")
-            lines.append("|---|---|---|---|---|")
+            # Quadratic kappa leads (ordinal ratings), exact-match kappa follows
+            # as the sensitivity check. Reporting only the unweighted figure
+            # understated agreement by treating 4-vs-5 like 1-vs-5.
+            lines.append(
+                f"| {field.replace('_', ' ').title()} | N | Hallucination rate | Mean quality | "
+                f"Kappa quadratic (n) | Kappa exact |"
+            )
+            lines.append("|---|---|---|---|---|---|")
             for cell in field_rows:
                 cell_stats = cell["providers"].get(provider, {})
                 halluc = cell_stats.get("hallucination_rate")
+                n_missing = cell_stats.get("hallucination_n_missing", 0)
                 quality = cell_stats.get("mean_quality")
+                kappa_q = cell_stats.get("cohen_kappa_quadratic")
                 kappa = cell_stats.get("cohen_kappa")
                 kappa_n = cell_stats.get("kappa_n", 0)
-                underpowered = " (underpowered)" if cell_stats.get("kappa_underpowered") else ""
+                notes = " (underpowered)" if cell_stats.get("kappa_underpowered") else ""
+                if cell_stats.get("kappa_undefined"):
+                    notes += " (undefined)"
+                halluc_cell = "-" if halluc is None else f"{halluc*100:.0f}%"
+                if n_missing:
+                    halluc_cell += f" ({n_missing} no data)"
                 lines.append(
                     f"| {cell['value']} | {cell_stats.get('n_items', 0)} | "
-                    f"{'-' if halluc is None else f'{halluc*100:.0f}%'} | "
+                    f"{halluc_cell} | "
                     f"{'-' if quality is None else f'{quality:.2f}'} | "
-                    f"{'-' if kappa is None else f'{kappa:.2f}'} (n={kappa_n}){underpowered} |"
+                    f"{'-' if kappa_q is None else f'{kappa_q:.2f}'} (n={kappa_n}){notes} | "
+                    f"{'-' if kappa is None else f'{kappa:.2f}'} |"
                 )
             lines.append("")
 
@@ -1104,12 +1324,17 @@ def render_csvs(report: dict[str, Any]) -> dict[str, str]:
                 stats = cell["providers"].get(provider, {})
                 covariate_rows.append([
                     field, cell["value"], provider, stats.get("n_items", 0),
-                    stats.get("hallucination_rate"), stats.get("mean_quality"),
-                    stats.get("cohen_kappa"), stats.get("kappa_n", 0), stats.get("kappa_underpowered", False),
+                    stats.get("hallucination_rate"), stats.get("hallucination_n_missing", 0),
+                    stats.get("mean_quality"),
+                    stats.get("cohen_kappa_quadratic"), stats.get("cohen_kappa"),
+                    stats.get("percent_agreement"),
+                    stats.get("kappa_n", 0), stats.get("kappa_underpowered", False),
+                    stats.get("kappa_undefined", False),
                 ])
     files["covariate_analysis.csv"] = _csv_string(
-        ["field", "value", "provider", "n_items", "hallucination_rate", "mean_quality",
-         "cohen_kappa", "kappa_n", "kappa_underpowered"],
+        ["field", "value", "provider", "n_items", "hallucination_rate", "hallucination_n_missing",
+         "mean_quality", "cohen_kappa_quadratic", "cohen_kappa", "percent_agreement",
+         "kappa_n", "kappa_underpowered", "kappa_undefined"],
         covariate_rows,
     )
 

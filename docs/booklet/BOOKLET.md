@@ -870,15 +870,15 @@ The fields every provider must fill in are:
 | Field | What goes here |
 |---|---|
 | `headline` | One sentence with the most clinically important takeaway. |
-| `objective` | The research question, objective, or hypothesis. |
+| `objective` | The research question, objective, or hypothesis, in 1-2 concise sentences. |
 | `study_design` | The reported design, or `"Not reported"`. |
 | `species` | The animal species or population studied. |
 | `sample_size` | Number of animals/samples/records/cases analyzed, or `null` if not reported — the prompt explicitly forbids writing `0` unless the article says zero. |
-| `key_methods` | A short list of the main methods, interventions, measurements/outcomes assessed, statistical analysis approach, or comparisons. |
-| `key_findings` | A short list of the most important findings — the prompt asks for a key number only when it's essential to understanding a result, rather than trying to capture every statistic in the article. |
-| `clinical_significance` | How a practicing clinician should interpret or apply the findings. |
-| `limitations` | Important caveats — the prompt specifically calls out missing confirmatory diagnostics (e.g. EEG, histopathology, imaging) as a limitation worth surfacing on its own, separate from sample-size caveats. |
-| `summary_text` | Short plain-language prose for a busy clinician, under 400 words (target 300-380), in a fixed section order: title/authors, Background, Methods, Results, Limitations, Conclusions. Flowing paragraphs only — no numbered headers, no bullet points, no bold. |
+| `key_methods` | The main methods, interventions, measurements/outcomes assessed, statistical analysis approach, or comparisons. At most 4 items, each one concise sentence. |
+| `key_findings` | The most important findings. At most 5 items, each one concise sentence — the headline results rather than an exhaustive list. The prompt asks for a key number only when it's essential to understanding a result, rather than trying to capture every statistic in the article. |
+| `clinical_significance` | How a practicing clinician should interpret or apply the findings, in 1-2 concise sentences. |
+| `limitations` | Important caveats, at most 4 items, each one concise sentence — the prompt specifically calls out missing confirmatory diagnostics (e.g. EEG, histopathology, imaging) as a limitation worth surfacing on its own, separate from sample-size caveats. |
+| `summary_text` | Short plain-language prose for a busy clinician, 300-340 words (never exceed 400), in a fixed section order: title/authors, Background, Methods, Results, Limitations, Conclusions. Flowing paragraphs only — no numbered headers, no bullet points, no bold. |
 
 Every one of these rules exists to stop the model from **inventing**
 information: if a fact isn't in the article, the prompt tells the model to
@@ -890,11 +890,24 @@ Each summarized paper ends up with **two** representations stored side by
 side:
 
 - **`summary`** — the readable prose from `summary_text`. This is what the
-  blind judge in Chapter 4 actually reads and scores.
+  blind judge in Chapter 4 actually reads and scores, what the human
+  reviewers in Chapter 8 grade, and the only one of the two that the
+  300-340-word budget applies to.
 - **`structured_summary`** — the full schema as a clean dictionary
   (`headline`, `sample_size`, `key_findings`, and so on), kept for later
   analysis — for example, checking whether summaries tend to omit sample
   size more often for one provider than another.
+
+That same split shows up on disk. Each readable output folder holds a
+top-level `.txt` per paper rendering the **structured bullets**, plus a
+`prose/` subfolder rendering the **flowing `summary_text`** with its word
+count and an `[OVER 400]` flag. So if you open a summary file and count the
+words, check which of the two you're looking at first: the bullet view has
+no word budget at all, and only the item-count caps above. Note also that
+those caps are applied twice — as instructions to the model, and again when
+rendering the `.txt` — but `data/summaries.jsonl` always stores the full,
+uncapped lists. A bullet file showing 5 findings where the JSONL has 7 is
+working as intended, not losing data.
 
 If a provider returns a response that's missing a field or otherwise
 doesn't quite fit the schema, the code repairs it by filling the gap with

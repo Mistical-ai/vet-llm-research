@@ -19,7 +19,7 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
   These methodological limitations are distinct from sample-size caveats and are often the most
   scientifically important.
 - summary_text: a short, plain-language prose summary for a busy veterinary clinician who has
-  about a minute to read it. Aim for 300-340 words and do not exceed 360 words. Write flowing
+  about a minute to read it. Aim for 300-340 words and do not exceed 400 words. Write flowing
   paragraphs only — no numbered headers, no bullet points, no markdown bold — one short paragraph
   per section, in this exact order:
 
@@ -45,7 +45,7 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
   [The bottom-line takeaway and its clinical relevance.]
 
 Rules:
-- summary_text must be 300-340 words (never exceed 360 words) and contain only flowing prose
+- summary_text must be 300-340 words (never exceed 400 words) and contain only flowing prose
   paragraphs in the section order above — no numbered lists, no bullet points, no bold headers.
 - summary_text must not simply restate the key_findings list; describe results in plain
   language and save exact statistics for key_findings.

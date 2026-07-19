@@ -177,17 +177,35 @@ def _units_for(rows: list[dict[str, Any]],
                value_fn: Callable[[dict[str, Any]], float | None]) -> list[list[float]]:
     """Group rows into per-item rating lists using ``value_fn`` to read a score.
 
-    One judge is allowed at most one rating per item; if the same judge appears
-    twice for an item (e.g. a re-run wrote a second row), the later value wins so
-    a duplicate never inflates the agreement count.
+    One judge contributes at most one rating per item. If the same judge scored
+    the same item twice (a re-run appended a second row), the two are AVERAGED
+    into a single panelist rating rather than one superseding the other.
+
+    Averaging, not last-wins: a later row is only "more correct" if the earlier
+    one is known to be invalid, and a completed row with full reasoning gives no
+    such evidence. Picking the later value silently prefers whichever run scored
+    higher — on this project's own corpus the second run was higher in 15 of 15
+    duplicated pairs, so last-wins would have shifted the headline mean upward
+    by ~0.77 points on a 1-5 scale with no stated justification. Two complete
+    judgements are two observations, so they are treated as such.
+
+    ``report_tables.collect_item_scores`` applies the identical rule. These two
+    must not diverge: if the tables averaged duplicates while alpha kept only
+    the latest, the reliability figure would describe a different dataset than
+    the means it sits beside.
     """
-    by_item: dict[tuple[str, str, str], dict[str, float]] = defaultdict(dict)
+    by_item: dict[tuple[str, str, str], dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for row in rows:
         value = value_fn(row)
         if value is None:
             continue
-        by_item[_item_key(row)][_judge(row)] = value
-    return [list(judge_values.values()) for judge_values in by_item.values()]
+        by_item[_item_key(row)][_judge(row)].append(value)
+    return [
+        [sum(values) / len(values) for values in judge_values.values()]
+        for judge_values in by_item.values()
+    ]
 
 
 def pairwise_absolute_agreement(
@@ -322,7 +340,7 @@ def compute_reliability(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "jury_score": jury_block,
         "per_criterion": per_criterion,
         "pairwise_agreement": pairwise_absolute_agreement(materialized, _jury_value),
-        "interpretation": _interpret_alpha(jury_block["krippendorff_alpha"]),
+        "interpretation": _interpret_alpha(jury_block["krippendorff_alpha"], comparable_items),
     })
     return base
 
@@ -335,14 +353,37 @@ def _round_or_none(value: float | None) -> float | None:
     return round(value, 3) if isinstance(value, (int, float)) else None
 
 
-def _interpret_alpha(alpha: float | None) -> str:
+# Minimum comparable items before an alpha is treated as interpretable, the
+# sibling of MIN_CORRELATION_N below and deliberately the same value: one
+# minimum-sample number is easier to state and defend in a methods section than
+# two. Below this the coefficient is still reported, but the plain-language
+# verdict is withheld — without this gate a 3-paper pilot could headline
+# "Strong agreement: jury scores are reliable", the strongest possible
+# validation claim, off a sample far too small to support it.
+MIN_ALPHA_N = 30
+
+
+def _interpret_alpha(alpha: float | None, n: int | None = None) -> str:
     """Plain-language reading of an alpha value using Krippendorff's own cutoffs.
 
     Krippendorff suggests alpha >= 0.80 for firm conclusions and 0.667 as the
     lowest value at which tentative conclusions are still defensible.
+
+    ``n`` is the number of comparable items behind the estimate. Below
+    :data:`MIN_ALPHA_N` the verdict is withheld regardless of the value, exactly
+    as :func:`interpret_correlation` does for correlations — these two functions
+    answer sibling questions and should not disagree about how much data a
+    verdict needs.
     """
     if alpha is None:
         return "No agreement estimate available."
+    if n is not None and n < MIN_ALPHA_N:
+        return (
+            f"Underpowered: only {n} comparable item(s) (< {MIN_ALPHA_N}). "
+            f"Alpha ({alpha}) is shown for transparency but is too unstable to "
+            "treat as evidence that the jury is reliable -- score more items "
+            "before concluding."
+        )
     if alpha >= 0.80:
         return "Strong agreement (alpha >= 0.80): jury scores are reliable."
     if alpha >= 0.667:

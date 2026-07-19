@@ -241,9 +241,26 @@ def test_build_evaluation_row_keeps_summariser_metadata_only() -> None:
     assert row["composite_score"] is not None
     assert row["rubric_version"] == "vet_medhelm_score_v1.0"
     assert "automatic_metrics" in row
-    # ... but is NOT in any field that would be reconstructed into a judge prompt.
-    rendered = build_judge_prompt("Reference body.", "Candidate body.").lower()
-    assert "anthropic" not in rendered
+    # ... but appears in NO other field of the row.
+    #
+    # This is the row-level half of the blind protocol. The template-level half
+    # is covered above by test_blind_judge_prompt_contains_no_model_identifiers
+    # (behavioural) and ..._signature_excludes_summariser_name (structural).
+    # Scanning the row itself is what catches the remaining leak vector: a
+    # summariser name copied into reasoning, strata, or an excerpt would ride
+    # along into any downstream re-render of the judged text.
+    #
+    # Note this deliberately scans `row`, not a freshly built prompt from two
+    # literals — a prompt built from strings that never contained the token
+    # cannot fail, so it would assert nothing about build_evaluation_row.
+    leaked = sorted(
+        key for key, value in row.items()
+        if key != "summarizer" and "anthropic" in json.dumps(value).lower()
+    )
+    assert not leaked, (
+        f"Summariser identity leaked out of metadata into: {leaked}. "
+        "Only row['summarizer'] may name the summariser."
+    )
 
 
 # Checks that the dry-run fake judge response is deterministic: calling it
@@ -616,7 +633,13 @@ def test_dev_mode_caps_paper_count(tmp_path: Path,
     )
 
     assert counts["evaluated"] == 2  # 2 papers × 1 summariser × 1 judge
-    lines = evaluations_path.read_text(encoding="utf-8").strip().splitlines()
+    # This is a dry-run (PHASE3_MODE=test), so the mock rows are redirected
+    # away from the production ledger and land in the _dryrun sibling. The
+    # production file must stay untouched — that is the whole point of the
+    # guard added after the 2026-07-09 contamination.
+    assert not evaluations_path.exists()
+    dry_run_path = evaluations_path.with_name("evaluations_dryrun.jsonl")
+    lines = dry_run_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
 
 
@@ -656,6 +679,9 @@ def test_run_evaluation_with_explicit_instances_bypasses_summaries_path(
 
     assert counts["evaluated"] == 1
     assert not missing_summaries_path.exists()  # never created or read
+    # Dry-run rows go to the _dryrun sibling, never the production ledger.
+    assert not evaluations_path.exists()
+    evaluations_path = evaluations_path.with_name("evaluations_dryrun.jsonl")
     rows = [json.loads(line) for line in evaluations_path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["doi"] == "10.9999/txt.0001"
@@ -1053,3 +1079,246 @@ def test_write_dev_detail_eval_outputs_overwrites_in_place(tmp_path: Path) -> No
         {"10.1/aaa"}, output_dir=out_dir, evaluations_path=evaluations_path, manifest_index={},
     )
     assert len(list(out_dir.glob("*.md"))) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b.1 — a criterion the judge never returned is not a score of 1
+# ---------------------------------------------------------------------------
+
+def test_jury_score_excludes_missing_criterion() -> None:
+    """Imputing the floor is a strong claim the judge never made.
+
+    faithfulness carries weight 1.5 of 5.5. Scoring it 1 by default drags the
+    composite to (1*1.5 + 4*4.0)/5.5 = 3.18; renormalizing over the criteria
+    actually present gives 4.00 — a 0.82 swing on a 1-5 scale.
+    """
+    from evaluator import MEDHELM_CRITERION_WEIGHTS, calculate_jury_score
+
+    partial = {
+        "completeness": {"score": 4},
+        "clinical_usefulness": {"score": 4},
+        "clarity": {"score": 4},
+        "safety": {"score": 4},
+    }
+    assert calculate_jury_score(partial, weights=MEDHELM_CRITERION_WEIGHTS) == 4.0
+
+
+def test_jury_score_unparseable_criterion_is_not_scored_one() -> None:
+    """'4/5' is unparseable, not terrible."""
+    from evaluator import UNWEIGHTED_CRITERION_WEIGHTS, calculate_jury_score
+
+    scores = {
+        "faithfulness": {"score": "4/5"},
+        "completeness": {"score": 4},
+        "clinical_usefulness": {"score": 4},
+        "clarity": {"score": 4},
+        "safety": {"score": 4},
+    }
+    assert calculate_jury_score(scores, weights=UNWEIGHTED_CRITERION_WEIGHTS) == 4.0
+
+
+def test_jury_score_out_of_range_still_clamps() -> None:
+    """Clamping a genuine out-of-range integer is correct and must survive."""
+    from evaluator import UNWEIGHTED_CRITERION_WEIGHTS, calculate_jury_score
+
+    scores = {c: {"score": 9} for c in
+              ("faithfulness", "completeness", "clinical_usefulness", "clarity", "safety")}
+    assert calculate_jury_score(scores, weights=UNWEIGHTED_CRITERION_WEIGHTS) == 5.0
+
+
+def test_jury_score_all_criteria_missing_is_none() -> None:
+    from evaluator import UNWEIGHTED_CRITERION_WEIGHTS, calculate_jury_score
+
+    assert calculate_jury_score({}, weights=UNWEIGHTED_CRITERION_WEIGHTS) is None
+
+
+def test_missing_criteria_helper_names_the_gaps() -> None:
+    from evaluator import MEDHELM_CRITERION_WEIGHTS, missing_criteria
+
+    scores = {"completeness": {"score": 4}, "faithfulness": {"score": "n/a"}}
+    assert missing_criteria(scores, weights=MEDHELM_CRITERION_WEIGHTS) == [
+        "faithfulness", "clinical_usefulness", "clarity", "safety",
+    ]
+
+
+def test_parse_judge_response_records_missing_criteria() -> None:
+    """The row must carry which criteria were absent, so a consumer can filter."""
+    import json as _json
+
+    from evaluator import parse_judge_response
+
+    payload = {
+        "criteria_scores": {
+            "completeness": {"score": 4, "reasoning": "ok"},
+            "clinical_usefulness": {"score": 4, "reasoning": "ok"},
+            "clarity": {"score": 4, "reasoning": "ok"},
+            "safety": {"score": 4, "reasoning": "ok"},
+        },
+        "hallucination": {"present": False, "claims": []},
+        "confidence": 5,
+    }
+    parsed = parse_judge_response(_json.dumps(payload))
+    assert parsed["missing_criteria"] == ["faithfulness"]
+    assert parsed["jury_score_unweighted"] == 4.0
+
+
+def test_hallucination_count_survives_explicit_null() -> None:
+    """`{"count": null}` must not crash the parser.
+
+    dict.get's default never fires for a present-but-null key, so
+    int(halluc_block.get("count", len(claims))) raised TypeError on a judge
+    that answered `"count": null` — a whole judge response lost to a crash.
+    """
+    import json as _json
+
+    from evaluator import parse_judge_response
+
+    payload = {
+        "criteria_scores": {c: {"score": 4, "reasoning": "ok"} for c in
+                            ("faithfulness", "completeness", "clinical_usefulness",
+                             "clarity", "safety")},
+        "hallucination": {"present": True, "count": None,
+                          "claims": [{"severity": "major", "category": "contradiction"}]},
+        "confidence": 5,
+    }
+    parsed = parse_judge_response(_json.dumps(payload))
+    # Falls back to the actual number of claims rather than crashing.
+    assert parsed["hallucination_count"] == 1
+    assert parsed["parse_method"] == "json"
+
+
+# ---------------------------------------------------------------------------
+# Dry-run contamination guards
+# ---------------------------------------------------------------------------
+#
+# BACKGROUND: on 2026-07-09 a PHASE3_MODE=test run appended 16 mock rows to
+# data/evaluations.jsonl. Nothing distinguished them from real judge output,
+# so five days of reports averaged hash-derived scores in with real ones, and
+# 10.1111/jvim.16872 was locked out of ever being judged because the resume
+# check saw its mock row and skipped it. These tests pin both directions:
+# mock rows must not be READ as real, and must not be WRITTEN to production.
+
+
+def _mock_row(**overrides: object) -> dict:
+    """A row shaped like what _mock_judge_response produces."""
+    row = {
+        "doi": "10.1111/jvim.16872",
+        "summarizer": "anthropic",
+        "judge": "openai",
+        "input_source": "processed",
+        "rubric_version": evaluator.RUBRIC_VERSION,
+        "judge_model_version": "gpt-5.4-DRYRUN",
+        "reasoning": "[MOCK] dry-run evaluation",
+        "jury_score": 3.2,
+    }
+    row.update(overrides)
+    return row
+
+
+def _real_row(**overrides: object) -> dict:
+    row = _mock_row()
+    row.update({"judge_model_version": "gpt-5.4-2026-03-05",
+                "reasoning": "The summary is well supported."})
+    row.update(overrides)
+    return row
+
+
+def test_is_dry_run_row_matches_suffix_and_reasoning() -> None:
+    """Either signal alone is enough; a real row trips neither."""
+    assert evaluator.is_dry_run_row(_mock_row()) is True
+    # Suffix alone, real-looking reasoning.
+    assert evaluator.is_dry_run_row(_mock_row(reasoning="looks real")) is True
+    # Reasoning alone, in case a row ever loses its model_version.
+    assert evaluator.is_dry_run_row(
+        _mock_row(judge_model_version="gpt-5.4-2026-03-05")) is True
+    assert evaluator.is_dry_run_row(_real_row()) is False
+    # Must not match a model that merely contains the word.
+    assert evaluator.is_dry_run_row(
+        _real_row(judge_model_version="gpt-DRYRUN-turbo")) is False
+    assert evaluator.is_dry_run_row(None) is False
+
+
+def test_is_dry_run_slot_reads_model_version() -> None:
+    assert evaluator.is_dry_run_slot({"model_version": "gpt-5.4-DRYRUN"}) is True
+    assert evaluator.is_dry_run_slot({"model_version": "gpt-5.4-2026-03-05"}) is False
+    assert evaluator.is_dry_run_slot({}) is False
+    assert evaluator.is_dry_run_slot(None) is False
+
+
+def test_is_production_path_resolves_before_comparing() -> None:
+    """A reconstructed path naming the same file must count as production.
+
+    A bare `==` would miss this, and on a OneDrive-backed Windows path so
+    would a case-sensitive compare.
+    """
+    reconstructed = evaluator.DATA_DIR / "evaluations.jsonl"
+    assert evaluator.is_production_path(reconstructed, evaluator.EVALUATIONS_PATH)
+    # None means "use the default", which IS the production file.
+    assert evaluator.is_production_path(None, evaluator.EVALUATIONS_PATH)
+    assert not evaluator.is_production_path(
+        Path("somewhere_else.jsonl"), evaluator.EVALUATIONS_PATH)
+
+
+def test_dry_run_sibling_stays_beside_target(tmp_path: Path) -> None:
+    """Redirect target is derived from the path, never hardcoded to data/.
+
+    A fixed constant would send a test writing to tmp into the real data/
+    folder — the guard must not itself write somewhere unexpected.
+    """
+    sibling = evaluator.dry_run_sibling(tmp_path / "evaluations.jsonl")
+    assert sibling == tmp_path / "evaluations_dryrun.jsonl"
+
+
+def test_already_evaluated_ignores_mock_rows(tmp_path: Path,
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE REGRESSION: a mock row must not make a paper look already judged.
+
+    The orphan mock for 10.1111/jvim.16872 matched the resume key exactly
+    (same doi/summarizer/judge/rubric_version), so --resume skipped a paper
+    that no judge had ever actually scored.
+    """
+    ledger = tmp_path / "evaluations.jsonl"
+    ledger.write_text(json.dumps(_mock_row()) + "\n", encoding="utf-8")
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", ledger)
+
+    assert evaluator.already_evaluated(
+        "10.1111/jvim.16872", "anthropic", "openai") is False
+
+    # A real row for the same key still resumes correctly.
+    ledger.write_text(json.dumps(_real_row()) + "\n", encoding="utf-8")
+    assert evaluator.already_evaluated(
+        "10.1111/jvim.16872", "anthropic", "openai") is True
+
+
+def test_append_evaluation_redirects_mock_row_with_explicit_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard keys off the target file, not off `path is None`.
+
+    check_batch_status calls append_evaluation(row, EVALUATIONS_PATH) with the
+    path explicit, so a `path is None` test would let mock rows straight into
+    production.
+    """
+    production = tmp_path / "evaluations.jsonl"
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", production)
+
+    evaluator.append_evaluation(_mock_row(), production)
+
+    assert not production.exists(), "mock row reached the production ledger"
+    redirected = tmp_path / "evaluations_dryrun.jsonl"
+    assert redirected.exists()
+    assert json.loads(redirected.read_text(encoding="utf-8").strip())["doi"] \
+        == "10.1111/jvim.16872"
+
+
+def test_append_evaluation_still_writes_real_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard must not block real judge output."""
+    production = tmp_path / "evaluations.jsonl"
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", production)
+
+    evaluator.append_evaluation(_real_row(), production)
+
+    assert production.exists()
+    assert not (tmp_path / "evaluations_dryrun.jsonl").exists()

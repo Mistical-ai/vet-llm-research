@@ -68,6 +68,12 @@ from file_paths import descriptive_stem, doi_to_slug, resolve_existing_pdf_path 
 from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
 from extract import truncate_to_limit  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
+# Shared dry-run guards live in evaluator.py next to the mock that stamps the
+# marker, so reader and writer can never drift. Safe top-level import:
+# evaluator does not import summarizer.
+from evaluator import (  # noqa: E402
+    DRY_RUN_MODEL_SUFFIX, dry_run_sibling, is_dry_run_slot, is_production_path,
+)
 
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
@@ -189,11 +195,12 @@ class VeterinarySummary(BaseModel):
     )
     summary_text: str = Field(
         description=(
-            "A short plain-language prose summary of 300-340 words; do not exceed 360 "
+            "A short plain-language prose summary of 300-340 words; do not exceed 400 "
             "words. Written for a busy veterinary clinician. Flowing paragraphs only — no "
             "numbered lists, no bullet points, no bold headers — one paragraph each "
             "for Background, Methods, Results, Limitations, and Conclusions, in that "
-            "order. Mention only headline numbers. Must not include unsupported facts."
+            "order. Mention only headline numbers; keep exhaustive statistics in "
+            "key_findings instead. Must not include unsupported facts."
         ),
     )
 
@@ -715,7 +722,7 @@ def _mock_summary(model_name: str, article_text: str, title_hint: str = "") -> d
         parsed=parsed,
         input_tokens=max(100, len(article_text) // 4),
         output_tokens=120,
-        model_version=f"{spec.model_id}-DRYRUN",
+        model_version=f"{spec.model_id}{DRY_RUN_MODEL_SUFFIX}",
     )
 
 
@@ -1347,7 +1354,15 @@ def _new_summary_entry(record: dict, input_source: str = "processed") -> dict:
 
 
 def load_existing_summaries(path: Path | None = None) -> dict[str, dict]:
-    """Load existing summaries keyed by DOI + input source for resume support."""
+    """Load existing summaries keyed by DOI + input source for resume support.
+
+    Mock slots are returned as-is. This is the shared reader behind the
+    readable-folder writers, evaluate's candidate lookup and the batch merge,
+    so filtering here would blank every slot during a dry-run and leave the
+    whole test-mode pipeline producing empty output. The narrower question
+    "should --resume treat this slot as done?" is answered at the resume-skip
+    sites instead, via ``is_dry_run_slot``.
+    """
     resolved = path if path is not None else SUMMARIES_PATH
     if not resolved.exists():
         return {}
@@ -1367,6 +1382,62 @@ def load_existing_summaries(path: Path | None = None) -> dict[str, dict]:
     return out
 
 
+def _slot_is_done(slot: dict) -> bool:
+    """True when ``--resume`` should skip this provider slot as already done.
+
+    A LIVE run refuses to accept a dry-run leftover as finished work: a mock
+    slot must be redone rather than silently standing in for a real summary.
+    A dry run accepts its own mocks, since there they are the expected
+    output — otherwise test mode could never resume at all.
+    """
+    if slot.get("status") != "success":
+        return False
+    return not is_dry_run_slot(slot) or resolve_mode().dry_run
+
+
+def _payload_has_dry_run_slot(summaries_by_doi: dict[str, dict]) -> bool:
+    """True when any per-provider model slot in the payload holds mock output."""
+    for entry in summaries_by_doi.values():
+        models = entry.get("models") if isinstance(entry, dict) else None
+        if not isinstance(models, dict):
+            continue
+        if any(is_dry_run_slot(slot) for slot in models.values()):
+            return True
+    return False
+
+
+def _file_holds_real_summaries(path: Path) -> bool:
+    """True when ``path`` already contains at least one genuine model slot.
+
+    Read defensively: an unreadable or malformed file is reported as holding
+    real work, because the safe assumption when we cannot tell is "there is
+    something here worth not destroying."
+    """
+    if not path.exists():
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                models = entry.get("models") if isinstance(entry, dict) else None
+                if not isinstance(models, dict):
+                    continue
+                for slot in models.values():
+                    if not isinstance(slot, dict) or is_dry_run_slot(slot):
+                        continue
+                    if slot.get("summary_text") or slot.get("model_version"):
+                        return True
+    except OSError:
+        return True
+    return False
+
+
 def _write_all_summaries(path: Path, summaries_by_doi: dict[str, dict]) -> None:
     """
     Rewrite the summaries file from scratch.
@@ -1376,7 +1447,35 @@ def _write_all_summaries(path: Path, summaries_by_doi: dict[str, dict]) -> None:
     rewrite the whole file in one atomic step at the end of each run. Each
     line is still valid JSON, so any partial-completion analysis still works
     on the snapshot from before the rewrite.
+
+    DRY-RUN GUARD: because this path REWRITES rather than appends, a dry-run
+    run would splice "[MOCK ...]" text into the real rows' model slots and
+    replace production in place — destroying the originals, with nothing left
+    to recover or compare against. (The 2026-07-09 evaluations incident was
+    diagnosable only because appending left the real rows intact beside the
+    mocks.) So a mock write that would DESTROY REAL WORK is diverted to a
+    ``_dryrun`` sibling instead. The check sits BEFORE tmp.replace(path):
+    diverting after the tmp had already landed on production is no guard.
+
+    Deliberately narrow. It fires only when the target already holds genuine
+    summaries, not on every dry-run write, because the whole Phase 3 pipeline
+    (readable-folder writers, evaluate's dataset hash, batch merge, status)
+    reads this one path. Diverting unconditionally would leave a dry-run
+    writing one file while every downstream step read another — a fragmented
+    pipeline in exchange for no extra safety, since a dry-run over an absent
+    or already-mock file destroys nothing.
+
+    Two independent signals arm the guard — the run mode, and the payload
+    itself. Mode alone is sufficient today; the slot check catches a future
+    bug that stamps mock slots while the mode still reports live.
     """
+    mock_write = resolve_mode().dry_run or _payload_has_dry_run_slot(summaries_by_doi)
+    if (mock_write and is_production_path(path, SUMMARIES_PATH)
+            and _file_holds_real_summaries(path)):
+        path = dry_run_sibling(path)
+        print(f"[phase3] REFUSING to overwrite real summaries with mock output.\n"
+              f"[phase3] dry-run → {path.name} (production untouched)")
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1550,7 +1649,7 @@ def run_realtime(
 
         for provider in providers:
             slot = entry["models"].setdefault(provider, _empty_model_slot())
-            if resume and slot.get("status") == "success":
+            if resume and _slot_is_done(slot):
                 counts["skipped"] += 1
                 print(f"  {provider}: already success, skipping")
                 continue
@@ -1710,10 +1809,10 @@ def _format_provider_section(provider: str, result: dict) -> list[str]:
 # mistaken for a second section boundary.
 _PROSE_SECTION_HEADERS = ("Background", "Methods", "Results", "Limitations", "Conclusions")
 
-# summary_text word ceiling surfaced in the readable prose file. The prompt now
-# asks for 300-340 words (hard ceiling 360), but LLMs only approximate word
-# counts, so this display-only flag makes any overshoot past 400 obvious on
-# inspection. It never edits the summary — enforcement stays prompt-side only.
+# summary_text word ceiling surfaced in the readable prose file. The prompt asks
+# for 300-340 words with a hard ceiling of 400, so this display-only flag fires
+# exactly when that ceiling is breached. It never edits the summary — enforcement
+# stays prompt-side only, because LLMs only approximate word counts.
 _PROSE_WORD_FLAG_THRESHOLD = 400
 
 
@@ -1843,6 +1942,13 @@ _DEV_SUMMARY_INTRO_BY_RUN_KIND = {
         "generated by a `summarize --mode single` run. It mirrors data/summaries.jsonl\n"
         "for this DOI in a human-readable form; the JSONL file remains the source of truth."
     ),
+    "batch": (
+        "This file contains one summary from each configured model provider,\n"
+        "merged back from a `summarize --mode batch` run (see check_batch_status.py).\n"
+        "It mirrors data/summaries.jsonl for this DOI in a human-readable form; the\n"
+        "JSONL file remains the source of truth. Batch results merge one provider at a\n"
+        "time, so this file is rewritten as each provider's results arrive."
+    ),
 }
 
 
@@ -1894,8 +2000,9 @@ def _format_dev_prose_entry_as_text(entry: dict, *, run_kind: str = "dev") -> st
     Readable prose sibling of ``_format_dev_summary_entry_as_text``.
 
     Same header block, but each provider section shows the flowing clinician
-    ``summary_text`` (the field the blind judge actually scores and the 400-word
-    rule governs) with a word count and over-budget flag, instead of the
+    ``summary_text`` (the field the blind judge actually scores and the
+    300-340-word budget governs, hard ceiling 400) with a word count and
+    over-budget flag, instead of the
     structured bullet lists. Written to the ``prose/`` subfolder alongside the
     top-level bullet file (see ``write_dev_summary_jsonl_outputs``).
     """
@@ -1909,6 +2016,25 @@ def _format_dev_prose_entry_as_text(entry: dict, *, run_kind: str = "dev") -> st
     return "\n".join(lines).rstrip() + "\n"
 
 
+# summarize-all's readable .txt is a lossy render (capped lists, no token
+# counts), so it cannot drive --resume on its own. The full entry is mirrored
+# into this hidden sibling folder instead, keyed by the UNSUFFIXED stem.
+#
+# Keying on the bare stem is what makes resume work under the default
+# SUMMARIZE_ALL_UNIQUE_OUTPUT=true, where every run appends __run_<timestamp>
+# to the .txt name: each run writes a new visible .txt but updates the one
+# sidecar, so the next run can still tell which providers already succeeded.
+#
+# The folder is dotted and holds only .json, so it is invisible to every
+# readable-folder reader (all of which glob "*.txt" non-recursively) and to
+# _warn_about_unread_subfolders, which only names subfolders containing .txt.
+_RESUME_SIDECAR_DIRNAME = ".resume"
+
+
+def _resume_sidecar_path(output_dir: Path, stem: str) -> Path:
+    return output_dir / _RESUME_SIDECAR_DIRNAME / f"{stem}.json"
+
+
 def _write_folder_output(
     output_dir: Path,
     stem: str,
@@ -1917,25 +2043,48 @@ def _write_folder_output(
     output_suffix: str | None = None,
     formatter: Callable[[dict], str] = _format_folder_entry_as_text,
 ) -> Path:
-    """Atomically write one paper's multi-model summary to the output folder."""
+    """Atomically write one paper's multi-model summary to the output folder.
+
+    Also refreshes the resume sidecar (see _RESUME_SIDECAR_DIRNAME) so a later
+    ``--resume`` run can skip provider slots that already succeeded.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     output_stem = f"{stem}__{output_suffix}" if output_suffix else stem
     out_path = output_dir / f"{output_stem}.txt"
     tmp_path = out_path.with_suffix(".txt.tmp")
     tmp_path.write_text(formatter(entry), encoding="utf-8")
     tmp_path.replace(out_path)
+
+    # Never let a sidecar problem lose the summary that was just written: the
+    # .txt is the deliverable, the sidecar is only an optimisation.
+    try:
+        sidecar = _resume_sidecar_path(output_dir, stem)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_tmp = sidecar.with_suffix(".json.tmp")
+        sidecar_tmp.write_text(
+            json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        sidecar_tmp.replace(sidecar)
+    except OSError as exc:
+        print(f"  [warn] could not write resume sidecar for {stem}: {exc}")
     return out_path
 
 
 def _load_folder_output(output_dir: Path, stem: str) -> dict | None:
-    """Load legacy JSON folder output for resume support, or return None."""
-    path = output_dir / f"{stem}.json"
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+    """Load a previous run's entry for ``stem``, or None if there isn't one.
+
+    Reads the resume sidecar written by _write_folder_output. The legacy
+    ``<stem>.json`` beside the .txt is still honoured so folders produced
+    before the sidecar existed keep resuming.
+    """
+    for path in (_resume_sidecar_path(output_dir, stem),
+                 output_dir / f"{stem}.json"):
+        if not path.exists():
+            continue
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
 
 
 def write_dev_summary_jsonl_outputs(
@@ -1948,9 +2097,11 @@ def write_dev_summary_jsonl_outputs(
     run_kind: str = "dev",
 ) -> int:
     """
-    Render a plain-English ``.txt`` file per DOI into ``output_dir`` — either
-    ``data/dev_summaries_jsonl/`` (``run_kind="dev"``, the default) or
-    ``data/single_summaries_jsonl/`` (``run_kind="single"``).
+    Render a plain-English ``.txt`` file per DOI into ``output_dir`` —
+    ``data/dev_summaries_jsonl/`` (``run_kind="dev"``, the default),
+    ``data/single_summaries_jsonl/`` (``run_kind="single"``), or
+    ``data/batch_summaries_jsonl/`` (``run_kind="batch"``, written from
+    ``check_batch_status.merge_summarisation_results``).
 
     This is the readable sibling of a real-time ``summarize`` run: it reads
     back the entries ``run_realtime`` just wrote to ``data/summaries.jsonl``
@@ -2094,7 +2245,7 @@ def summarize_all_pdfs(
 
         for provider in provider_list:
             slot = entry["models"].setdefault(provider, _empty_model_slot())
-            if resume and slot.get("status") == "success":
+            if resume and _slot_is_done(slot):
                 counts["skipped"] += 1
                 print(f"  {provider}: already success, skipping")
                 continue
@@ -2202,7 +2353,7 @@ def summarize_all_processed_texts(
 
         for provider in provider_list:
             slot = entry["models"].setdefault(provider, _empty_model_slot())
-            if resume and slot.get("status") == "success":
+            if resume and _slot_is_done(slot):
                 counts["skipped"] += 1
                 print(f"  {provider}: already success, skipping")
                 continue

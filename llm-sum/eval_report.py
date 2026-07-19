@@ -26,6 +26,10 @@ from typing import Any, Iterable
 from scenarios import VET_TAXONOMY_V1, VeterinarySummaryQualityScenario
 from reliability import compute_reliability
 from eval_instances import load_manifest_index
+# evaluator.py owns the dry-run predicates because it owns the mock that
+# stamps the marker. Safe as a top-level import: evaluator does not import
+# eval_report, so there is no cycle.
+from evaluator import dry_run_sibling, is_dry_run_row
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 HUMAN_REVIEWS_PATH = DATA_DIR / "human_reviews.jsonl"
@@ -63,21 +67,57 @@ def save_markdown_detail_report(markdown: str, ts: str, out_dir: Path = RESULTS_
     return out_path
 
 
-def iter_evaluation_rows(path: Path | None = None) -> Iterable[dict[str, Any]]:
-    """Yield valid evaluation rows from append-only JSONL."""
+def count_dry_run_rows(path: Path | None = None) -> int:
+    """How many mock rows the ledger holds, for report headers.
+
+    Reported rather than silently dropped: an unexplained N is what let the
+    original contamination survive five days of reports.
+    """
     resolved = path if path is not None else EVALUATIONS_PATH
-    if not resolved.exists():
-        return
-    with open(resolved, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict):
+    return sum(1 for row in iter_evaluation_rows(resolved, include_dry_run=True)
+               if is_dry_run_row(row))
+
+
+def iter_evaluation_rows(path: Path | None = None, *,
+                         include_dry_run: bool = False) -> Iterable[dict[str, Any]]:
+    """Yield valid evaluation rows from append-only JSONL.
+
+    Rows produced by the dry-run mock are skipped by default. This is the
+    shared reader behind every report, table, figure, significance test and
+    human-review export, so filtering here keeps mock data out of all of them
+    at once. See ``evaluator.is_dry_run_row`` for what counts as a mock.
+
+    ``include_dry_run=True`` switches to provenance/forensic mode: it keeps
+    mock rows AND additionally reads the ``_dryrun`` sibling that the write
+    guard diverts them to, so callers recording what actually ran (the run
+    manifest's resolved model versions) see the whole picture. Without the
+    union, a test-mode run would write its rows to the sibling and then
+    produce a manifest claiming real model versions — the same class of bug
+    this filter exists to prevent.
+    """
+    resolved = path if path is not None else EVALUATIONS_PATH
+    sources = [resolved]
+    if include_dry_run:
+        sibling = dry_run_sibling(resolved)
+        if sibling != resolved:
+            sources.append(sibling)
+
+    for source in sources:
+        if not source.exists():
+            continue
+        with open(source, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if not include_dry_run and is_dry_run_row(row):
+                    continue
                 yield row
 
 
@@ -96,29 +136,34 @@ def _load_human_reviews(path: Path | None) -> list[dict[str, Any]] | None:
     return list(iter_human_review_rows(resolved))
 
 
-def _score(row: dict[str, Any]) -> float | None:
-    """Prefer MedHELM jury_score but fall back to legacy quality_score."""
-    value = row.get("jury_score")
-    if isinstance(value, (int, float)):
-        return float(value)
-    value = row.get("quality_score")
-    if isinstance(value, (int, float)) and value != 99:
-        return float(value)
-    return None
+def _rate(aggregates: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    """Item-level rates for one collapsed flag, plus its coverage.
 
+    Only items where at least one judge reported usable data enter either the
+    numerator or the denominator. Rows with no usable data used to count as
+    negative while staying in the denominator, which biased every rate toward
+    the flattering answer — a worse parse rate read as fewer hallucinations.
 
-def _field_score(row: dict[str, Any], field: str) -> float | None:
-    """Read a specific numeric aggregation field (weighted or unweighted)."""
-    value = row.get(field)
-    return float(value) if isinstance(value, (int, float)) else None
-
-
-def _major_hallucination(row: dict[str, Any]) -> bool:
-    return any(
-        claim.get("severity") == "major"
-        for claim in (row.get("hallucination_claims") or [])
-        if isinstance(claim, dict)
-    )
+    Three figures, because inter-judge agreement on hallucination is low and a
+    single number would hide that (see report_tables._collapse_flags):
+      rate       — MAJORITY of reporting judges. The headline.
+      any_rate   — at least one judge flagged it. Upper bound / sensitivity.
+      mean_rate  — mean per-judge flag rate. Comparable to the pre-fix figure,
+                   which was judge-row-weighted, and answers a per-judgement
+                   rather than a per-summary question.
+    """
+    flags = [agg.get(key) or {} for agg in aggregates]
+    reported = [f for f in flags if f.get("value") is not None]
+    n_missing = sum(1 for f in flags if f.get("value") is None)
+    if not reported:
+        return {"rate": None, "any_rate": None, "mean_rate": None, "n_missing": n_missing}
+    n = len(reported)
+    return {
+        "rate": round(sum(1 for f in reported if f["value"]) / n, 3),
+        "any_rate": round(sum(1 for f in reported if f.get("any_value")) / n, 3),
+        "mean_rate": round(sum(f.get("mean_rate") or 0.0 for f in reported) / n, 3),
+        "n_missing": n_missing,
+    }
 
 
 def _strata_value(row: dict[str, Any], field: str) -> str:
@@ -133,49 +178,92 @@ def _strata_value(row: dict[str, Any], field: str) -> str:
 
 
 def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarizer") -> list[dict[str, Any]]:
-    """Aggregate scores and reliability signals by one grouping field."""
+    """Aggregate scores and reliability signals by one grouping field.
+
+    ITEM-WEIGHTED. Rows are grouped by the requested field, then each group is
+    collapsed through ``report_tables.collect_item_scores`` so multiple judges
+    scoring the same summary are averaged within that summary before summaries
+    are averaged together. A paper that happened to draw three judges is still
+    one paper.
+
+    This function used to average judge ROWS directly, which let a 3-judge
+    paper outvote a 1-judge paper 3:1 — and since the evaluator resumes
+    per (doi, summariser, judge), a ragged panel is the normal case rather than
+    the exception. On a corpus where paper X scored 5,5,5 and paper Y scored 2,
+    the old code printed 4.25 and report_tables printed 3.50 from identical
+    data. Both now print 3.50; ``tests/test_eval_report.py`` pins the equality.
+
+    ``report_tables`` imports this module, so the import is function-local to
+    break the cycle — the same pattern ``_load_human_reviews`` uses.
+    """
+    from report_tables import collect_item_scores  # noqa: E402  (lazy: avoids circular import)
+
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[_strata_value(row, group_field)].append(row)
 
     summary: list[dict[str, Any]] = []
-    for group, items in sorted(groups.items()):
-        scores = [score for row in items if (score := _score(row)) is not None]
-        weighted_scores = [
-            s for row in items if (s := _field_score(row, "jury_score_weighted")) is not None
-        ]
-        unweighted_scores = [
-            s for row in items if (s := _field_score(row, "jury_score_unweighted")) is not None
-        ]
-        hallucination_rows = [row for row in items if int(row.get("hallucination_count") or 0) > 0]
-        major_rows = [row for row in items if _major_hallucination(row)]
-        low_confidence = [row for row in items if int(row.get("confidence_score") or 0) < 3]
-        malformed = [row for row in items if row.get("parse_method") == "sentinel"]
-        disagreements = [
-            float(row["judge_disagreement"])
-            for row in items
-            if isinstance(row.get("judge_disagreement"), (int, float))
-        ]
+    for group, group_rows in sorted(groups.items()):
+        # Collapse WITHIN the group: grouping is a row-level operation, while
+        # judge-averaging is per (paper, provider). Doing it in this order lets
+        # any stratum field group arbitrarily without collect_item_scores
+        # needing to know the field exists.
+        item_scores = collect_item_scores(group_rows)
+        aggregates = [agg for by_provider in item_scores.values() for agg in by_provider.values()]
+
+        unweighted = [a["unweighted"] for a in aggregates if a["unweighted"] is not None]
+        weighted = [a["weighted"] for a in aggregates if a["weighted"] is not None]
+        disagreements = [a["disagreement"] for a in aggregates if a["disagreement"] is not None]
+
+        halluc = _rate(aggregates, "hallucination")
+        major = _rate(aggregates, "major_hallucination")
+        low_confidence = _rate(aggregates, "low_confidence")
+        parse_failure = _rate(aggregates, "parse_failure")
+
+        # Rows carrying no (doi, summarizer) identity cannot be attributed to an
+        # item, so collect_item_scores drops them. Surface the count rather than
+        # letting the shortfall vanish silently.
+        n_unkeyed = len(group_rows) - sum(
+            1 for r in group_rows
+            if str(r.get("doi", "")).strip() and str(r.get("summarizer", "")).strip()
+        )
+
         summary.append({
             "group": group,
-            "n_rows": len(items),
-            "n_scored": len(scores),
-            "mean_score": round(sum(scores) / len(scores), 3) if scores else None,
+            # n_items is the unit every mean above is computed over. n_rows is
+            # the judge-row count, kept because it is what the cost of the run
+            # scales with. These differ by the panel size; conflating them is
+            # what made "N" name three different quantities across the report.
+            "n_items": len(aggregates),
+            "n_rows": len(group_rows),
+            "n_scored": len(unweighted),
+            "n_unkeyed_rows": n_unkeyed,
+            # Primary MedHELM score. Deliberately the SAME 1-5 quantity as
+            # mean_score_unweighted: the old code fell back to legacy
+            # quality_score, which is 1-10, and averaged it with 1-5 values —
+            # emitting a number on neither scale under the most neutral name a
+            # consumer would reach for.
+            "mean_score": round(sum(unweighted) / len(unweighted), 3) if unweighted else None,
             # Both aggregation methods, so weighted vs. unweighted can be
             # compared in the same report without re-running judges.
-            "mean_score_weighted": (
-                round(sum(weighted_scores) / len(weighted_scores), 3) if weighted_scores else None
-            ),
+            "mean_score_weighted": round(sum(weighted) / len(weighted), 3) if weighted else None,
             "mean_score_unweighted": (
-                round(sum(unweighted_scores) / len(unweighted_scores), 3) if unweighted_scores else None
+                round(sum(unweighted) / len(unweighted), 3) if unweighted else None
             ),
-            "hallucination_rate": round(len(hallucination_rows) / len(items), 3) if items else 0.0,
-            "major_hallucination_rate": round(len(major_rows) / len(items), 3) if items else 0.0,
-            "low_confidence_rate": round(len(low_confidence) / len(items), 3) if items else 0.0,
-            "parse_failure_rate": round(len(malformed) / len(items), 3) if items else 0.0,
+            # Majority-of-judges headline, with the upper bound and the
+            # per-judgement rate beside it. The spread between the three is the
+            # inter-judge disagreement and is meant to be visible.
+            "hallucination_rate": halluc["rate"],
+            "hallucination_rate_any_judge": halluc["any_rate"],
+            "hallucination_rate_mean_per_judge": halluc["mean_rate"],
+            "hallucination_n_missing": halluc["n_missing"],
+            "major_hallucination_rate": major["rate"],
+            "major_hallucination_rate_any_judge": major["any_rate"],
+            "major_hallucination_n_missing": major["n_missing"],
+            "low_confidence_rate": low_confidence["rate"],
+            "parse_failure_rate": parse_failure["rate"],
             "mean_judge_disagreement": (
-                round(sum(disagreements) / len(disagreements), 3)
-                if disagreements else None
+                round(sum(disagreements) / len(disagreements), 3) if disagreements else None
             ),
         })
     return summary
@@ -281,11 +369,13 @@ def _print_table(title: str, rows: list[dict[str, Any]]) -> bool:
     if len(rows) == 1 and str(rows[0]["group"]).strip().lower() == "unknown":
         return False
 
-    headers = ["Group", "N", "Weighted", "Unweighted", "Halluc%", "Major%", "LowConf%", "ParseFail%"]
+    # "Items" not "N": every mean in this table is computed over summaries, not
+    # over judge rows, so the column has to name the same unit.
+    headers = ["Group", "Items", "Weighted", "Unweighted", "Halluc%", "Major%", "LowConf%", "ParseFail%"]
     body = [
         [
             str(row["group"]),
-            str(row["n_rows"]),
+            str(row["n_items"]),
             _fmt_score(row["mean_score_weighted"]),
             _fmt_score(row["mean_score_unweighted"]),
             _fmt_pct(row["hallucination_rate"]),
@@ -331,7 +421,7 @@ def _markdown_stratum_table(rows: list[dict[str, Any]]) -> list[str]:
     )
 
     lines = [
-        "| Group | N | Unweighted | Weighted | Hallucination % | Major % |",
+        "| Group | Items | Unweighted | Weighted | Hallucination % | Major % |",
         "|---|---|---|---|---|---|",
     ]
     for row in ordered:
@@ -339,7 +429,7 @@ def _markdown_stratum_table(rows: list[dict[str, Any]]) -> list[str]:
         label = "(no metadata)" if group.strip().lower() == "unknown" else group
         unweighted_cell = _bold_top(_fmt_score(row["mean_score_unweighted"]), row["mean_score_unweighted"], top)
         lines.append(
-            f"| {label} | {row['n_rows']} | {unweighted_cell} | {_fmt_score(row['mean_score_weighted'])} | "
+            f"| {label} | {row['n_items']} | {unweighted_cell} | {_fmt_score(row['mean_score_weighted'])} | "
             f"{_fmt_pct(row['hallucination_rate'])} | {_fmt_pct(row['major_hallucination_rate'])} |"
         )
     return lines
@@ -407,6 +497,25 @@ def _fmt_kappa(kappa: float | None, n: int | None) -> str:
     return "-" if kappa is None else f"{kappa:.2f} (n={n or 0})"
 
 
+def _fmt_kappa_pair(stats: dict[str, Any]) -> str:
+    """Quadratic kappa (headline) with the exact-match kappa beside it.
+
+    Ratings are ordinal 1-5, so quadratic weighting — which penalises a 4-vs-5
+    disagreement far less than 1-vs-5 — answers the right question and is the
+    primary figure. The unweighted value is kept visible as an exact-match
+    sensitivity check rather than dropped. An "undefined" marker distinguishes
+    the degenerate all-one-category case from genuine perfect agreement.
+    """
+    quadratic = stats.get("cohen_kappa_quadratic")
+    exact = stats.get("cohen_kappa")
+    if quadratic is None and exact is None:
+        return "-"
+    marker = " undefined" if stats.get("kappa_undefined") else ""
+    quad_cell = "-" if quadratic is None else f"{quadratic:.2f}"
+    exact_cell = "-" if exact is None else f"{exact:.2f}"
+    return f"{quad_cell} / {exact_cell}{marker}"
+
+
 def _corr_row_md(label: str, stats: dict[str, Any]) -> str:
     ba = stats.get("bland_altman") or {}
     return (
@@ -414,7 +523,7 @@ def _corr_row_md(label: str, stats: dict[str, Any]) -> str:
         f"{_fmt_corr(stats.get('spearman'), stats.get('spearman_p'))} | "
         f"{_fmt_corr(stats.get('pearson'), stats.get('pearson_p'))} | "
         f"{_fmt_stat(ba.get('mean_bias'))} | "
-        f"{_fmt_kappa(stats.get('cohen_kappa'), stats.get('n'))} | "
+        f"{_fmt_kappa_pair(stats)} | "
         f"{_fmt_pct(stats.get('percent_agreement'))} |"
     )
 
@@ -427,10 +536,12 @@ def _render_hvj_markdown(hvj: dict[str, Any] | None, heading: str) -> list[str]:
     overall_w = hvj.get("overall_weighted") or {}
     lines = [
         f"**{heading}** (Spearman is the headline; bias is mean human − jury; "
-        "Kappa/% Agreement are categorical, rounded to the nearest 1-5 score):",
+        "Kappa/% Agreement are categorical, rounded to the nearest 1-5 score; kappa is "
+        "shown as quadratic-weighted / exact-match, the former being primary for "
+        "ordinal ratings):",
         "",
     ]
-    lines.append("| Score | N | Spearman | Pearson | Bias | Cohen's Kappa | % Agreement |")
+    lines.append("| Score | N | Spearman | Pearson | Bias | Kappa quad/exact | % Agreement |")
     lines.append("|---|---|---|---|---|---|---|")
     lines.append(_corr_row_md("**Overall (unweighted, MedHELM-comparable)**", overall))
     if overall_w:
@@ -443,7 +554,7 @@ def _render_hvj_markdown(hvj: dict[str, Any] | None, heading: str) -> list[str]:
     if per_criterion:
         lines.append("<details><summary>Per-criterion diagnostics</summary>")
         lines.append("")
-        lines.append("| Criterion | N | Spearman | Pearson | Bias | Cohen's Kappa | % Agreement |")
+        lines.append("| Criterion | N | Spearman | Pearson | Bias | Kappa quad/exact | % Agreement |")
         lines.append("|---|---|---|---|---|---|---|")
         for criterion, stats in per_criterion.items():
             lines.append(_corr_row_md(criterion, stats))
@@ -513,6 +624,16 @@ def _render_markdown(report: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     else:
         benchmark = "an unnamed benchmark"
 
+    # Count SUMMARIES, not judge rows. With the default 3-judge panel every
+    # summary produces three rows, so len(rows) overstated this headline
+    # threefold — the same "N means three different things" confusion the
+    # stratum tables carried.
+    n_summaries = len({
+        (str(r.get("doi", "")), str(r.get("summarizer", "")),
+         str(r.get("input_source") or "processed"))
+        for r in rows
+        if str(r.get("doi", "")).strip() and str(r.get("summarizer", "")).strip()
+    })
     n_rows = len(rows)
     summarizers = sorted({str(r["summarizer"]) for r in rows if r.get("summarizer")})
     provider_note = (
@@ -520,9 +641,10 @@ def _render_markdown(report: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         f"({', '.join(summarizers)})"
         if summarizers else ""
     )
+    judge_note = f" from {n_rows} judge rating{'s' if n_rows != 1 else ''}" if n_rows != n_summaries else ""
     lines.append(
-        f"**{n_rows} summar{'y' if n_rows == 1 else 'ies'} evaluated**{provider_note} "
-        f"using the {benchmark} benchmark."
+        f"**{n_summaries} summar{'y' if n_summaries == 1 else 'ies'} evaluated**{provider_note}"
+        f"{judge_note} using the {benchmark} benchmark."
     )
     lines.append("")
 
@@ -829,6 +951,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     rows = list(iter_evaluation_rows(args.evaluations))
+    n_dry_run = count_dry_run_rows(args.evaluations)
+    if n_dry_run:
+        print(f"[eval-report] excluded {n_dry_run} dry-run (mock) rows; "
+              f"{len(rows)} real judge rows analysed", file=sys.stderr)
     human_reviews = _load_human_reviews(args.human_reviews)
     # Precedence: --human-validation-mode (CLI) > HUMAN_VALIDATION_MODE (.env) >
     # the module default (per_reviewer). human_review validates the value.
@@ -866,7 +992,13 @@ def main(argv: list[str] | None = None) -> int:
     print("VETERINARY SUMMARY EVALUATION REPORT")
     print("=" * 72)
     print(f"Source:      {args.evaluations}")
-    print(f"Rows scored: {len(rows)}")
+    n_summaries = len({
+        (str(r.get("doi", "")), str(r.get("summarizer", "")),
+         str(r.get("input_source") or "processed"))
+        for r in rows
+        if str(r.get("doi", "")).strip() and str(r.get("summarizer", "")).strip()
+    })
+    print(f"Summaries:   {n_summaries}   (from {len(rows)} judge rating(s))")
 
     taxonomy = report.get("taxonomy")
     if taxonomy:
@@ -881,10 +1013,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Saved to:    {saved_path}")
 
     print(
-        "\nColumns: N = evaluation rows | Weighted/Unweighted = the two jury_score\n"
-        "aggregations, 1-5 scale (see docs/phase3/medhelm_evaluation.md) | Halluc%/\n"
-        "Major% = rows with any / major-severity hallucination claims | LowConf% =\n"
-        "judge confidence below 3 | ParseFail% = judge response could not be parsed."
+        "\nColumns: Items = summaries (judges averaged within each, then averaged\n"
+        "across summaries) | Weighted/Unweighted = the two jury_score aggregations,\n"
+        "1-5 scale (see docs/phase3/medhelm_evaluation.md) | Halluc%/Major% =\n"
+        "summaries where a MAJORITY of reporting judges flagged a / major-severity\n"
+        "hallucination (the saved JSON also carries the any-judge upper bound and\n"
+        "the mean per-judge rate) | LowConf% = judge confidence below 3 |\n"
+        "ParseFail% = judge response could not be parsed."
     )
 
     _print_reliability(report.get("reliability"))
@@ -993,7 +1128,7 @@ def _print_hvj(hvj: dict[str, Any] | None, heading: str) -> None:
                 f"spearman={_fmt_corr(stats.get('spearman'), stats.get('spearman_p'))}  "
                 f"pearson={_fmt_corr(stats.get('pearson'), stats.get('pearson_p'))}  "
                 f"bias={_fmt_stat(ba.get('mean_bias'))}  "
-                f"kappa={_fmt_kappa(stats.get('cohen_kappa'), stats.get('n'))}  "
+                f"kappa={_fmt_kappa_pair(stats)}  "
                 f"agreement={_fmt_pct(stats.get('percent_agreement'))}  (n={stats.get('n', 0)})")
 
     print(f"  {heading} (Spearman | Pearson | bias human-jury):")

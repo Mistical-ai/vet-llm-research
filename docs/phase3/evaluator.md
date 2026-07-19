@@ -88,15 +88,32 @@ python llm-sum/run_phase3.py evaluate --mode test  --input-mode dev       # mock
 python llm-sum/run_phase3.py evaluate --mode dev   --input-mode jsonl     # override: journal-stratified data/summaries.jsonl
 python llm-sum/run_phase3.py evaluate --mode dev   --input-mode dev       # override: judge data/dev_tests/summaries_txt (PHASE3_DEV_LIMIT articles)
 python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular   # judge data/summaries_txt (full corpus, once you're ready)
+
+# Seed the dev-jsonl loop from a different readable folder:
+python llm-sum/run_phase3.py evaluate --mode dev --source-dir data/batch_summaries_jsonl
 ```
 
 | `EVAL_INPUT_MODE` / `--input-mode` | Reads from |
 |---|---|
 | `jsonl` (default for non-dev modes) | `data/summaries.jsonl` — unchanged original behaviour. |
-| `dev-jsonl` (default for `--mode dev`) | `data/dev_summaries_jsonl/` → judges matching `summaries.jsonl` articles → mirrors scores to `data/dev_evals_jsonl/`. Incremental (skips already-judged papers; `--no-resume` forces a full re-judge). |
-| `dev` | `data/dev_tests/summaries_txt/` (summarize-all comparison) |
-| `regular` | `data/summaries_txt/` |
+| `dev-jsonl` (default for `--mode dev`) | The **top level** of `data/dev_summaries_jsonl/` (or `--source-dir PATH`) → judges matching `summaries.jsonl` articles → mirrors scores to `data/dev_evals_jsonl/`. Incremental (skips already-judged papers; `--no-resume` forces a full re-judge). |
+| `dev` | `data/dev_tests/summaries_txt/` (summarize-all comparison) — picks *which* papers to judge; the scored text still comes from `summaries.jsonl` |
+| `regular` | `data/summaries_txt/` — same: file list only, prose from `summaries.jsonl` |
 | `auto` | `dev` when `PHASE3_MODE=dev`, otherwise `regular` — so switching `PHASE3_MODE` also switches the folder. |
+
+**Every input mode judges the same surface.** The judge always scores the flowing
+`summary_text` (`models.<provider>.summary` in `data/summaries.jsonl`) — the exact
+text human reviewers grade in Phase 5. A readable folder only ever decides *which*
+papers get judged, never what text is scored. The `dev` and `regular` modes therefore
+require a populated `summaries.jsonl` for the same DOIs: `summarize-all` writes only
+comparison `.txt` files, so any provider slot with no matching prose is **skipped with
+a warning** rather than scored on the bulleted render. Run `summarize` for those DOIs,
+or use `--input-mode jsonl`.
+
+The `dev-jsonl` folder scan is **non-recursive** on purpose, so the `prose/` subfolder
+(the same papers in prose form) is never counted twice. That also hides an
+`--output-subdir` pool and the single/batch folders — pass `--source-dir` to judge
+those. The command warns when it detects such a subfolder.
 
 Only the processed-text side is ever judged — `summaries_pdf/` (direct-PDF
 comparison files) is never read by any input mode. There is no journal-

@@ -9,11 +9,19 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
 - key_methods: short list of main methods, interventions, measurements/outcomes
   assessed, statistical analysis approach, or comparisons.
 - key_findings: short list of the most important findings, especially quantitative results.
+  Include a key number or threshold when it is essential to understanding a finding (for
+  example a response rate or a follow-up duration), but do not try to capture every statistic
+  in the article — favor the most clinically important results over exhaustive coverage.
 - clinical_significance: how a practising clinician should interpret or apply the findings.
 - limitations: short list of important caveats or limitations from the article.
+  Specifically include the absence of confirmatory diagnostic tests (EEG,
+  electroencephalography, histopathology, imaging) if the article mentions them as limitations.
+  These methodological limitations are distinct from sample-size caveats and are often the most
+  scientifically important.
 - summary_text: a short, plain-language prose summary for a busy veterinary clinician who has
-  about a minute to read it. Write flowing paragraphs only — no numbered headers, no bullet
-  points, no markdown bold — one short paragraph per section, in this exact order:
+  about a minute to read it. Aim for 300-340 words and do not exceed 400 words. Write flowing
+  paragraphs only — no numbered headers, no bullet points, no markdown bold — one short paragraph
+  per section, in this exact order:
 
   [Article title, as reported in the text — omit this line if not present]
   [Author names, as reported, comma-separated — omit this line if not present]
@@ -37,7 +45,7 @@ The API will require you to fill a VeterinarySummary schema. Fill every field us
   [The bottom-line takeaway and its clinical relevance.]
 
 Rules:
-- summary_text must be 300-340 words (never exceed 360 words) and contain only flowing prose
+- summary_text must be 300-340 words (never exceed 400 words) and contain only flowing prose
   paragraphs in the section order above — no numbered lists, no bullet points, no bold headers.
 - summary_text must not simply restate the key_findings list; describe results in plain
   language and save exact statistics for key_findings.

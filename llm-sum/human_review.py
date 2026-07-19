@@ -2007,12 +2007,17 @@ def _normalize_scoresheet_row(
     )
     # Clinical-risk-weighted human composite, mirroring the jury's own
     # jury_score_weighted (calculate_jury_score with MEDHELM_CRITERION_WEIGHTS is
-    # the single source of truth). Only when ALL five criteria are present:
-    # calculate_jury_score clamps a missing criterion to 1, which would silently
-    # deflate a partially-filled row, so a partial row gets None instead.
-    human_score_weighted = (
-        calculate_jury_score(criteria_scores, weights=MEDHELM_CRITERION_WEIGHTS)
-        if len(criteria_scores) == len(CRITERIA) else None
+    # the single source of truth).
+    #
+    # This used to be computed only when ALL five criteria were present, because
+    # calculate_jury_score imputed a missing criterion as 1 and would silently
+    # deflate a partially-filled row. It now renormalizes over the criteria
+    # actually present — the same rule as the unweighted mean directly above —
+    # so a partial row yields a real weighted score instead of None. That keeps
+    # the weighted and unweighted human composites computed over the SAME items,
+    # which is what makes the two comparable to their LLM counterparts.
+    human_score_weighted = calculate_jury_score(
+        criteria_scores, weights=MEDHELM_CRITERION_WEIGHTS,
     )
     record = {
         "item_id": item_id,

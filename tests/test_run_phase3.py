@@ -98,12 +98,17 @@ def _wired_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import eval_instances
     import prepare_texts
     import run_phase3
+    import summarize_all_ingest
 
     summaries_path = tmp_path / "summaries.jsonl"
     evaluations_path = tmp_path / "evaluations.jsonl"
     processed_dir = tmp_path / "processed"
 
     monkeypatch.setattr(evaluator, "SUMMARIES_PATH", summaries_path)
+    # The summarize-all input modes now judge the prose summary_text out of
+    # summaries.jsonl rather than the bulleted .txt body, so this path has to
+    # be redirected too or those tests would read the real project file.
+    monkeypatch.setattr(summarize_all_ingest, "SUMMARIES_PATH", summaries_path)
     monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
     monkeypatch.setattr(evaluator, "PROCESSED_DIR", processed_dir)
     monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
@@ -275,8 +280,9 @@ def test_resolve_eval_input_mode_precedence(monkeypatch: pytest.MonkeyPatch) -> 
 def test_evaluate_dev_input_mode_reads_txt_folder_not_jsonl(
     _wired_paths, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--input-mode dev judges data/dev_tests/summaries_txt directly and
-    never touches data/summaries.jsonl (left empty/nonexistent here)."""
+    """--input-mode dev picks WHICH papers to judge from
+    data/dev_tests/summaries_txt, but scores the prose summary_text from
+    data/summaries.jsonl — the same surface every other input mode judges."""
     import run_phase3
     import summarize_all_ingest
 
@@ -286,11 +292,13 @@ def test_evaluate_dev_input_mode_reads_txt_folder_not_jsonl(
     _write_summarize_all_txt(
         txt_dir, _wired_paths["processed_dir"], doi="10.9999/txt.0001",
     )
+    _write_fake_summaries(
+        _wired_paths["summaries_path"], _wired_paths["processed_dir"], ["10.9999/txt.0001"],
+    )
 
     result = _run_evaluate(["evaluate", "--mode", "test", "--input-mode", "dev"])
 
     assert result == 0
-    assert not _wired_paths["summaries_path"].exists()
 
     manifest_path = _find_manifest(_wired_paths["manifest_dir"])
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -301,9 +309,15 @@ def test_evaluate_dev_input_mode_reads_txt_folder_not_jsonl(
 
     from evaluator import JURY_PANEL
 
+    # PHASE3_MODE=test, so the write guard diverts these mock rows away from
+    # the production ledger into the _dryrun sibling. See the guard tests in
+    # tests/test_evaluator.py for why.
+    _dry_run_evaluations = _wired_paths["evaluations_path"].with_name(
+        "evaluations_dryrun.jsonl")
+    assert not _wired_paths["evaluations_path"].exists()
     rows = [
         json.loads(line)
-        for line in _wired_paths["evaluations_path"].read_text(encoding="utf-8").splitlines()
+        for line in _dry_run_evaluations.read_text(encoding="utf-8").splitlines()
     ]
     # One article × one summarizer × the 3-judge default = 3 rows.
     assert len(rows) == 3
@@ -657,6 +671,62 @@ def test_evaluate_dev_jsonl_reads_dev_folder_and_writes_dev_evals(
         assert path.read_text(encoding="utf-8").startswith("DOI:")
 
 
+# In plain English: `--source-dir` lets you judge a folder other than the
+# default data/dev_summaries_jsonl/ — an --output-subdir pool, or the single/
+# batch readable folders — while results still land in data/dev_evals_jsonl/.
+# The folder actually used must also be recorded in the run manifest, or
+# provenance goes ambiguous once runs mix sources.
+def test_evaluate_dev_jsonl_source_dir_overrides_default_folder(
+    _wired_paths, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import run_phase3
+
+    default_dir, evals_dir = _wire_dev_jsonl(_wired_paths, monkeypatch, run_phase3)
+    alt_dir = _wired_paths["manifest_dir"] / "batch_summaries_jsonl"
+    dois = ["10.9999/alt.0001"]
+    _write_fake_summaries(_wired_paths["summaries_path"], _wired_paths["processed_dir"], dois)
+    # A decoy in the default folder that must NOT be judged.
+    _write_dev_readable_txt(default_dir, "10.9999/decoy.0001")
+    for doi in dois:
+        _write_dev_readable_txt(alt_dir, doi)
+
+    result = _run_evaluate([
+        "evaluate", "--mode", "test", "--input-mode", "dev-jsonl",
+        "--source-dir", str(alt_dir),
+    ])
+    assert result == 0
+
+    data = json.loads(_find_manifest(_wired_paths["manifest_dir"]).read_text(encoding="utf-8"))
+    assert data["selected_instance_ids"] == dois  # decoy not judged
+    assert data["evaluation_config"]["slice_config"]["source_dir"] == str(alt_dir)
+    assert data["dataset_path"] == str(alt_dir)
+
+
+# In plain English: the readable-folder readers glob *.txt non-recursively, so
+# an --output-subdir pool is invisible to them. That silence is the trap this
+# warning exists to break: prose/ is skipped quietly (it's the same papers),
+# but any other subfolder gets named out loud.
+def test_warn_about_unread_subfolders_names_only_non_prose_subdirs(tmp_path: Path, capsys) -> None:
+    import run_phase3
+
+    folder = tmp_path / "dev_summaries_jsonl"
+    _write_dev_readable_txt(folder, "10.1/top")
+    _write_dev_readable_txt(folder / "prose", "10.1/top")          # expected sibling
+    _write_dev_readable_txt(folder / "promptv2", "10.2/hidden")    # invisible pool
+    (folder / "empty_dir").mkdir()                                  # no .txt -> ignored
+
+    skipped = run_phase3._warn_about_unread_subfolders(folder)
+
+    assert skipped == ["promptv2"]
+    out = capsys.readouterr().out
+    assert "promptv2" in out
+    assert "--source-dir" in out
+    assert "prose" not in out.replace("promptv2", "")
+
+    # Missing folder is silent, not an error.
+    assert run_phase3._warn_about_unread_subfolders(tmp_path / "nope") == []
+
+
 def test_evaluate_dev_jsonl_skips_already_evaluated(
     _wired_paths, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -684,9 +754,15 @@ def test_evaluate_dev_jsonl_skips_already_evaluated(
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert data["selected_instance_ids"] == ["10.9999/dev.0002"]
 
+    # PHASE3_MODE=test, so the write guard diverts these mock rows away from
+    # the production ledger into the _dryrun sibling. See the guard tests in
+    # tests/test_evaluator.py for why.
+    _dry_run_evaluations = _wired_paths["evaluations_path"].with_name(
+        "evaluations_dryrun.jsonl")
+    assert not _wired_paths["evaluations_path"].exists()
     rows = [
         json.loads(line)
-        for line in _wired_paths["evaluations_path"].read_text(encoding="utf-8").splitlines()
+        for line in _dry_run_evaluations.read_text(encoding="utf-8").splitlines()
     ]
     assert {row["doi"] for row in rows} == {"10.9999/dev.0002"}
 
@@ -978,11 +1054,13 @@ def test_evaluate_dev_jsonl_deferred_papers_picked_up_next_run(
 
     result_2 = _run_evaluate(["evaluate", "--mode", "dev", "--limit", "3", "--force"])
     assert result_2 == 0
-    # create_run_id() has 1-second granularity, so two runs in the same test
-    # can share a run_id and the same manifest filename -- the second run's
-    # write simply overwrites the first's, which is fine here since
-    # selected_1 was already captured in memory before this second call.
-    manifest_2 = _find_manifest(_wired_paths["manifest_dir"])
+    # create_run_id() has 1-second granularity, so whether these two runs share
+    # a manifest filename depends on wall-clock luck: land in the same second
+    # and the second write overwrites the first, straddle a second boundary and
+    # there are two files. Either way the run we want is the newest one, and
+    # selected_1 was already captured in memory before this second call. (Do not
+    # use _find_manifest here -- it asserts exactly one manifest exists.)
+    manifest_2 = sorted(_wired_paths["manifest_dir"].glob("run_manifest_*.json"))[-1]
     selected_2 = set(json.loads(manifest_2.read_text(encoding="utf-8"))["selected_instance_ids"])
 
     assert selected_2.isdisjoint(selected_1)

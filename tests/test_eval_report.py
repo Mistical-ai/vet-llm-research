@@ -6,6 +6,7 @@ from pathlib import Path
 import eval_instances
 import summarizer
 import eval_report
+from conftest import make_eval_row
 from eval_report import (
     build_report,
     main,
@@ -29,8 +30,13 @@ def _isolate_detail_lookups(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_summarize_rows_by_summarizer() -> None:
+    # Two distinct papers, one judge each. The doi matters: aggregation is
+    # item-weighted, so a row with no (doi, summarizer) identity cannot be
+    # attributed to an item — see test_summarize_rows_surfaces_unkeyed_rows.
     rows = [
         {
+            "doi": "10.1/a",
+            "judge": "openai",
             "summarizer": "openai",
             "jury_score": 4.0,
             "jury_score_weighted": 4.2,
@@ -42,6 +48,8 @@ def test_summarize_rows_by_summarizer() -> None:
             "hallucination_claims": [],
         },
         {
+            "doi": "10.1/b",
+            "judge": "openai",
             "summarizer": "openai",
             "jury_score": 2.0,
             "jury_score_weighted": 1.8,
@@ -215,12 +223,12 @@ def test_render_markdown_headline_and_glossary() -> None:
 
 def test_markdown_stratum_table_bolds_all_ties() -> None:
     rows = [
-        {"group": "openai", "n_rows": 5, "mean_score_unweighted": 4.0, "mean_score_weighted": 4.1,
-         "hallucination_rate": 0.2, "major_hallucination_rate": 0.0},
-        {"group": "anthropic", "n_rows": 5, "mean_score_unweighted": 4.0, "mean_score_weighted": 3.9,
-         "hallucination_rate": 0.4, "major_hallucination_rate": 0.2},
-        {"group": "gemini", "n_rows": 5, "mean_score_unweighted": 3.5, "mean_score_weighted": 3.4,
-         "hallucination_rate": 0.6, "major_hallucination_rate": 0.4},
+        {"group": "openai", "n_items": 5, "n_rows": 15, "mean_score_unweighted": 4.0,
+         "mean_score_weighted": 4.1, "hallucination_rate": 0.2, "major_hallucination_rate": 0.0},
+        {"group": "anthropic", "n_items": 5, "n_rows": 15, "mean_score_unweighted": 4.0,
+         "mean_score_weighted": 3.9, "hallucination_rate": 0.4, "major_hallucination_rate": 0.2},
+        {"group": "gemini", "n_items": 5, "n_rows": 15, "mean_score_unweighted": 3.5,
+         "mean_score_weighted": 3.4, "hallucination_rate": 0.6, "major_hallucination_rate": 0.4},
     ]
 
     table_text = "\n".join(_markdown_stratum_table(rows))
@@ -412,3 +420,176 @@ def test_import_eval_report_has_no_provider_side_effects() -> None:
     import importlib
 
     importlib.reload(eval_report)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b.2 / 1b.3 — aggregation must be item-weighted and single-scale
+# ---------------------------------------------------------------------------
+
+def _ragged_panel() -> list[dict]:
+    """One paper judged by 3 judges, another by 1 — what per-judge resume produces.
+
+    Row-weighted aggregation reads this as (5+5+5+2)/4 = 4.25, letting the
+    3-judge paper count triple. Item-weighted reads it as (5.0+2.0)/2 = 3.50.
+    """
+    rows = [make_eval_row("10.1/x", "openai", judge=j, unweighted=5.0, weighted=5.0)
+            for j in ("openai", "anthropic", "gemini")]
+    rows.append(make_eval_row("10.1/y", "openai", judge="openai", unweighted=2.0, weighted=2.0))
+    return rows
+
+
+def test_summarize_rows_is_item_weighted() -> None:
+    """A paper judged three times is still one paper."""
+    summary = summarize_rows(_ragged_panel(), group_field="summarizer")
+    assert summary[0]["mean_score_unweighted"] == 3.5
+    assert summary[0]["mean_score_weighted"] == 3.5
+
+
+def test_summarize_rows_reports_items_not_judge_rows() -> None:
+    """'N' must name items; the judge-row count stays available but separate."""
+    summary = summarize_rows(_ragged_panel(), group_field="summarizer")
+    assert summary[0]["n_items"] == 2
+    assert summary[0]["n_rows"] == 4
+
+
+def test_summarize_rows_never_mixes_score_scales() -> None:
+    """quality_score is 1-10; jury_score is 1-5. Averaging them is meaningless."""
+    rows = [
+        make_eval_row("10.1/a", "openai", unweighted=4.0, weighted=4.0),
+        make_eval_row("10.1/b", "openai", unweighted=None, weighted=None,
+                      jury_score=None, quality_score=8),
+    ]
+    summary = summarize_rows(rows, group_field="summarizer")
+    # 6.0 is the old bug: mean(4.0, 8) — a value on neither scale.
+    assert summary[0]["mean_score"] != 6.0
+    assert summary[0]["mean_score"] == 4.0
+
+
+def test_eval_report_and_report_tables_agree_on_provider_means() -> None:
+    """The cross-module invariant: one corpus, one answer.
+
+    This is the acceptance criterion for routing summarize_rows through
+    report_tables.collect_item_scores. Keep it forever — it is the test that
+    catches a future third reimplementation of aggregation.
+    """
+    import report_tables as rt
+
+    rows = _ragged_panel() + [
+        make_eval_row("10.1/x", "anthropic", judge="openai", unweighted=3.0, weighted=3.0),
+        make_eval_row("10.1/y", "anthropic", judge="openai", unweighted=4.0, weighted=4.0),
+    ]
+    from_eval_report = {
+        s["group"]: s["mean_score_unweighted"]
+        for s in summarize_rows(rows, group_field="summarizer")
+    }
+
+    item_scores = rt.collect_item_scores(rows)
+    from_report_tables: dict[str, float] = {}
+    for provider in ("openai", "anthropic"):
+        vals = [agg[provider]["unweighted"] for agg in item_scores.values()
+                if provider in agg and agg[provider]["unweighted"] is not None]
+        from_report_tables[provider] = round(sum(vals) / len(vals), 3)
+
+    assert from_eval_report == from_report_tables
+
+
+def test_summarize_rows_surfaces_unkeyed_rows() -> None:
+    """Item-weighting needs an item identity. A row without (doi, summarizer)
+    cannot be attributed to one, so it is excluded from every mean — but the
+    shortfall must be visible, not silent."""
+    rows = [
+        make_eval_row("10.1/a", "openai", unweighted=4.0, weighted=4.0),
+        {"summarizer": "openai", "judge": "openai", "jury_score_unweighted": 1.0},  # no doi
+    ]
+    summary = summarize_rows(rows, group_field="summarizer")
+    assert summary[0]["n_items"] == 1
+    assert summary[0]["n_rows"] == 2
+    assert summary[0]["n_unkeyed_rows"] == 1
+    assert summary[0]["mean_score_unweighted"] == 4.0  # the unkeyed 1.0 never lands
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b.4 — missing hallucination data is not a clean bill of health
+# ---------------------------------------------------------------------------
+
+def test_hallucination_rate_excludes_missing() -> None:
+    """Unparsed rows must leave the denominator, not count as clean.
+
+    The old rule biased the rate toward the flattering answer: the worse the
+    parse rate, the fewer hallucinations the study appeared to find.
+    """
+    rows = []
+    for i in range(2):                      # 2 papers with a hallucination
+        rows.append(make_eval_row(f"10.1/h{i}", "openai", hallucination_count=1))
+    for i in range(3):                      # 3 papers with no usable data
+        rows.append(make_eval_row(f"10.1/m{i}", "openai", hallucination_count=None))
+    for i in range(5):                      # 5 clean papers
+        rows.append(make_eval_row(f"10.1/c{i}", "openai", hallucination_count=0))
+
+    summary = summarize_rows(rows, group_field="summarizer")[0]
+    assert summary["hallucination_rate"] == round(2 / 7, 3)   # not 2/10 = 0.2
+    assert summary["hallucination_n_missing"] == 3
+
+
+def test_hallucination_rate_none_when_no_usable_data() -> None:
+    """No usable rows at all -> no rate, rather than a confident 0%."""
+    rows = [make_eval_row("10.1/a", "openai", hallucination_count=None)]
+    summary = summarize_rows(rows, group_field="summarizer")[0]
+    assert summary["hallucination_rate"] is None
+    assert summary["hallucination_n_missing"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Dry-run filtering at the shared reader
+# ---------------------------------------------------------------------------
+#
+# iter_evaluation_rows is the single reader behind every report, table,
+# figure, significance test and human-review export, so filtering here keeps
+# mock rows out of all of them at once. See tests/test_evaluator.py for the
+# background on the 2026-07-09 contamination.
+
+
+def _write_ledger(path, rows) -> None:
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _mock_eval_row(doi: str = "10.1111/jvim.16872") -> dict:
+    return {"doi": doi, "summarizer": "anthropic", "judge": "openai",
+            "judge_model_version": "gpt-5.4-DRYRUN",
+            "reasoning": "[MOCK] dry-run evaluation", "jury_score": 3.2}
+
+
+def _real_eval_row(doi: str = "10.2460/javma.23.06.0320") -> dict:
+    return {"doi": doi, "summarizer": "anthropic", "judge": "openai",
+            "judge_model_version": "gpt-5.4-2026-03-05",
+            "reasoning": "Well supported.", "jury_score": 4.4}
+
+
+def test_iter_evaluation_rows_excludes_dry_run_by_default(tmp_path) -> None:
+    ledger = tmp_path / "evaluations.jsonl"
+    _write_ledger(ledger, [_mock_eval_row(), _real_eval_row()])
+
+    rows = list(eval_report.iter_evaluation_rows(ledger))
+    assert len(rows) == 1
+    assert rows[0]["doi"] == "10.2460/javma.23.06.0320"
+
+
+def test_iter_evaluation_rows_include_dry_run_yields_everything(tmp_path) -> None:
+    """Forensic escape hatch: the raw ledger is still inspectable."""
+    ledger = tmp_path / "evaluations.jsonl"
+    _write_ledger(ledger, [_mock_eval_row(), _real_eval_row()])
+
+    rows = list(eval_report.iter_evaluation_rows(ledger, include_dry_run=True))
+    assert len(rows) == 2
+
+
+def test_count_dry_run_rows(tmp_path) -> None:
+    """The excluded count is reported, not silently swallowed.
+
+    An unexplained N is what let the original contamination survive five days
+    of reports.
+    """
+    ledger = tmp_path / "evaluations.jsonl"
+    _write_ledger(ledger, [_mock_eval_row(), _mock_eval_row(), _real_eval_row()])
+
+    assert eval_report.count_dry_run_rows(ledger) == 2

@@ -78,7 +78,7 @@ from sklearn.metrics import cohen_kappa_score
 from sklearn.metrics.pairwise import cosine_similarity as _sk_cosine_similarity
 
 from eval_instances import load_manifest_index
-from eval_report import iter_evaluation_rows
+from eval_report import count_dry_run_rows, iter_evaluation_rows
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
@@ -364,14 +364,27 @@ def categorical_agreement(
     """
     n = len(human_values)
     if n < 2 or len(jury_values) != n:
-        return {"n": n, "cohen_kappa": None, "cohen_kappa_quadratic": None, "percent_agreement": None}
+        return {"n": n, "cohen_kappa": None, "cohen_kappa_quadratic": None,
+                "percent_agreement": None, "kappa_undefined": False}
     human_cats = [_round_to_category(v) for v in human_values]
     jury_cats = [_round_to_category(v) for v in jury_values]
+    # Kappa is undefined when both raters used exactly one, identical category:
+    # chance agreement is 1, so the formula divides by zero and sklearn returns
+    # NaN. cohen_kappa maps that to 1.0 (matching Krippendorff's alpha's
+    # all-identical convention), which is defensible but indistinguishable from
+    # a hard-won perfect agreement across a spread of categories. Flag it so a
+    # reader can tell "perfect" from "no information".
+    #
+    # Note this is genuinely the ONLY NaN case: two raters who each used one
+    # category but DIFFERENT ones (e.g. all 3 vs all 4) yield kappa 0.0, not
+    # NaN, so no real disagreement is ever reported as perfect agreement.
+    undefined = len(set(human_cats)) == 1 and len(set(jury_cats)) == 1 and human_cats[0] == jury_cats[0]
     return {
         "n": n,
         "cohen_kappa": cohen_kappa(human_cats, jury_cats, weights=weights),
         "cohen_kappa_quadratic": cohen_kappa(human_cats, jury_cats, weights="quadratic"),
         "percent_agreement": percent_agreement(human_cats, jury_cats),
+        "kappa_undefined": undefined,
     }
 
 
@@ -477,8 +490,20 @@ def _strata_value(row: dict[str, Any], field: str) -> str:
     return str(value or "unknown")
 
 
-def _has_hallucination(row: dict[str, Any]) -> bool:
-    return int(row.get("hallucination_count") or 0) > 0
+def _has_hallucination(row: dict[str, Any]) -> bool | None:
+    """True/False when the judge reported, None when it never said.
+
+    ``None`` is NOT "no hallucination". An absent or unparseable count is
+    missing data, and counting it as clean while it stays in the denominator
+    biases every rate downward — the worse the parse rate, the fewer
+    hallucinations the study appears to find. Mirrors
+    report_tables._hallucination_flag; callers must exclude None from both the
+    numerator and the denominator and report how many were dropped.
+    """
+    value = row.get("hallucination_count")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) > 0
 
 
 def build_covariate_report(
@@ -492,12 +517,15 @@ def build_covariate_report(
     mean quality, and Cohen's Kappa (LLM judge vs. human), together.
 
     ``item_scores`` is report_tables.collect_item_scores()'s output (reused,
-    not re-derived) for quality. Hallucination rate is computed directly from
-    the evaluation rows (broken out by provider AND stratum together, which
-    neither eval_report.py nor report_tables.py currently does). Cohen's Kappa
-    comes from data/human_reviews.jsonl, filtered to each provider+stratum
-    cell; because the human-review sample is small, every cell below
-    ``min_items_for_kappa`` is flagged "underpowered" rather than hidden.
+    not re-derived) for BOTH quality and hallucination, broken out by provider
+    AND stratum together — which neither eval_report.py nor report_tables.py
+    does. Reading both from the same collapse keeps them on the same unit: the
+    hallucination rate used to be computed from raw judge rows while quality
+    beside it was item-weighted, so one cell reported two different
+    denominators. Cohen's Kappa comes from data/human_reviews.jsonl, filtered
+    to each provider+stratum cell; because the human-review sample is small,
+    every cell below ``min_items_for_kappa`` is flagged "underpowered" rather
+    than hidden.
     """
     materialized_eval = [r for r in evaluation_rows if isinstance(r, dict)]
     materialized_human = [r for r in human_review_rows if isinstance(r, dict)]
@@ -505,22 +533,16 @@ def build_covariate_report(
     result: dict[str, Any] = {"fields": list(fields), "min_items_for_kappa": min_items_for_kappa, "by_field": {}}
 
     for field in fields:
-        # Hallucination rate + n, per (provider, stratum value).
+        # Hallucination AND quality per (provider, stratum value), both read
+        # from the same item-level collapse so the cell reports one unit.
         halluc_buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-        for row in materialized_eval:
-            provider = str(row.get("summarizer", "")).strip()
-            if not provider:
-                continue
-            value = _strata_value(row, field)
-            halluc_buckets[(provider, value)].append(row)
-
-        # Quality, per (provider, stratum value), from item_scores.
         quality_buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
         for (_doi, _input_source), by_provider in item_scores.items():
             for provider, agg in by_provider.items():
                 value = _strata_value({"strata": agg.get("strata") or {}}, field)
                 if agg.get("unweighted") is not None:
                     quality_buckets[(provider, value)].append(agg["unweighted"])
+                halluc_buckets[(provider, value)].append(agg.get("hallucination") or {})
 
         # Cohen's Kappa, per (provider, stratum value), from human_reviews.jsonl.
         kappa_human: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -546,18 +568,42 @@ def build_covariate_report(
                 halluc_rows = halluc_buckets.get(key, [])
                 quality_scores = quality_buckets.get(key, [])
                 agreement = categorical_agreement(kappa_human.get(key, []), kappa_jury.get(key, []))
+                # Only items where at least one judge reported enter either side
+                # of the hallucination fraction; the rest are counted and
+                # surfaced rather than silently read as clean. `value` is the
+                # majority-of-judges verdict (report_tables._collapse_flags);
+                # `any_value` is kept beside it as the upper bound, since
+                # inter-judge agreement on hallucination is low.
+                reported = [f for f in halluc_rows if f.get("value") is not None]
                 cell["providers"][provider] = {
                     "n_items": len(halluc_rows),
                     "hallucination_rate": (
-                        round(sum(1 for r in halluc_rows if _has_hallucination(r)) / len(halluc_rows), 3)
-                        if halluc_rows else None
+                        round(sum(1 for f in reported if f["value"]) / len(reported), 3)
+                        if reported else None
                     ),
+                    "hallucination_rate_any_judge": (
+                        round(sum(1 for f in reported if f.get("any_value")) / len(reported), 3)
+                        if reported else None
+                    ),
+                    "hallucination_n_missing": len(halluc_rows) - len(reported),
                     "mean_quality": (
                         round(sum(quality_scores) / len(quality_scores), 3) if quality_scores else None
                     ),
+                    # Quadratic weighting is the headline: these are ordinal 1-5
+                    # ratings, so "off by one" must not be penalised as heavily
+                    # as "off by four". The unweighted (exact-match) kappa and
+                    # percent agreement are kept beside it as the sensitivity
+                    # check — all three are reported, none is discarded.
+                    "cohen_kappa_quadratic": agreement["cohen_kappa_quadratic"],
                     "cohen_kappa": agreement["cohen_kappa"],
+                    "percent_agreement": agreement["percent_agreement"],
                     "kappa_n": agreement["n"],
                     "kappa_underpowered": agreement["n"] < min_items_for_kappa,
+                    # Kappa is undefined (not perfect) when both raters used a
+                    # single identical category — chance agreement is 1, so the
+                    # formula divides by zero. cohen_kappa reports 1.0 there by
+                    # convention; this flag lets a reader tell the two apart.
+                    "kappa_undefined": agreement["kappa_undefined"],
                 }
             field_rows.append(cell)
         result["by_field"][field] = field_rows
@@ -633,6 +679,10 @@ def build_stats_engine_report(
     from report_tables import collect_item_scores, _providers_in_order  # noqa: E402 (lazy: avoid circular import)
 
     evaluation_rows = list(iter_evaluation_rows(evaluations_path))
+    n_dry_run = count_dry_run_rows(evaluations_path)
+    if n_dry_run:
+        print(f"[stats-engine] excluded {n_dry_run} dry-run (mock) rows; "
+              f"{len(evaluation_rows)} real judge rows analysed", file=sys.stderr)
     human_review_rows = list(iter_human_review_rows(human_reviews_path))
     item_scores = collect_item_scores(evaluation_rows)
     providers = _providers_in_order(item_scores)

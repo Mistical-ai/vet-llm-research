@@ -36,26 +36,36 @@ tiktoken>=0.7.0
 # Phase 6: Publication reporting & statistics
 # Peer-reviewed, citable statistics — exact small-sample significance tests
 # (Wilcoxon signed-rank, Friedman) and bootstrap confidence intervals — so the
-# numbers in a paper come from a validated library, not hand-rolled math. Pinned
-# so every machine reproduces the identical result. Note: Krippendorff's alpha in
-# llm-sum/reliability.py stays hand-rolled because scipy does not implement it.
-scipy>=1.11
+# numbers in a paper come from a validated library, not hand-rolled math.
+#
+# The four statistical dependencies below are pinned to EXACT versions, not >=
+# floors. A floor permits unbounded major-version drift, so two machines can
+# compute different numbers from the same data while both satisfy this file --
+# which is precisely what the reproducibility claim in docs/statistics_explained.md
+# promises cannot happen. Bump these deliberately and re-run the suite; the
+# Krippendorff reference test in tests/test_reliability.py will catch an
+# estimator that changes underneath the study.
+#
+# Note: Krippendorff's alpha in llm-sum/reliability.py stays hand-rolled because
+# scipy does not implement it. It is validated against Krippendorff's own
+# published worked example (alpha_interval = 0.811) rather than by a dependency.
+scipy==1.18.0
 # Numerical arrays underneath scipy (also used by pandas above); pinned explicitly
 # so the reporting layer never depends on a transitive install.
-numpy>=1.23
+numpy==2.4.4
 # Renders the publication figures (provider comparison, cost-quality Pareto,
 # per-criterion heatmap, reliability plot) headlessly to PNG/SVG in
 # llm-sum/report_figures.py. Uses the non-interactive "Agg" backend only — no
 # display server is required, so this is safe to run on a CI box or the AI's
 # sandboxed shell.
-matplotlib>=3.7
+matplotlib==3.11.0
 # Validated implementations of Cohen's Kappa (sklearn.metrics.cohen_kappa_score)
 # and TF-IDF + cosine similarity (sklearn.feature_extraction.text.TfidfVectorizer,
 # sklearn.metrics.pairwise.cosine_similarity) used by llm-sum/stats_engine.py.
 # Rides on the numpy/scipy already pinned above — same rationale as the scipy
 # note further up: a peer-reviewed, citable library beats a hand-rolled formula
 # whenever one already exists.
-scikit-learn>=1.3
+scikit-learn==1.9.0
 # Writes the .xlsx human-validation scoresheet (llm-sum/human_review.py's
 # render_scoresheet_xlsx) with dropdown validation, a frozen header, and sized
 # columns so a veterinarian reviewer can fill it in without mistyping a score.

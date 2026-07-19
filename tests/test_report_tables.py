@@ -19,6 +19,7 @@ import pytest
 import eval_instances
 import report_tables as rt
 import stats_engine
+from conftest import make_eval_row
 from report_tables import (
     benjamini_hochberg,
     bootstrap_ci,
@@ -53,29 +54,11 @@ def _isolate_stats_engine_lookups(monkeypatch, tmp_path):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _eval_row(doi: str, summarizer: str, judge: str, unweighted: float, weighted: float,
-              *, species: str = "Canine", study_design: str = "RCT",
-              clinical_topic: str = "Oncology", journal: str = "JVIM",
-              input_source: str = "processed") -> dict:
-    """One evaluations.jsonl row (single judge) with both jury modes + strata."""
-    return {
-        "benchmark_name": "vet_lit_summary_medhelm",
-        "doi": doi,
-        "summarizer": summarizer,
-        "judge": judge,
-        "input_source": input_source,
-        "jury_score": unweighted,
-        "jury_score_unweighted": unweighted,
-        "jury_score_weighted": weighted,
-        "judge_disagreement": 0.0,
-        "strata": {
-            "species": [species],
-            "study_design": study_design,
-            "clinical_topic": clinical_topic,
-            "journal": journal,
-            "input_source": input_source,
-        },
-    }
+# The shared row factory lives in tests/conftest.py so report_tables,
+# report_figures, stats_engine and eval_report all build rows the same way.
+# Rows here now also carry criteria_scores (the shared factory always sets
+# them); nothing in this file reads that block, so the added key is inert.
+_eval_row = make_eval_row
 
 
 def _separated_corpus() -> list[dict]:
@@ -359,3 +342,40 @@ def test_import_report_tables_has_no_provider_side_effects() -> None:
     """Importing the module must not require API keys or the network."""
     import importlib
     importlib.reload(rt)
+
+
+# ---------------------------------------------------------------------------
+# Tier 1b.10 — a re-judged row is not a fourth panelist
+# ---------------------------------------------------------------------------
+
+def test_collect_item_scores_collapses_repeated_judge() -> None:
+    """A --no-resume rerun appends a second row for the same (item, provider,
+    judge). Counting it as a panelist would inflate n_judges and double-weight
+    that judge, so the two rows collapse to ONE rating.
+
+    They are AVERAGED, not last-wins: both are complete judgements, and picking
+    the later one silently prefers whichever run scored higher. reliability.
+    _units_for applies the identical rule so alpha and the tables never describe
+    different datasets.
+    """
+    rows = [
+        _eval_row("10.1/x", "openai", "openai", 5.0, 5.0),
+        _eval_row("10.1/x", "openai", "openai", 3.0, 3.0),   # rerun, same judge
+        _eval_row("10.1/x", "openai", "anthropic", 3.0, 3.0),
+    ]
+    agg = collect_item_scores(rows)[("10.1/x", "processed")]["openai"]
+    assert agg["n_judges"] == 2
+    # openai collapses to mean(5, 3) = 4.0; anthropic contributes 3.0.
+    assert agg["unweighted"] == 3.5
+
+
+def test_repeated_judge_average_is_not_last_wins() -> None:
+    """Order must not decide the score — the guard against silent cherry-picking."""
+    ascending = [
+        _eval_row("10.1/x", "openai", "openai", 2.0, 2.0),
+        _eval_row("10.1/x", "openai", "openai", 5.0, 5.0),
+    ]
+    descending = list(reversed(ascending))
+    a = collect_item_scores(ascending)[("10.1/x", "processed")]["openai"]["unweighted"]
+    b = collect_item_scores(descending)[("10.1/x", "processed")]["openai"]["unweighted"]
+    assert a == b == 3.5

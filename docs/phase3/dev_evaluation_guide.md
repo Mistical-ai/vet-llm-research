@@ -8,7 +8,8 @@ The folders this guide revolves around:
 
 | Folder | Written by | Holds |
 | --- | --- | --- |
-| `data/dev_summaries_jsonl/` | `summarize --mode dev` | readable `.txt` of the summaries you made (one per paper) |
+| `data/dev_summaries_jsonl/` | `summarize --mode dev` | readable `.txt` of the summaries you made (one per paper) — the **structured bullets** view |
+| `data/dev_summaries_jsonl/prose/` | the same `summarize --mode dev` run | the same papers as **flowing prose** (`summary_text`) with a word count and an `[OVER 400]` flag — this is the text the judge actually scores |
 | `data/dev_evals_jsonl/` | `evaluate --mode dev` | readable `.txt` of the judge scores (one per paper) -- quick glance: aggregate score, hallucination count, judge reasoning |
 | `data/dev_detailEval_reports/` | `evaluate --mode dev` | readable `.md` deep-dive per paper -- title, every judge's own per-criterion score + reasoning, hallucination claim detail, automatic metrics, cross-judge agreement stats |
 
@@ -39,8 +40,19 @@ paper into `data/dev_summaries_jsonl/`.
 
 ## Step 2 — Eyeball the summaries
 
-Open the `.txt` files in `data/dev_summaries_jsonl/`. Each has a section per provider. If they
-look reasonable, continue.
+Each paper is written twice, and which file you open depends on what you're checking:
+
+- **`data/dev_summaries_jsonl/prose/*.txt`** — open these first. They hold the flowing
+  `summary_text`, which is exactly what the blind judge scores in Step 3 and what human
+  reviewers grade in Phase 5. Each provider section shows a `Summary (prose): N words`
+  line, flagged `[OVER 400]` if it breaks the ceiling. The 300-340-word budget applies
+  here and nowhere else.
+- **`data/dev_summaries_jsonl/*.txt`** (top level) — the structured bullet view
+  (`key_methods` / `key_findings` / `limitations`). Useful for spotting missing fields,
+  but it has *no* word budget, only item-count caps, so don't judge length from it.
+  It also shows at most 4/5/4 items; `data/summaries.jsonl` keeps the full lists.
+
+Each file has a section per provider. If they look reasonable, continue.
 
 ## Step 3 — Evaluate that sample
 
@@ -86,13 +98,31 @@ python llm-sum/run_phase3.py eval-report --markdown
 
 ## Step 5 — Grow the sample (optional)
 
-Just run Steps 1 and 3 again. `summarize --mode dev` skips papers already in
+Just run Steps 1 and 3 again. `summarize --mode dev` skips papers already in the top level of
 `dev_summaries_jsonl/` and picks *new* ones; `evaluate --mode dev` skips papers already in
 `dev_evals_jsonl/` and judges up to `PHASE3_DEV_LIMIT` of the rest, journal-balanced (and this
 always keeps `dev_detailEval_reports/` in sync with `dev_evals_jsonl/` -- same DOIs, written
 together). If Step 3 deferred some papers because the pending pool was bigger than the cap,
 running it again picks up wherever it left off — no need to track which ones by hand. Repeat
 until you've seen enough.
+
+## Trying a different prompt side-by-side
+
+`summarize --mode dev --output-subdir NAME` writes into
+`data/dev_summaries_jsonl/NAME/` and keeps its own independent "already done" pool, so a
+paper already summarized at the top level can be re-picked (and re-paid for) there.
+
+**This loop's Step 3 will not see those papers.** The folder readers glob `*.txt`
+non-recursively — that's what keeps `prose/` from being counted twice — so a subfolder
+pool is invisible until you point the judge at it:
+
+```powershell
+python llm-sum/run_phase3.py evaluate --mode dev --source-dir data/dev_summaries_jsonl/NAME
+```
+
+The same applies to `data/single_summaries_jsonl/` and `data/batch_summaries_jsonl/`.
+Both `evaluate` and the pilot review sampler warn when they notice a subfolder holding
+summaries they aren't reading.
 
 ## If you need to redo a paper
 

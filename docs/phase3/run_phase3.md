@@ -116,14 +116,19 @@ python llm-sum/run_phase3.py summarize --estimate --mode batch
 # Free: full mock run
 python llm-sum/run_phase3.py summarize --mode test
 
-# Paid: one paper × 3 providers → 3 summaries in summaries.jsonl
+# Paid: one paper × 3 providers → 3 summaries in summaries.jsonl,
+# plus readable data/single_summaries_jsonl/*.txt and its prose/ sibling.
+# (A fully-resumed run touches no paper and writes nothing there; it says so.)
 python llm-sum/run_phase3.py summarize --mode single
 
 # Paid: small run (default 5 papers × 3 providers)
+# → summaries.jsonl + data/dev_summaries_jsonl/*.txt + prose/
 python llm-sum/run_phase3.py summarize --mode dev
 python llm-sum/run_phase3.py summarize --mode dev --limit 3
 
-# Paid: full corpus via batch API
+# Paid: full corpus via batch API. Readable files appear later, when
+# check_batch_status.py merges each provider's results back, in
+# data/batch_summaries_jsonl/ (+ prose/).
 python llm-sum/run_phase3.py summarize --mode batch
 
 # Resume / force
@@ -133,6 +138,15 @@ python llm-sum/run_phase3.py summarize --mode single --force
 # Dev mode skips papers already in data/dev_summaries_jsonl/ (incremental sampling);
 # --no-skip-existing reconsiders them
 python llm-sum/run_phase3.py summarize --mode dev --no-skip-existing
+
+# Write this run's readable output into its own pool instead of the top level.
+# The subfolder tracks its OWN "already done" set, so a paper already summarized
+# at the top level can be re-picked here -- and re-paid for.
+python llm-sum/run_phase3.py summarize --mode dev --output-subdir promptv2
+# NOTE: `evaluate --mode dev` and the pilot review sampler read only the TOP
+# LEVEL of data/dev_summaries_jsonl/, so a subfolder pool is invisible to them
+# until you point them at it (both warn when they spot one):
+python llm-sum/run_phase3.py evaluate --mode dev --source-dir data/dev_summaries_jsonl/promptv2
 
 # Input source (default: processed)
 python llm-sum/run_phase3.py summarize --mode single --input-source processed
@@ -151,7 +165,8 @@ python llm-sum/run_phase3.py summarize --mode single --guide-summary llm-sum/pro
 | `--estimate` | Print projected cost via tiktoken; no API calls. Not available for `--input-source pdf`. |
 | `--limit N` | Override mode's paper limit |
 | `--resume` | Skip (doi, model) pairs already at `status=success` |
-| `--no-skip-existing` | Dev mode only: reconsider papers already in `data/dev_summaries_jsonl/` (default: skip them so dev sampling is incremental) |
+| `--no-skip-existing` | Dev mode only: reconsider papers already in the active output folder — the top level, or the `--output-subdir` folder if one is given (default: skip them so dev sampling is incremental) |
+| `--output-subdir NAME` | Dev mode only: write readable output to `data/dev_summaries_jsonl/NAME/` and track skip-existing against that subfolder alone. Judge it with `evaluate --source-dir data/dev_summaries_jsonl/NAME` |
 | `--force` | Bypass interactive `yes` confirmation |
 | `--providers` | Comma-separated subset (default: all three) |
 | `--manifest PATH` | Manifest JSONL |
@@ -218,9 +233,18 @@ python llm-sum/run_phase3.py summarize-all --mode single --providers openai,gemi
 Blind judge over `data/summaries.jsonl`. Writes to `data/evaluations.jsonl`.
 
 `--mode dev` is special: it runs the **folder-driven dev loop** — it reads the DOIs already
-in `data/dev_summaries_jsonl/` (written by `summarize --mode dev`), judges their matching
-articles, and mirrors the scores into `data/dev_evals_jsonl/`, skipping papers already
-evaluated there. See [dev_evaluation_guide.md](dev_evaluation_guide.md) for the full loop.
+in the **top level** of `data/dev_summaries_jsonl/` (written by `summarize --mode dev`), judges
+their matching articles, and mirrors the scores into `data/dev_evals_jsonl/`, skipping papers
+already evaluated there. See [dev_evaluation_guide.md](dev_evaluation_guide.md) for the full loop.
+
+The folder scan is deliberately **non-recursive**: `prose/` holds the same papers in their
+flowing-prose form and must never be counted twice. The side effect is that an
+`--output-subdir` pool, `data/single_summaries_jsonl/`, and `data/batch_summaries_jsonl/`
+are invisible to the default scan — use `--source-dir` to judge those. The command prints a
+warning when it notices summaries filed in a subfolder it isn't reading.
+
+Whichever folder seeds the run, the judge always scores the **prose `summary_text`** pulled
+from `data/summaries.jsonl` — the readable folder only decides *which* papers to judge.
 
 ```powershell
 python llm-sum/run_phase3.py evaluate --mode test
@@ -232,6 +256,11 @@ python llm-sum/run_phase3.py evaluate --mode dev --judges openai,anthropic
 python llm-sum/run_phase3.py evaluate --mode dev --jury
 python llm-sum/run_phase3.py evaluate --mode dev --no-resume   # re-judge papers already done
 python llm-sum/run_phase3.py evaluate --mode dev --force
+
+# Judge a different readable folder (results still go to data/dev_evals_jsonl/):
+python llm-sum/run_phase3.py evaluate --mode dev --source-dir data/dev_summaries_jsonl/promptv2
+python llm-sum/run_phase3.py evaluate --mode dev --source-dir data/single_summaries_jsonl
+python llm-sum/run_phase3.py evaluate --mode dev --source-dir data/batch_summaries_jsonl
 
 # Override the dev-mode default for a single run:
 python llm-sum/run_phase3.py evaluate --mode dev --input-mode jsonl   # journal-stratified summaries.jsonl
@@ -245,6 +274,7 @@ python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular
 | `--judges` | Comma-separated judge provider keys. Overrides `--jury` and `JURY_PRESET`. Default judges: the full 3-judge panel `openai,anthropic,gemini`. |
 | `--jury` | Full 3-judge panel (`openai,anthropic,gemini`); same as `JURY_PRESET=panel`. Presets: `panel` (3, default) / `duo` (2: `openai,anthropic`) / `solo` (1: `openai`). |
 | `--input-mode` | `jsonl` (default), `dev-jsonl`, `dev`, `regular`, or `auto` — where to read summaries from. `--mode dev` defaults to `dev-jsonl` regardless of `EVAL_INPUT_MODE`. See [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate). |
+| `--source-dir PATH` | dev-jsonl mode only: seed the run from this readable-summary folder instead of `data/dev_summaries_jsonl/`. Use for an `--output-subdir` pool, `data/single_summaries_jsonl/`, or `data/batch_summaries_jsonl/`. Results still go to `data/dev_evals_jsonl/`, and the folder actually used is recorded in the run manifest. Judge-side twin of `pilot_human_review --dev-summaries-dir`. |
 | `--no-resume` | Re-evaluate pairs already in `evaluations.jsonl`; in dev-jsonl mode also re-includes papers already in `data/dev_evals_jsonl/` |
 | `--force` | Bypass confirmation |
 

@@ -137,27 +137,28 @@ def _strip_spines(ax) -> None:
 def aggregate_criterion_means(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, float]]:
     """``{provider: {criterion: mean_score}}`` from raw evaluations.jsonl rows.
 
-    Reads the nested ``criteria_scores`` block evaluator.py writes on every
-    MedHELM-schema row (``{criterion: {"score": int, "reasoning": str}}``,
-    see ``evaluator._normalize_criteria_scores``); multiple judges scoring
-    the same summary are pooled into one mean per (provider, criterion), same
-    as ``report_tables.collect_item_scores`` pools multiple judges' jury
-    scores.
+    A thin projection over ``report_tables.collect_item_scores`` — the same
+    substrate the leaderboard composite is built from. That sharing is the
+    point: this function used to pool judge rows flat, while the composite
+    averaged judges within a paper first, so a single ``main()`` run could
+    render a heatmap and a bar chart that disagreed about the identical data.
+    Reading both from one collapse makes that contradiction impossible rather
+    than merely fixed.
+
+    Item-weighted throughout: judges are averaged within a paper, then papers
+    are averaged, so a paper that happened to draw three judges does not count
+    three times. Criteria a judge omitted are absent, never imputed.
     """
-    sums: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    for row in rows:
-        provider = str(row.get("summarizer", "")).strip()
-        block = row.get("criteria_scores")
-        if not provider or not isinstance(block, dict):
-            continue
-        for criterion in CRITERIA:
-            item = block.get(criterion)
-            score = item.get("score") if isinstance(item, dict) else item
-            if isinstance(score, (int, float)):
-                sums[provider][criterion].append(float(score))
+    item_scores = rt.collect_item_scores(rows)
+    per_provider: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for by_provider in item_scores.values():
+        for provider, agg in by_provider.items():
+            for criterion, value in (agg.get("criteria") or {}).items():
+                if value is not None:
+                    per_provider[provider][criterion].append(value)
     return {
         provider: {c: round(sum(v) / len(v), 3) for c, v in crits.items() if v}
-        for provider, crits in sums.items()
+        for provider, crits in per_provider.items()
     }
 
 

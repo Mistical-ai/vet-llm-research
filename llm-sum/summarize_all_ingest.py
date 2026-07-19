@@ -63,8 +63,15 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from eval_instances import EvaluationInstance, build_strata, load_manifest_index  # noqa: E402
+from eval_instances import (  # noqa: E402
+    EvaluationInstance, build_strata, iter_jsonl, load_manifest_index,
+)
 from prepare_texts import read_cached_text, read_processed_jsonl  # noqa: E402
+
+# Own module-level copy (same pattern as evaluator/human_review/eval_instances)
+# so tests can monkeypatch `summarize_all_ingest.SUMMARIES_PATH`; it is resolved
+# at call time, never captured at import.
+SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 
 _SEPARATOR = "=" * 78
 _KV_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9 _-]*):\s*(.*)$")
@@ -225,6 +232,48 @@ def _read_reference_text(parsed: dict[str, Any]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Prose lookup — keep this input mode scoring the same surface as every other
+# ---------------------------------------------------------------------------
+
+def _load_prose_by_doi_provider(
+    summaries_path: Path | None = None,
+) -> dict[tuple[str, str], str]:
+    """Map ``(doi, provider) -> summary_text`` from ``data/summaries.jsonl``.
+
+    Why this exists: the body text parsed out of a summarize-all ``.txt`` is
+    the *bulleted* structured render (``summarizer._format_human_readable``),
+    not the flowing ``summary_text``. Every other input mode judges the prose
+    (``eval_instances.iter_jsonl_instances`` reads ``slot["summary"]``), and
+    the human review packet shows that same prose — so scoring bullets here
+    would mean the judge and the reviewer grade a different artifact than
+    everywhere else in the study. The render-time list caps
+    (``summarizer._HUMAN_READABLE_LIST_CAPS``) make that worse: they truncate
+    ``key_findings``/``limitations`` in the ``.txt`` only, so a completeness
+    point could be lost on a paper whose JSONL record actually had the item.
+
+    Note that summarize-all itself never writes ``summaries.jsonl`` (it only
+    writes the comparison ``.txt`` files), so prose is available only for DOIs
+    that were also run through ``summarize``. Callers treat a miss as "skip
+    this row" rather than falling back to bullets.
+    """
+    resolved = summaries_path if summaries_path is not None else SUMMARIES_PATH
+    prose: dict[tuple[str, str], str] = {}
+    if not resolved.exists():
+        return prose
+    for record in iter_jsonl(resolved):
+        doi = str(record.get("doi", "")).strip()
+        if not doi:
+            continue
+        for provider, slot in (record.get("models") or {}).items():
+            if not isinstance(slot, dict):
+                continue
+            text = slot.get("summary")
+            if slot.get("status") == "success" and text:
+                prose[(doi, str(provider))] = str(text)
+    return prose
+
+
+# ---------------------------------------------------------------------------
 # Instance iterator — same EvaluationInstance shape as eval_instances.py
 # ---------------------------------------------------------------------------
 
@@ -235,6 +284,7 @@ def iter_summarize_all_instances(
     manual_manifest_path: Path | None = None,
     paper_limit: int | None = None,
     files: list[Path] | None = None,
+    summaries_path: Path | None = None,
 ) -> Iterable[EvaluationInstance]:
     """Yield one EvaluationInstance per successful provider slot found in
     ``folder``'s summarize-all ``.txt`` files.
@@ -245,9 +295,17 @@ def iter_summarize_all_instances(
     module docstring). Pass ``files`` to judge an already-resolved file list
     (e.g. one computed once by ``select_latest_txt_files`` and reused for
     both provenance hashing and instance building).
+
+    ``candidate_summary`` is always the flowing ``summary_text`` looked up from
+    ``data/summaries.jsonl`` (see ``_load_prose_by_doi_provider``), never the
+    bulleted body parsed out of the ``.txt``. A provider slot with no matching
+    prose is skipped with a warning rather than scored on bullets, so this mode
+    can never disagree with the surface every other mode judges.
     """
     selected = files if files is not None else select_latest_txt_files(folder, paper_limit=paper_limit)
     manifest_index = load_manifest_index(manifest_path, manual_manifest_path)
+    prose_by_doi_provider = _load_prose_by_doi_provider(summaries_path)
+    missing_prose: list[str] = []
 
     for path in selected:
         try:
@@ -276,13 +334,27 @@ def iter_summarize_all_instances(
         for provider, slot in parsed["providers"].items():
             if slot.get("status") != "success" or not slot.get("summary"):
                 continue
+            # Judge the prose, not the bulleted body this .txt carries.
+            prose = prose_by_doi_provider.get((doi, provider))
+            if not prose:
+                missing_prose.append(f"{doi} ({provider})")
+                continue
             yield EvaluationInstance(
                 doi=doi,
                 summarizer=provider,
                 reference_text=reference_text,
-                candidate_summary=str(slot["summary"]),
+                candidate_summary=prose,
                 input_source="processed",
                 strata=strata,
                 summary_record=summary_record,
                 manifest_record=manifest_record,
             )
+
+    if missing_prose:
+        print(
+            f"[summarize_all_ingest] WARNING: skipped {len(missing_prose)} provider "
+            f"slot(s) with no prose summary_text in {summaries_path or SUMMARIES_PATH}. "
+            "This input mode judges the flowing summary_text, which summarize-all "
+            "does not write — run `summarize` for these DOIs, or use "
+            "`--input-mode jsonl`. Skipped: " + ", ".join(missing_prose)
+        )

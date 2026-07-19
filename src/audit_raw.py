@@ -50,38 +50,55 @@ from utils import log_error  # noqa: E402
 
 def _load_and_dedup_manifest(
     manifest_path: Path,
-) -> tuple[dict[str, dict], list[dict], int]:
+) -> tuple[dict[str, dict], list[dict], int, int]:
     """
-    Read manifest, return (doi_index, ordered_unique_records, duplicate_count).
+    Read manifest, return
+    (doi_index, ordered_unique_records, duplicate_count, unparseable_count).
 
     Last occurrence of each DOI wins (most recent append is most complete).
     Original insertion order of first appearances is preserved in output list.
     """
     if not manifest_path.exists():
-        return {}, [], 0
+        return {}, [], 0, 0
 
     first_order: list[str] = []  # DOIs in first-seen order
     records_by_doi: dict[str, dict] = {}
     total_lines = 0
+    unparseable = 0
 
     with manifest_path.open(encoding="utf-8") as fh:
         for raw_line in fh:
             raw_line = raw_line.strip()
             if not raw_line:
                 continue
-            total_lines += 1
             try:
                 rec = json.loads(raw_line)
             except json.JSONDecodeError:
+                # Counted only if it parses. Incrementing before the parse made
+                # an unparseable line look like a duplicate, and a non-zero
+                # duplicate count triggers a full atomic rewrite of the manifest
+                # from unique_records — which does not contain that line. A
+                # corrupt row was therefore deleted permanently and reported as
+                # a benign "duplicate removed".
+                unparseable += 1
                 continue
-            doi = rec.get("doi", "").lower().strip()
+            total_lines += 1
+            # str() because a record with an explicit "doi": null yields None,
+            # and None.lower() would abort the whole audit.
+            doi = str(rec.get("doi") or "").lower().strip()
             if doi not in records_by_doi:
                 first_order.append(doi)
             records_by_doi[doi] = rec  # last occurrence wins
 
+    if unparseable:
+        print(f"[audit] WARNING: {unparseable} unparseable line(s) in "
+              f"{manifest_path.name}. This file will NOT be rewritten, because "
+              f"rewriting it would discard those lines permanently. Fix or "
+              f"remove them, then re-run the audit to deduplicate.")
+
     unique_records = [records_by_doi[d] for d in first_order if d in records_by_doi]
     duplicates_removed = total_lines - len(unique_records)
-    return records_by_doi, unique_records, duplicates_removed
+    return records_by_doi, unique_records, duplicates_removed, unparseable
 
 
 def _write_manifest_safe(manifest_path: Path, records: list[dict]) -> None:
@@ -125,7 +142,7 @@ def run_audit(
     # --- Phase 1: load & deduplicate manifests ---
     print("[audit] Loading manifests …")
 
-    doi_index, unique_records, dupes = _load_and_dedup_manifest(manifest_path)
+    doi_index, unique_records, dupes, bad_lines = _load_and_dedup_manifest(manifest_path)
     results["manifest_lines_before"] = len(unique_records) + dupes
     results["manifest_lines_after"] = len(unique_records)
     results["manifest_dupes"] = dupes
@@ -134,7 +151,9 @@ def run_audit(
         f"{dupes} duplicates"
     )
 
-    manual_index, manual_unique, manual_dupes = _load_and_dedup_manifest(manual_manifest_path)
+    manual_index, manual_unique, manual_dupes, manual_bad_lines = (
+        _load_and_dedup_manifest(manual_manifest_path)
+    )
     results["manual_lines_before"] = len(manual_unique) + manual_dupes
     results["manual_lines_after"] = len(manual_unique)
     results["manual_dupes"] = manual_dupes
@@ -146,13 +165,22 @@ def run_audit(
     combined_dois: set[str] = set(doi_index.keys()) | set(manual_index.keys())
 
     # --- Phase 2: write deduplicated manifests ---
+    # A rewrite reconstructs the file from the records that PARSED, so any line
+    # that didn't parse would be dropped for good. Refuse rather than silently
+    # discard a row the researcher may still be able to repair by hand.
     if not dry_run:
-        if dupes > 0:
+        if dupes > 0 and bad_lines == 0:
             _write_manifest_safe(manifest_path, unique_records)
             print(f"[audit] Wrote deduplicated manifest.jsonl ({len(unique_records)} lines)")
-        if manual_dupes > 0:
+        elif dupes > 0:
+            print(f"[audit] SKIPPED rewriting manifest.jsonl: {bad_lines} unparseable "
+                  f"line(s) would be lost. {dupes} duplicate(s) left in place.")
+        if manual_dupes > 0 and manual_bad_lines == 0:
             _write_manifest_safe(manual_manifest_path, manual_unique)
             print(f"[audit] Wrote deduplicated manual_manifest.jsonl ({len(manual_unique)} lines)")
+        elif manual_dupes > 0:
+            print(f"[audit] SKIPPED rewriting manual_manifest.jsonl: "
+                  f"{manual_bad_lines} unparseable line(s) would be lost.")
         if dupes == 0 and manual_dupes == 0:
             print("[audit] No duplicates — manifests unchanged.")
     else:

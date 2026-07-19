@@ -90,6 +90,12 @@ DEV_SUMMARIES_JSONL_DIR = DATA_DIR / "dev_summaries_jsonl"
 # stops after paper_limit papers — so cmd_summarize figures out which DOI(s)
 # actually got (re)written this run via `_dois_touched_since` instead.
 SINGLE_SUMMARIES_JSONL_DIR = DATA_DIR / "single_summaries_jsonl"
+# Readable sibling of data/summaries.jsonl for `summarize --mode batch` runs.
+# Written by check_batch_status.merge_summarisation_results as each provider's
+# results merge back, so the full 250-paper corpus ends up with the same
+# bullet + prose/ pair that dev and single runs produce. Judge it with
+# `evaluate --mode dev --source-dir data/batch_summaries_jsonl`.
+BATCH_SUMMARIES_JSONL_DIR = DATA_DIR / "batch_summaries_jsonl"
 # Readable judge-side sibling of DEV_SUMMARIES_JSONL_DIR: `evaluate --mode dev`
 # writes one .txt per judged dev paper here (see _cmd_evaluate_from_dev_jsonl).
 # data/evaluations.jsonl stays the append-only source of truth; this is the
@@ -197,6 +203,33 @@ def _read_dois_from_dev_folder(folder: Path) -> set[str]:
         except OSError:
             continue
     return dois
+
+
+def _warn_about_unread_subfolders(folder: Path) -> list[str]:
+    """Warn when ``folder`` has subdirectories holding .txt files we won't read.
+
+    ``_read_dois_from_dev_folder`` globs ``*.txt`` non-recursively, which is
+    deliberate: ``prose/`` is the readable prose sibling of the same papers and
+    must never be counted twice. But that same non-recursion silently hides a
+    ``summarize --mode dev --output-subdir NAME`` pool, whose papers then look
+    like they were never summarised at all. Naming the folders here turns a
+    silent no-op into an obvious "you probably meant --source-dir".
+
+    Returns the subfolder names warned about (empty when there's nothing to
+    say), so callers and tests can assert on it.
+    """
+    if not folder.exists():
+        return []
+    skipped = sorted(
+        child.name for child in folder.iterdir()
+        if child.is_dir() and child.name != "prose" and any(child.glob("*.txt"))
+    )
+    if skipped:
+        print(f"[phase3] NOTE: {folder} has subfolder(s) with readable summaries "
+              f"that are NOT part of this run: {', '.join(skipped)}. "
+              f"Only top-level *.txt files are read. To use one of them, pass "
+              f"--source-dir {folder / skipped[0]}")
+    return skipped
 
 
 def _dois_touched_since(
@@ -903,8 +936,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     finally:
         from eval_report import iter_evaluation_rows
 
+        # PROVENANCE read, not analysis: the manifest records which model
+        # versions actually answered, so it must see dry-run rows too. Filtering
+        # them here would let a test-mode run produce a manifest claiming real
+        # model versions — the same class of bug this filter exists to prevent.
         resolved_versions = resolve_model_versions(
-            active_judges, model_ids, list(iter_evaluation_rows()),
+            active_judges, model_ids,
+            list(iter_evaluation_rows(include_dry_run=True)),
         )
         finalize_run_manifest(
             manifest_path, resolved_model_versions=resolved_versions, status=status,
@@ -1007,8 +1045,13 @@ def _cmd_evaluate_from_txt_folder(
     finally:
         from eval_report import iter_evaluation_rows
 
+        # PROVENANCE read, not analysis: the manifest records which model
+        # versions actually answered, so it must see dry-run rows too. Filtering
+        # them here would let a test-mode run produce a manifest claiming real
+        # model versions — the same class of bug this filter exists to prevent.
         resolved_versions = resolve_model_versions(
-            active_judges, model_ids, list(iter_evaluation_rows()),
+            active_judges, model_ids,
+            list(iter_evaluation_rows(include_dry_run=True)),
         )
         finalize_run_manifest(
             manifest_path, resolved_model_versions=resolved_versions, status=status,
@@ -1048,11 +1091,18 @@ def _cmd_evaluate_from_dev_jsonl(
 
     manifest_index = load_manifest_index()
 
-    source_dois = _read_dois_from_dev_folder(DEV_SUMMARIES_JSONL_DIR)
+    # --source-dir redirects which readable folder seeds this run (an
+    # --output-subdir pool, data/single_summaries_jsonl/, data/batch_summaries_jsonl/).
+    # Resolved once here and used everywhere below — leaving any one reference
+    # pinned to the module constant would mix provenance into the run manifest.
+    source_dir = args.source_dir or DEV_SUMMARIES_JSONL_DIR
+
+    source_dois = _read_dois_from_dev_folder(source_dir)
     print(f"[phase3:evaluate] input mode=dev-jsonl: reading dev summaries from "
-          f"{DEV_SUMMARIES_JSONL_DIR}")
+          f"{source_dir}")
+    _warn_about_unread_subfolders(source_dir)
     if not source_dois:
-        print(f"[phase3:evaluate] No dev summaries found in {DEV_SUMMARIES_JSONL_DIR}. "
+        print(f"[phase3:evaluate] No dev summaries found in {source_dir}. "
               "Run 'summarize --mode dev' first.")
         return 1
 
@@ -1127,7 +1177,7 @@ def _cmd_evaluate_from_dev_jsonl(
 
     # Hash the specific dev-summary files that seed this run for provenance.
     selected_files = sorted(
-        p for p in DEV_SUMMARIES_JSONL_DIR.glob("*.txt")
+        p for p in source_dir.glob("*.txt")
         if _read_dois_from_dev_folder_file(p) in target_dois
     )
 
@@ -1141,7 +1191,7 @@ def _cmd_evaluate_from_dev_jsonl(
         "mode": profile.name,
         "slice_config": {
             "type": "dev_jsonl",
-            "source_dir": str(DEV_SUMMARIES_JSONL_DIR),
+            "source_dir": str(source_dir),
             "articles_found": len(source_dois),
             "articles_pending_before_sampling": pending_before_sampling,
             "articles_to_judge": len(target_dois),
@@ -1151,7 +1201,7 @@ def _cmd_evaluate_from_dev_jsonl(
     }
     manifest = build_run_manifest(
         run_id=create_run_id(),
-        dataset_path=str(DEV_SUMMARIES_JSONL_DIR),
+        dataset_path=str(source_dir),
         dataset_hash_sha256=sha256_files_combined(selected_files),
         judges=active_judges,
         model_ids=model_ids,
@@ -1199,8 +1249,13 @@ def _cmd_evaluate_from_dev_jsonl(
     finally:
         from eval_report import iter_evaluation_rows
 
+        # PROVENANCE read, not analysis: the manifest records which model
+        # versions actually answered, so it must see dry-run rows too. Filtering
+        # them here would let a test-mode run produce a manifest claiming real
+        # model versions — the same class of bug this filter exists to prevent.
         resolved_versions = resolve_model_versions(
-            active_judges, model_ids, list(iter_evaluation_rows()),
+            active_judges, model_ids,
+            list(iter_evaluation_rows(include_dry_run=True)),
         )
         finalize_run_manifest(
             manifest_path, resolved_model_versions=resolved_versions, status=status,
@@ -1265,8 +1320,10 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"failed={c.get('failed',0)} pending={c.get('pending',0)}")
 
     eval_total = 0
+    dry_run_total = 0
     requires_review = 0
     if EVALUATIONS_PATH.exists():
+        from evaluator import is_dry_run_row
         with open(EVALUATIONS_PATH, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -1276,11 +1333,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # Count mock rows separately: reporting a raw line count would
+                # overstate how much of the corpus has actually been judged.
+                if is_dry_run_row(row):
+                    dry_run_total += 1
+                    continue
                 eval_total += 1
                 if row.get("requires_human_review"):
                     requires_review += 1
-    print(f"[phase3:status] data/evaluations.jsonl: {eval_total} rows "
-          f"({requires_review} flagged for human review)")
+    suffix = f", {dry_run_total} dry-run rows excluded" if dry_run_total else ""
+    print(f"[phase3:status] data/evaluations.jsonl: {eval_total} real rows "
+          f"({requires_review} flagged for human review{suffix})")
     return 0
 
 
@@ -1729,6 +1792,17 @@ def build_parser() -> argparse.ArgumentParser:
                               "folder-driven dev loop. 'auto': 'dev' when --mode is dev, "
                               "else 'regular'. Overrides EVAL_INPUT_MODE from .env for this "
                               "run. PDF-input comparison files are never evaluated."))
+    p_eval.add_argument("--source-dir", type=Path, default=None,
+                        help="dev-jsonl mode only: read the papers to judge from this "
+                             "readable-summary folder instead of the default "
+                             "data/dev_summaries_jsonl/. Use it to judge a "
+                             "`summarize --mode dev --output-subdir NAME` pool "
+                             "(data/dev_summaries_jsonl/NAME/), or "
+                             "data/single_summaries_jsonl/ and "
+                             "data/batch_summaries_jsonl/. Results still go to "
+                             "data/dev_evals_jsonl/, so the incremental skip works "
+                             "across sources. This is the judge-side twin of "
+                             "pilot_human_review's --dev-summaries-dir.")
     p_eval.add_argument("--no-resume", action="store_true",
                         help="Re-evaluate even pairs already in evaluations.jsonl. In "
                              "dev-jsonl mode this also re-includes papers already in "

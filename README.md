@@ -325,6 +325,10 @@ Every paid mode asks for confirmation before calling APIs. Set `PHASE3_MODE=test
 
 **Dev mode is an incremental loop.** `summarize --mode dev` picks one random paper per journal and writes readable `.txt` files to `data/dev_summaries_jsonl/`; `evaluate --mode dev` then judges exactly those papers and writes readable scores to `data/dev_evals_jsonl/`. Both stages skip papers already done, so re-running grows the sample paper-by-paper. Full step-by-step: [docs/phase3/dev_evaluation_guide.md](docs/phase3/dev_evaluation_guide.md).
 
+**Every summary is written twice, and only one of them has a word limit.** The top-level `.txt` in each readable folder shows the *structured bullets*; the `prose/` subfolder shows the flowing `summary_text` with a word count. The 300-340-word budget (hard ceiling 400) applies **only to the prose** — which is also the exact text the blind judge scores and human reviewers grade. `data/summaries.jsonl` keeps the full uncapped lists either way.
+
+**The same pair of files exists for every run kind**, so nothing special is needed at full scale: `summarize --mode single` writes `data/single_summaries_jsonl/`, and batch results land in `data/batch_summaries_jsonl/` as each provider merges back. To judge or review one of those instead of the dev folder, pass `evaluate --source-dir <path>` or `pilot_human_review --dev-summaries-dir <path>` — the readers only look at the top level of one folder, and will warn you if they spot summaries filed somewhere they aren't reading.
+
 ### PDF vs processed text comparison (`summarize-all`)
 
 The primary dev command runs **six summaries** from one matched article — 3 providers × 2 input sources:
@@ -473,6 +477,9 @@ vet-llm-research/
 │   ├── summaries_pdf/            ← Phase 3: summarize-all PDF-source outputs (single/test)
 │   ├── summaries_txt/            ← Phase 3: summarize-all processed-text outputs (single/test)
 │   ├── dev_summaries_jsonl/      ← Phase 3: readable .txt sibling of summaries.jsonl for summarize --mode dev
+│   │   └── prose/                ← Phase 3: same papers, flowing summary_text (what the judge scores)
+│   ├── single_summaries_jsonl/   ← Phase 3: same two surfaces for summarize --mode single
+│   ├── batch_summaries_jsonl/    ← Phase 3: same two surfaces, written as batch results merge back
 │   ├── dev_evals_jsonl/          ← Phase 3: readable .txt sibling of evaluations.jsonl for evaluate --mode dev
 │   ├── dev_detailEval_reports/   ← Phase 3: deep-dive Markdown reports from evaluate --mode dev
 │   ├── dev_tests/                ← Phase 3: summarize-all dev-mode PDF-vs-processed comparison output
