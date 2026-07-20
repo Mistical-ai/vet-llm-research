@@ -19,6 +19,7 @@ from _bootstrap import *  # noqa: F401,F403
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,8 +28,10 @@ from batch_utils import (  # noqa: E402
     SUMMARIES_PATH,
     load_batch_jobs,
     parse_anthropic_result_line,
+    parse_gemini_result_line,
     parse_openai_result_line,
     parse_evaluation_custom_id,
+    safe_job_id_for_path,
 )
 from models_config import compute_cost  # noqa: E402
 from utils import BudgetGuard, log_error  # noqa: E402
@@ -67,6 +70,33 @@ def fetch_anthropic_status(job_id: str) -> dict:
     }
 
 
+# Gemini's Batch Mode reports state as JOB_STATE_* (ai.google.dev/gemini-api/docs/batch-mode)
+# rather than OpenAI's "completed" / Anthropic's "ended". Normalising here means
+# SUCCESS_STATUSES / TERMINAL_STATUSES below stay untouched and provider-agnostic.
+GEMINI_STATE_TO_STATUS = {
+    "JOB_STATE_SUCCEEDED": "completed",
+    "JOB_STATE_FAILED": "failed",
+    "JOB_STATE_EXPIRED": "expired",
+    "JOB_STATE_CANCELLED": "cancelled",
+    "JOB_STATE_PENDING": "pending",
+    "JOB_STATE_RUNNING": "running",
+}
+
+
+def fetch_gemini_status(job_id: str) -> dict:
+    from google import genai  # type: ignore[import-not-found]
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    job = client.batches.get(name=job_id)
+    state = getattr(job, "state", None)
+    state_name = state.name if state is not None and hasattr(state, "name") else str(state)
+    dest = getattr(job, "dest", None)
+    return {
+        "status": GEMINI_STATE_TO_STATUS.get(state_name, str(state_name).lower()),
+        "output_file_name": getattr(dest, "file_name", None) if dest is not None else None,
+        "request_counts": {},
+    }
+
+
 def download_openai_results(output_file_id: str, dest: Path) -> Path:
     import openai  # type: ignore[import-not-found]
     client = openai.OpenAI()
@@ -74,6 +104,25 @@ def download_openai_results(output_file_id: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(content)
     return dest
+
+
+def download_openai_error_file(error_file_id: str) -> str:
+    """
+    Fetch a completed-but-failed OpenAI batch job's per-row error detail.
+
+    A job can be terminal-success (status "completed") while every request
+    in it failed — in that case ``output_file_id`` is None and the failure
+    detail lives in ``error_file_id`` instead (see fetch_openai_status). This
+    is the read-only counterpart to download_openai_results: same client
+    shape, but returns text (each line already valid JSON) for the caller to
+    parse and log, rather than writing a results file to merge.
+    """
+    import openai  # type: ignore[import-not-found]
+    client = openai.OpenAI()
+    content = client.files.content(error_file_id).read()
+    if isinstance(content, bytes):
+        content = content.decode("utf-8")
+    return content
 
 
 def download_anthropic_results(job_id: str, dest: Path) -> Path:
@@ -88,6 +137,16 @@ def download_anthropic_results(job_id: str, dest: Path) -> Path:
         for line in client.messages.batches.results(job_id):
             # SDK yields dict-like objects; serialise to JSON.
             f.write(json.dumps(line.model_dump() if hasattr(line, "model_dump") else line) + "\n")
+    return dest
+
+
+def download_gemini_results(output_file_name: str, dest: Path) -> Path:
+    """Download a completed Gemini batch job's result JSONL via the Files API."""
+    from google import genai  # type: ignore[import-not-found]
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    content = client.files.download(file=output_file_name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(content if isinstance(content, (bytes, bytearray)) else bytes(content))
     return dest
 
 
@@ -156,6 +215,13 @@ def _batch_result_cost(provider: str, parsed: dict) -> float:
     )
 
 
+_RESULT_PARSERS = {
+    "openai": parse_openai_result_line,
+    "anthropic": parse_anthropic_result_line,
+    "gemini": parse_gemini_result_line,
+}
+
+
 def merge_summarisation_results(result_path: Path, provider: str,
                                 guard: BudgetGuard | None = None) -> int:
     """
@@ -167,9 +233,7 @@ def merge_summarisation_results(result_path: Path, provider: str,
     stop sees the whole run's spend rather than each job's in isolation.
     """
     guard = guard if guard is not None else BudgetGuard()
-    parser = (
-        parse_openai_result_line if provider == "openai" else parse_anthropic_result_line
-    )
+    parser = _RESULT_PARSERS[provider]
 
     summaries = _load_summaries()
     custom_id_to_key = _build_custom_id_to_key(summaries)
@@ -220,9 +284,11 @@ def _write_batch_readable_outputs(dois: set[str]) -> int:
     human validation without any extra step.
 
     Called once per provider merge, and batch merges arrive one provider at a
-    time (gemini is not batched at all). The renderer re-reads summaries.jsonl
-    each call, so the first merge writes a file with one provider populated and
-    the next overwrites it with both — expected, not a bug.
+    time (and Gemini may not appear here at all if GEMINI_BATCH_ENABLED=false,
+    since it was already written by the real-time fallback during `summarize`).
+    The renderer re-reads summaries.jsonl each call, so the first merge writes
+    a file with one provider populated and the next overwrites it with more —
+    expected, not a bug.
 
     Never fatal: a rendering problem must not lose an expensive completed batch
     merge that is already safely on disk.
@@ -266,9 +332,7 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
 
     guard = guard if guard is not None else BudgetGuard()
 
-    parser = (
-        parse_openai_result_line if provider == "openai" else parse_anthropic_result_line
-    )
+    parser = _RESULT_PARSERS[provider]
     summaries = _load_summaries()
     custom_id_to_key = _build_custom_id_to_key(summaries)
 
@@ -351,7 +415,9 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
 
 TERMINAL_STATUSES = {"completed", "ended", "failed", "expired", "cancelled"}
 # The subset of TERMINAL_STATUSES that actually produced results worth
-# downloading. OpenAI reports "completed"; Anthropic reports "ended". The rest
+# downloading. OpenAI reports "completed"; Anthropic reports "ended"; Gemini's
+# JOB_STATE_* names are normalised to these same strings by
+# GEMINI_STATE_TO_STATUS above, so this set stays provider-agnostic. The rest
 # of TERMINAL_STATUSES are terminal *failures* — asking a provider for the
 # output of a failed or expired job just wastes a request and logs a confusing
 # error, so they are reported and skipped instead.
@@ -376,10 +442,12 @@ def poll_all(*, download_when_complete: bool = True) -> None:
         provider = job["provider"]
         job_id = job["job_id"]
         try:
-            status = (
-                fetch_openai_status(job_id) if provider == "openai"
-                else fetch_anthropic_status(job_id)
-            )
+            if provider == "openai":
+                status = fetch_openai_status(job_id)
+            elif provider == "anthropic":
+                status = fetch_anthropic_status(job_id)
+            else:
+                status = fetch_gemini_status(job_id)
         except Exception as exc:
             print(f"[phase3:batch] {provider} {job_id} status fetch failed: {exc}")
             continue
@@ -401,13 +469,72 @@ def poll_all(*, download_when_complete: bool = True) -> None:
         # downloaded successfully and then crashed mid-merge could never merge
         # those results — the download it had already done was the very thing
         # that stopped it retrying. Paid results stayed stranded on disk.
-        result_path = BATCH_DIR / f"{provider}_{job_id}_results.jsonl"
+        #
+        # Gemini job names look like "batches/abc123" (a resource path, not a
+        # bare id) — sanitised here so the "/" never turns into an unwanted
+        # subdirectory under BATCH_DIR. The real job_id (with the slash) is
+        # still what's sent back to the Gemini API in fetch/download above.
+        # Shared with batch_utils._unresolved_batch_jobs so both agree on the
+        # same result-file name.
+        safe_job_id = safe_job_id_for_path(job_id)
+        result_path = BATCH_DIR / f"{provider}_{safe_job_id}_results.jsonl"
+        # OpenAI's terminal-success statuses can still mean "every request in
+        # the job failed" — in that case output_file_id is None and the
+        # failure detail lives in error_file_id instead (see
+        # fetch_openai_status above). The generic download branch below only
+        # checks output_file_id for OpenAI, so an all-failed job used to fall
+        # through to `else: continue` silently: no print, no .merged marker.
+        # Since batch_utils._unresolved_batch_jobs treats "no .merged marker"
+        # as "still unresolved", that stranded job blocked every future
+        # OpenAI batch submission until the user passed --force — even
+        # though the job was genuinely done, just failed. Handle it here,
+        # before the normal download/merge path, so a real all-failed job
+        # still gets logged and marked resolved instead of merged.
+        if (provider == "openai" and not status.get("output_file_id")
+                and status.get("error_file_id")):
+            merged_marker = result_path.with_suffix(".merged")
+            if merged_marker.exists():
+                continue
+            try:
+                error_content = download_openai_error_file(status["error_file_id"])
+            except Exception as exc:
+                print(f"[phase3:batch] error-file download failed for {job_id}: {exc}")
+                continue
+            print(error_content)
+            count = 0
+            for line in error_content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                custom_id = row.get("custom_id", "")
+                message = (
+                    row.get("response", {}).get("body", {}).get("error", {}).get("message")
+                    or str(row.get("error"))
+                )
+                log_error(custom_id, "batch_merge", message)
+                count += 1
+            stage = job.get("stage", "summarize")
+            merged_marker.write_text(
+                f"resolved stage={stage} provider={provider} job_id={job_id} "
+                f"status=all_failed\n",
+                encoding="utf-8",
+            )
+            print(f"[phase3:batch] {provider} {job_id}: all {count} requests failed — "
+                  f"see data/error_log.jsonl for details")
+            continue
+
         if not result_path.exists():
             try:
                 if provider == "openai" and status.get("output_file_id"):
                     download_openai_results(status["output_file_id"], result_path)
                 elif provider == "anthropic":
                     download_anthropic_results(job_id, result_path)
+                elif provider == "gemini" and status.get("output_file_name"):
+                    download_gemini_results(status["output_file_name"], result_path)
                 else:
                     continue
             except Exception as exc:

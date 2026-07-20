@@ -647,7 +647,11 @@ def _gemini_output_token_limit() -> int:
     shared 1200-1500 token cap. We keep the shared cap for other providers, but
     give Gemini a larger default because its JSON output often includes escaped
     prose and pretty formatting; this is safer than trying to repair partial
-    scientific summaries after truncation.
+    scientific summaries after truncation. Gemini calls also disable "thinking"
+    (see ``thinking_config``/``thinking_budget=0`` at the call sites) because
+    invisible reasoning tokens were eating this same budget and causing
+    MAX_TOKENS cutoffs with almost no visible output; the larger cap here and
+    the disabled thinking are two separate mitigations for the same failure.
     """
     return GEMINI_MAX_OUTPUT_TOKENS
 
@@ -985,6 +989,7 @@ def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
             max_output_tokens=_gemini_output_token_limit(),
             response_mime_type="application/json",
             response_schema=gemini_response_schema(),
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
 
@@ -1166,6 +1171,7 @@ def _call_gemini_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
             max_output_tokens=_gemini_output_token_limit(),
             response_mime_type="application/json",
             response_schema=gemini_response_schema(),
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
 
@@ -1488,13 +1494,22 @@ def _write_all_summaries(path: Path, summaries_by_doi: dict[str, dict]) -> None:
 # Confirmation guard
 # ---------------------------------------------------------------------------
 
-def confirm_real_batch(profile: ModeProfile, force: bool) -> bool:
+def confirm_real_batch(profile: ModeProfile, force: bool, *,
+                       batch_providers: list[str] | None = None,
+                       realtime_providers: list[str] | None = None) -> bool:
     """
     Final interactive guardrail. Returns True if it's safe to proceed.
 
     Triggers when the resolved profile both requires confirmation AND is
     not already short-circuited to mocks. ``--force`` bypasses the prompt
     for overnight/scheduled use and logs an audit line.
+
+    ``batch_providers``/``realtime_providers``, when given (mode=batch
+    only), make the label reflect what's actually about to happen instead of
+    always claiming "batch jobs" even when every provider's batch flag ends
+    up routing it to real-time. Callers that don't split providers (e.g.
+    `summarize-all`, which has no batch/real-time distinction) simply omit
+    them and get the original mode-level label.
     """
     if profile.dry_run or not profile.requires_confirm:
         return True
@@ -1510,9 +1525,17 @@ def confirm_real_batch(profile: ModeProfile, force: bool) -> bool:
         print(audit_line.strip())
         return True
 
-    label = "REAL batch jobs to paid APIs" if profile.use_batch else (
-        f"REAL real-time API calls (limit={profile.paper_limit or 'no limit'})"
-    )
+    if profile.use_batch and batch_providers is not None:
+        if batch_providers:
+            label = f"REAL batch jobs to paid APIs ({', '.join(batch_providers)})"
+            if realtime_providers:
+                label += f" + REAL real-time API calls ({', '.join(realtime_providers)})"
+        else:
+            label = f"REAL real-time API calls ({', '.join(realtime_providers or [])})"
+    else:
+        label = "REAL batch jobs to paid APIs" if profile.use_batch else (
+            f"REAL real-time API calls (limit={profile.paper_limit or 'no limit'})"
+        )
     reply = input(
         f"\n[phase3:safety] About to submit {label}.\n"
         "Type 'yes' to confirm: "
@@ -2466,7 +2489,25 @@ def main(argv: list[str] | None = None) -> int:
     if guide_summary:
         print(f"[phase3:summarize] format guide ready: {resolved_guide_path}")
 
-    if not confirm_real_batch(profile, force=args.force):
+    # Split the requested providers by whether their batch flag is on
+    # (models_config.MODELS[...].supports_batch, driven by
+    # OPENAI_BATCH_ENABLED / ANTHROPIC_BATCH_ENABLED / GEMINI_BATCH_ENABLED).
+    # Computed before confirm_real_batch (not just inside the batch branch
+    # below) so the confirmation prompt's label reflects what's actually
+    # about to happen, rather than always saying "batch jobs" even when a
+    # provider's flag routes it to real-time instead. Gemini defaults to
+    # GEMINI_BATCH_ENABLED=false, so by default it falls into
+    # realtime_providers and is summarised via the same real-time call
+    # single/dev mode use — in the SAME `summarize --mode batch` invocation,
+    # matching .env.template section 12's description of what batch mode
+    # does. Flipping GEMINI_BATCH_ENABLED=true moves it into batch_providers
+    # instead, with no other command-line change.
+    batch_providers = [p for p in providers if get_model_spec(p).supports_batch] if profile.use_batch else None
+    realtime_providers = [p for p in providers if not get_model_spec(p).supports_batch] if profile.use_batch else None
+
+    if not confirm_real_batch(profile, force=args.force,
+                              batch_providers=batch_providers,
+                              realtime_providers=realtime_providers):
         return 1
     require_positive_budget_for_real_run(
         dry_run=profile.dry_run,
@@ -2474,14 +2515,38 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if profile.use_batch:
-        # Lazy import so unit tests don't need the batch dependencies loaded.
-        from batch_utils import run_batch_summarisation
-        run_batch_summarisation(
-            manifest_path=args.manifest,
-            resume=args.resume,
-            providers=providers,
-            guide_summary_path=args.guide_summary,
-        )
+        # `paper_limit` (computed above from --limit / profile.paper_limit)
+        # applies to BOTH legs here — batch mode's own profile.paper_limit is
+        # always None ("full corpus"), so this is None unless --limit was
+        # explicitly passed. Passing the same value to both calls is what
+        # makes `--limit 2` a genuine smoke test: capping only the batch leg
+        # while leaving the real-time leg (e.g. Gemini, by default) uncapped
+        # would silently run that provider over the full corpus regardless of
+        # the limit the user asked for.
+        if batch_providers:
+            # Lazy import so unit tests don't need the batch dependencies loaded.
+            from batch_utils import run_batch_summarisation
+            print(f"[phase3:batch] batch-API providers: {', '.join(batch_providers)}")
+            run_batch_summarisation(
+                manifest_path=args.manifest,
+                resume=args.resume,
+                providers=batch_providers,
+                guide_summary_path=args.guide_summary,
+                force=args.force,
+                paper_limit=paper_limit,
+            )
+        if realtime_providers:
+            print(f"[phase3:batch] real-time providers (batch disabled for these): "
+                  f"{', '.join(realtime_providers)}")
+            run_realtime(
+                manifest_path=args.manifest,
+                resume=args.resume,
+                paper_limit=paper_limit,
+                providers=realtime_providers,
+                input_source=args.input_source,
+                guide_summary_path=args.guide_summary,
+                doi_filter=doi_filter,
+            )
         return 0
 
     run_realtime(

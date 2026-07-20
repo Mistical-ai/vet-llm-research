@@ -109,6 +109,16 @@ def _wired_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # summaries.jsonl rather than the bulleted .txt body, so this path has to
     # be redirected too or those tests would read the real project file.
     monkeypatch.setattr(summarize_all_ingest, "SUMMARIES_PATH", summaries_path)
+    # cmd_evaluate's journal-stratified sampling branch (single/dev/batch,
+    # anything other than --mode test) reads run_phase3's OWN module-level
+    # SUMMARIES_PATH/MANIFEST_PATH directly — a separate pair of constants
+    # from evaluator's, not a re-export — so patching only evaluator's above
+    # leaves this branch reading the real project data/summaries.jsonl and
+    # data/manifest.jsonl. --mode test never hits this branch (no journal
+    # stratification there), which is why this gap went unnoticed until a
+    # test exercised single/dev/batch's real sampling path.
+    monkeypatch.setattr(run_phase3, "SUMMARIES_PATH", summaries_path)
+    monkeypatch.setattr(run_phase3, "MANIFEST_PATH", tmp_path / "manifest.jsonl")
     monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
     monkeypatch.setattr(evaluator, "PROCESSED_DIR", processed_dir)
     monkeypatch.setattr(prepare_texts, "PROCESSED_DIR", processed_dir)
@@ -192,6 +202,126 @@ def test_evaluate_test_mode_writes_completed_run_manifest(_wired_paths) -> None:
     taxonomy = data["evaluation_config"]["taxonomy"]
     assert taxonomy["taxonomy_id"] == "vet_taxonomy_v1"
     assert taxonomy["task_key"] == "veterinary_summary_quality"
+
+
+# ---------------------------------------------------------------------------
+# evaluate --mode batch: full-corpus default + batch/real-time judge split
+# ---------------------------------------------------------------------------
+
+def _write_fake_summaries_with_journals(
+    summaries_path: Path, processed_dir: Path, dois_by_journal: dict[str, list[str]],
+) -> None:
+    """Like _write_fake_summaries, but with an explicit "journal" field per
+    row (read directly by _load_summaries_by_journal before it ever falls
+    back to manifest.jsonl), across multiple journals with multiple papers
+    each — needed to tell "1 per journal" apart from "every paper"."""
+    from file_paths import doi_to_slug
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    with open(summaries_path, "w", encoding="utf-8") as f:
+        for journal, dois in dois_by_journal.items():
+            for doi in dois:
+                slug = doi_to_slug(doi)
+                (processed_dir / f"{slug}.jsonl").write_text(
+                    json.dumps({"doi": doi, "slug": slug, "text": "Reference body. " * 30}) + "\n",
+                    encoding="utf-8",
+                )
+                f.write(json.dumps({
+                    "doi": doi,
+                    "custom_id": slug,
+                    "journal": journal,
+                    "models": {
+                        p: {"status": "success", "summary": f"{p} summary for {doi}"}
+                        for p in ("openai", "anthropic", "gemini")
+                    },
+                }) + "\n")
+
+
+# In plain English: two bugs, one test. (1) `evaluate --mode batch` with no
+# --limit used to sample only 1 paper PER JOURNAL (a `None or 1` bug in the
+# per-journal quota formula) instead of the whole corpus — this asserts every
+# journal-mapped paper is included. (2) `evaluate --mode batch` never
+# actually submitted a batch job for any judge — this asserts OpenAI/
+# Anthropic (batch-enabled by default) go through run_batch_evaluation while
+# Gemini (real-time by default) goes through run_evaluation, mirroring the
+# summarize-side split exactly, and that both legs see the same full-corpus
+# doi_filter.
+def test_evaluate_batch_mode_dispatches_split_judges_over_full_corpus(
+    _wired_paths, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import batch_utils
+    import evaluator
+
+    dois_by_journal = {
+        "jvim": ["10.9999/j1.1", "10.9999/j1.2", "10.9999/j1.3"],
+        "javma": ["10.9999/j2.1", "10.9999/j2.2"],
+    }
+    _write_fake_summaries_with_journals(
+        _wired_paths["summaries_path"], _wired_paths["processed_dir"], dois_by_journal,
+    )
+
+    batch_calls: list[dict] = []
+    realtime_calls: list[dict] = []
+
+    def _fake_run_batch_evaluation(*, judges, doi_filter, **_kwargs):
+        batch_calls.append({"judges": sorted(judges), "doi_filter": set(doi_filter)})
+        return {"submitted": []}
+
+    def _fake_run_evaluation(*, judges, doi_filter, **_kwargs):
+        realtime_calls.append({"judges": sorted(judges), "doi_filter": set(doi_filter)})
+        return {"success": 0, "failed": 0}
+
+    monkeypatch.setattr(batch_utils, "run_batch_evaluation", _fake_run_batch_evaluation)
+    monkeypatch.setattr(evaluator, "run_evaluation", _fake_run_evaluation)
+
+    ret = _run_evaluate(["evaluate", "--mode", "batch", "--force"])
+
+    assert ret == 0
+    all_dois = {doi for dois in dois_by_journal.values() for doi in dois}
+
+    assert len(batch_calls) == 1
+    assert batch_calls[0]["judges"] == ["anthropic", "openai"]
+    assert batch_calls[0]["doi_filter"] == all_dois, (
+        "batch mode with no --limit must judge every journal-mapped summary, "
+        "not just 1 per journal"
+    )
+
+    assert len(realtime_calls) == 1
+    assert realtime_calls[0]["judges"] == ["gemini"]
+    assert realtime_calls[0]["doi_filter"] == all_dois
+
+
+# In plain English: --limit must still work as an explicit per-journal cap
+# in batch mode (only the *default*, uncapped case was buggy).
+def test_evaluate_batch_mode_limit_still_caps_per_journal(
+    _wired_paths, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import batch_utils
+    import evaluator
+
+    dois_by_journal = {
+        "jvim": ["10.9999/j1.1", "10.9999/j1.2", "10.9999/j1.3"],
+        "javma": ["10.9999/j2.1", "10.9999/j2.2"],
+    }
+    _write_fake_summaries_with_journals(
+        _wired_paths["summaries_path"], _wired_paths["processed_dir"], dois_by_journal,
+    )
+
+    seen_dois: set[str] = set()
+    monkeypatch.setattr(
+        batch_utils, "run_batch_evaluation",
+        lambda *, doi_filter, **_kw: seen_dois.update(doi_filter) or {"submitted": []},
+    )
+    monkeypatch.setattr(
+        evaluator, "run_evaluation",
+        lambda *, doi_filter, **_kw: seen_dois.update(doi_filter) or {"success": 0, "failed": 0},
+    )
+
+    ret = _run_evaluate(["evaluate", "--mode", "batch", "--force", "--limit", "1"])
+
+    assert ret == 0
+    # 1 per journal x 2 journals = 2, not all 5.
+    assert len(seen_dois) == 2
 
 
 def _write_summarize_all_txt(

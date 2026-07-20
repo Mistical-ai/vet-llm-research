@@ -69,11 +69,13 @@ Set in `.env` or override per command with `--mode {test,single,dev,batch}`.
 | `test`   | Mock only | all                 | No        | No             |
 | `single` | Real      | 1                   | No        | Yes (`yes`)    |
 | `dev`    | Real      | `PHASE3_DEV_LIMIT` (default 5) | No | Yes (`yes`)    |
-| `batch`  | Real      | all                 | Yes (50% off) | Yes (`yes`) |
+| `batch`  | Real      | all                 | Yes (50% off, per-provider — see below) | Yes (`yes`) |
 
 **Important:** `summarize-all` uses different defaults than `summarize` in `single` and `dev`. For `summarize-all`, both `single` and `dev` default to **one matched article pair** (not `PHASE3_DEV_LIMIT`), which produces **six summaries** — see below.
 
-**Also important:** for `evaluate` in its default `jsonl` input mode, the "Default paper limit" above (and any `--limit` override) is a **per-journal quota**, not a flat total — `_sample_by_journal` draws that many papers from *each* journal represented in `data/summaries.jsonl`. So `evaluate --mode single` with no `--limit` judges 1 paper × (number of journals present), not 1 paper total, and `evaluate --mode dev` judges `PHASE3_DEV_LIMIT` papers × (number of journals). This quota behavior is specific to `evaluate`'s default `jsonl` mode; `evaluate --mode test` and `summarize`'s paper limit remain flat caps.
+**Batch mode is per-provider, not all-or-nothing.** Whether a provider actually goes through the Batch API in `--mode batch` depends on its own `*_BATCH_ENABLED` flag (`.env.template` section 12): `OPENAI_BATCH_ENABLED` and `ANTHROPIC_BATCH_ENABLED` default to `true`; `GEMINI_BATCH_ENABLED` defaults to `false`. A provider with its flag off is **not skipped** — `summarize --mode batch` still summarises it, just via the same real-time call `single`/`dev` mode use, in the same command. So the default `summarize --mode batch` submits OpenAI + Anthropic as batch jobs and summarises Gemini in real time, all from one invocation; flip `GEMINI_BATCH_ENABLED=true` once you've smoke-tested it to submit Gemini as a batch job too.
+
+**Also important:** for `evaluate` in its default `jsonl` input mode, the "Default paper limit" above (and any `--limit` override) is a **per-journal quota**, not a flat total — `_sample_by_journal` draws that many papers from *each* journal represented in `data/summaries.jsonl`. So `evaluate --mode single` with no `--limit` judges 1 paper × (number of journals present), not 1 paper total, and `evaluate --mode dev` judges `PHASE3_DEV_LIMIT` papers × (number of journals). `evaluate --mode batch` with no `--limit` judges **every** journal-mapped summary in `data/summaries.jsonl` (the true "batch = full corpus" default); pass `--limit N` to cap it to N papers per journal instead. This quota behavior is specific to `evaluate`'s default `jsonl` mode; `evaluate --mode test` and `summarize`'s paper limit remain flat caps.
 
 ---
 
@@ -129,9 +131,12 @@ python llm-sum/run_phase3.py summarize --mode single
 python llm-sum/run_phase3.py summarize --mode dev
 python llm-sum/run_phase3.py summarize --mode dev --limit 3
 
-# Paid: full corpus via batch API. Readable files appear later, when
-# check_batch_status.py merges each provider's results back, in
-# data/batch_summaries_jsonl/ (+ prose/).
+# Paid: full corpus. OpenAI/Anthropic submit as batch jobs; Gemini summarises
+# in real time in the same command unless GEMINI_BATCH_ENABLED=true, in which
+# case it submits as a batch job too. Readable files appear later, when
+# check_batch_status.py merges each batch provider's results back, in
+# data/batch_summaries_jsonl/ (+ prose/) — Gemini's real-time result rides
+# along on the first batch merge for the same paper.
 python llm-sum/run_phase3.py summarize --mode batch
 
 # Resume / force
@@ -166,11 +171,11 @@ python llm-sum/run_phase3.py summarize --mode single --guide-summary llm-sum/pro
 | Flag | Purpose |
 |------|---------|
 | `--estimate` | Print projected cost via tiktoken; no API calls. Not available for `--input-source pdf`. |
-| `--limit N` | Override mode's paper limit |
-| `--resume` | Skip (doi, model) pairs already at `status=success` |
+| `--limit N` | Override mode's paper limit. In `--mode batch`, caps BOTH the batch-submitted providers and the real-time fallback leg to the first N manifest rows with cached text — a genuine smoke test (e.g. `--limit 2`), not a partial one. |
+| `--resume` | Skip (doi, model) pairs already at `status=success` — in batch mode, also skips ones already `status=pending` (submitted, awaiting merge), so re-running doesn't resubmit an in-flight job. |
 | `--no-skip-existing` | Dev mode only: reconsider papers already in the active output folder — the top level, or the `--output-subdir` folder if one is given (default: skip them so dev sampling is incremental) |
 | `--output-subdir NAME` | Dev mode only: write readable output to `data/dev_summaries_jsonl/NAME/` and track skip-existing against that subfolder alone. Judge it with `evaluate --source-dir data/dev_summaries_jsonl/NAME` |
-| `--force` | Bypass interactive `yes` confirmation |
+| `--force` | Bypass interactive `yes` confirmation. In batch mode, also bypasses the refusal to submit while an earlier unresolved (unmerged) batch job for the same provider(s)/stage still exists — use only once you've confirmed via `check_batch_status.py` that a fresh submission is actually correct. |
 | `--providers` | Comma-separated subset (default: all three) |
 | `--manifest PATH` | Manifest JSONL |
 | `--input-source` | `processed` (default), `raw_text`, or `pdf` |
@@ -280,7 +285,7 @@ python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular
 | `--input-mode` | `jsonl` (default), `dev-jsonl`, `dev`, `regular`, or `auto` — where to read summaries from. `--mode dev` defaults to `dev-jsonl` regardless of `EVAL_INPUT_MODE`. See [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate). |
 | `--source-dir PATH` | dev-jsonl mode only: seed the run from this readable-summary folder instead of `data/dev_summaries_jsonl/`. Use for an `--output-subdir` pool, `data/single_summaries_jsonl/`, or `data/batch_summaries_jsonl/`. Results still go to `data/dev_evals_jsonl/`, and the folder actually used is recorded in the run manifest. Judge-side twin of `pilot_human_review --dev-summaries-dir`. |
 | `--no-resume` | Re-evaluate pairs already in `evaluations.jsonl`; in dev-jsonl mode also re-includes papers already in `data/dev_evals_jsonl/` |
-| `--force` | Bypass confirmation |
+| `--force` | Bypass confirmation. In batch mode, also bypasses the refusal to submit while an earlier unresolved batch judge job still exists (same guard as `summarize --mode batch`). |
 
 ### `eval-report` (always free, read-only)
 
@@ -417,6 +422,15 @@ python llm-sum/run_phase3.py eval-report
 python llm-sum/run_phase3.py status
 python llm-sum/run_phase3.py clean
 ```
+
+With the default `.env` (`GEMINI_BATCH_ENABLED=false`), `summarize --mode batch` prints one line per split, e.g.:
+```
+[phase3:batch] batch-API providers: openai, anthropic
+[phase3:batch] real-time providers (batch disabled for these): gemini
+```
+Gemini finishes summarising (in real time) before the command returns — it does **not** show up as a job in `data/batch_jobs.jsonl` or in `check_batch_status.py`'s polling output, only OpenAI/Anthropic do.
+
+`evaluate --mode batch` has the exact same per-judge split (`JUDGE_MODELS`/`--judges`, same `*_BATCH_ENABLED` flags): OpenAI/Anthropic judges submit as real batch jobs, Gemini judges (by default) score in real time in the same command. Both legs honor the run's journal-stratified sample (`--limit`, or every journal-mapped summary by default — see the "Also important" note under **Modes** above), so a small `--limit` restricts the batch-submitted judges too, not just the real-time ones.
 
 ---
 

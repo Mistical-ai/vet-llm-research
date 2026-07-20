@@ -360,6 +360,10 @@ def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch
         def GenerateContentConfig(**kwargs):
             return kwargs
 
+        @staticmethod
+        def ThinkingConfig(**kwargs):
+            return kwargs
+
     fake_genai = SimpleNamespace(
         Client=_FakeGeminiClient,
         types=_FakeTypes,
@@ -379,6 +383,7 @@ def test_gemini_structured_output_validates_json(monkeypatch: pytest.MonkeyPatch
     assert result["structured_summary"]["sample_size"] == 42
     assert captured_generation_config["response_mime_type"] == "application/json"
     assert captured_generation_config["contents"] == "X Article body. Y"
+    assert captured_generation_config["thinking_config"] == {"thinking_budget": 0}
     response_schema = captured_generation_config["response_schema"]
     assert isinstance(response_schema, dict)
     assert response_schema["properties"]["headline"]["type"] == "string"
@@ -752,6 +757,192 @@ def test_pdf_input_source_rejected_outside_test_and_single() -> None:
     assert summarizer.main(["--mode", "batch", "--input-source", "pdf"]) == 1
 
 
+# ---------------------------------------------------------------------------
+# `summarize --mode batch` provider split: batch-eligible vs real-time fallback
+# ---------------------------------------------------------------------------
+
+# In plain English: with the default .env (OPENAI/ANTHROPIC batch enabled,
+# GEMINI_BATCH_ENABLED=false), a plain `summarize --mode batch` with no
+# --providers flag used to crash with a ValueError the moment the batch
+# builder reached "gemini" — there was no code path for it there, and no
+# separate real-time call for it anywhere in main(). These tests pin the fix:
+# providers now split by their supports_batch flag, batch-eligible ones go
+# through run_batch_summarisation, the rest go through run_realtime — all
+# from the same command, matching what .env.template already documented.
+def test_batch_mode_default_providers_no_longer_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import batch_utils
+
+    batch_calls: list[list[str]] = []
+    realtime_calls: list[list[str]] = []
+
+    def _fake_run_batch_summarisation(*, providers, **_kwargs):
+        batch_calls.append(list(providers))
+        return {"submitted": [], "slug_to_doi": {}}
+
+    def _fake_run_realtime(*, providers, **_kwargs):
+        realtime_calls.append(list(providers))
+        return {"success": 0, "failed": 0, "skipped": 0}
+
+    monkeypatch.setattr(summarizer, "confirm_real_batch", lambda _p, force=False, **_kw: True)
+    monkeypatch.setattr(batch_utils, "run_batch_summarisation", _fake_run_batch_summarisation)
+    monkeypatch.setattr(summarizer, "run_realtime", _fake_run_realtime)
+
+    # No --providers flag: this is exactly the documented "Full batch run"
+    # invocation (docs/phase3/run_phase3.md) that used to crash.
+    ret = summarizer.main(["--mode", "batch"])
+
+    assert ret == 0
+    assert batch_calls == [["openai", "anthropic"]]
+    assert realtime_calls == [["gemini"]]
+
+
+def test_batch_mode_submits_gemini_as_batch_when_flag_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import batch_utils
+
+    batch_calls: list[list[str]] = []
+    realtime_calls: list[list[str]] = []
+
+    # models_config reads GEMINI_BATCH_ENABLED once at import time into the
+    # module-level MODELS registry (a frozen ModelSpec), so setting the env
+    # var alone has no effect on an already-imported process — swap in a
+    # replacement spec with the flag flipped instead.
+    import dataclasses
+    import models_config
+    monkeypatch.setitem(
+        models_config.MODELS, "gemini",
+        dataclasses.replace(models_config.MODELS["gemini"], supports_batch=True),
+    )
+
+    def _fake_run_batch_summarisation(*, providers, **_kwargs):
+        batch_calls.append(sorted(providers))
+        return {"submitted": [], "slug_to_doi": {}}
+
+    def _fake_run_realtime(*, providers, **_kwargs):
+        realtime_calls.append(list(providers))
+        return {"success": 0, "failed": 0, "skipped": 0}
+
+    monkeypatch.setattr(summarizer, "confirm_real_batch", lambda _p, force=False, **_kw: True)
+    monkeypatch.setattr(batch_utils, "run_batch_summarisation", _fake_run_batch_summarisation)
+    monkeypatch.setattr(summarizer, "run_realtime", _fake_run_realtime)
+
+    ret = summarizer.main(["--mode", "batch"])
+
+    assert ret == 0
+    assert batch_calls == [["anthropic", "gemini", "openai"]]
+    assert realtime_calls == [], "gemini should not fall back to real-time when its batch flag is on"
+
+
+# In plain English: `--limit N` must cap BOTH legs of `summarize --mode
+# batch`. Capping only the batch-submitted providers while leaving the
+# real-time fallback leg (Gemini, by default) uncapped would silently run
+# that provider over the full corpus regardless of the limit requested —
+# defeating the whole point of `--limit` as a safe smoke test.
+def test_batch_mode_limit_caps_both_batch_and_realtime_legs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import batch_utils
+
+    batch_calls: list[dict] = []
+    realtime_calls: list[dict] = []
+
+    def _fake_run_batch_summarisation(*, paper_limit=None, **kwargs):
+        batch_calls.append({"paper_limit": paper_limit, **kwargs})
+        return {"submitted": [], "slug_to_doi": {}}
+
+    def _fake_run_realtime(*, paper_limit=None, **kwargs):
+        realtime_calls.append({"paper_limit": paper_limit, **kwargs})
+        return {"success": 0, "failed": 0, "skipped": 0}
+
+    monkeypatch.setattr(summarizer, "confirm_real_batch", lambda _p, force=False, **_kw: True)
+    monkeypatch.setattr(batch_utils, "run_batch_summarisation", _fake_run_batch_summarisation)
+    monkeypatch.setattr(summarizer, "run_realtime", _fake_run_realtime)
+
+    ret = summarizer.main(["--mode", "batch", "--limit", "2"])
+
+    assert ret == 0
+    assert batch_calls[0]["paper_limit"] == 2
+    assert realtime_calls[0]["paper_limit"] == 2
+
+
+def test_batch_mode_no_limit_leaves_both_legs_uncapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import batch_utils
+
+    batch_calls: list[dict] = []
+    realtime_calls: list[dict] = []
+
+    monkeypatch.setattr(summarizer, "confirm_real_batch", lambda _p, force=False, **_kw: True)
+    monkeypatch.setattr(
+        batch_utils, "run_batch_summarisation",
+        lambda *, paper_limit=None, **kwargs: batch_calls.append(paper_limit)
+        or {"submitted": [], "slug_to_doi": {}},
+    )
+    monkeypatch.setattr(
+        summarizer, "run_realtime",
+        lambda *, paper_limit=None, **kwargs: realtime_calls.append(paper_limit)
+        or {"success": 0, "failed": 0, "skipped": 0},
+    )
+
+    ret = summarizer.main(["--mode", "batch"])
+
+    assert ret == 0
+    assert batch_calls == [None]
+    assert realtime_calls == [None]
+
+
+# ---------------------------------------------------------------------------
+# confirm_real_batch's label must reflect what's actually about to happen
+# ---------------------------------------------------------------------------
+
+def test_confirm_real_batch_label_reflects_mixed_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from phase3_mode import resolve_mode
+
+    profile = resolve_mode("batch")
+    captured_prompts: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt: captured_prompts.append(prompt) or "yes"
+    )
+
+    result = summarizer.confirm_real_batch(
+        profile, force=False,
+        batch_providers=["openai", "anthropic"],
+        realtime_providers=["gemini"],
+    )
+
+    assert result is True
+    assert len(captured_prompts) == 1
+    assert "REAL batch jobs to paid APIs (openai, anthropic)" in captured_prompts[0]
+    assert "REAL real-time API calls (gemini)" in captured_prompts[0]
+
+
+def test_confirm_real_batch_label_when_all_providers_are_realtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every provider's batch flag off (all real-time) must not still claim
+    "batch jobs to paid APIs" — a cosmetic-but-real accuracy bug."""
+    from phase3_mode import resolve_mode
+
+    profile = resolve_mode("batch")
+    captured_prompts: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt: captured_prompts.append(prompt) or "yes"
+    )
+
+    summarizer.confirm_real_batch(
+        profile, force=False, batch_providers=[], realtime_providers=["gemini"],
+    )
+
+    assert "REAL real-time API calls (gemini)" in captured_prompts[0]
+    assert "batch jobs" not in captured_prompts[0]
+
+
 def test_openai_pdf_call_uploads_file_and_parses_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -897,6 +1088,10 @@ def test_gemini_pdf_call_uploads_pdf(
         def GenerateContentConfig(**kwargs):
             return kwargs
 
+        @staticmethod
+        def ThinkingConfig(**kwargs):
+            return kwargs
+
     fake_genai = SimpleNamespace(
         Client=_FakeGeminiClient,
         types=_FakeTypes,
@@ -926,6 +1121,7 @@ def test_gemini_pdf_call_uploads_pdf(
     assert "default" not in json.dumps(response_schema)
     assert captured["contents"][0].name == "uploaded-paper"
     assert "attached as a PDF" in captured["contents"][1]
+    assert captured["generation_config"]["thinking_config"] == {"thinking_budget": 0}
 
 
 def test_gemini_pdf_call_uses_parsed_schema_output(
@@ -962,6 +1158,10 @@ def test_gemini_pdf_call_uses_parsed_schema_output(
     class _FakeTypes:
         @staticmethod
         def GenerateContentConfig(**kwargs):
+            return kwargs
+
+        @staticmethod
+        def ThinkingConfig(**kwargs):
             return kwargs
 
     fake_genai = SimpleNamespace(Client=_FakeGeminiClient, types=_FakeTypes)

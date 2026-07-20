@@ -41,6 +41,19 @@ os.environ.setdefault("PHASE3_MODE", "test")
 # data/summaries_txt instead) leaks into run_phase3 wiring tests and makes
 # them fail on developer machines while passing in a clean CI environment.
 os.environ["EVAL_INPUT_MODE"] = "jsonl"
+# Pin the batch-support matrix to the documented defaults (OpenAI/Anthropic
+# batch-enabled, Gemini real-time) regardless of the developer's local .env.
+# models_config.py reads these once at import time into a frozen MODELS dict,
+# so whatever's ambient here becomes permanent for the whole test session —
+# without this, a developer who set GEMINI_BATCH_ENABLED=true locally to
+# smoke-test the feature (per docs/phase3/run_phase3.md) breaks every test
+# that assumes the documented default. Tests that want the opposite state
+# still override it explicitly with monkeypatch.setitem(models_config.MODELS,
+# "gemini", dataclasses.replace(...)) — see test_batch_mode_submits_gemini_as_
+# batch_when_flag_enabled in test_summarizer.py.
+os.environ["GEMINI_BATCH_ENABLED"] = "false"
+os.environ["OPENAI_BATCH_ENABLED"] = "true"
+os.environ["ANTHROPIC_BATCH_ENABLED"] = "true"
 
 for path in (_REPO_ROOT / "src", _REPO_ROOT / "llm-sum"):
     sp = str(path)

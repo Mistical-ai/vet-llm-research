@@ -81,9 +81,11 @@ MODELS: dict[ProviderKey, ModelSpec] = {
         model_id=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
         price_input_per_mtok=4.00,
         price_output_per_mtok=18.00,
-        # Gemini batch API not in scope for Phase 3 — same as real-time price.
-        price_input_per_mtok_batched=4.00,
-        price_output_per_mtok_batched=18.00,
+        # Google's Batch API is 50% off the real-time price (same discount
+        # structure as OpenAI/Anthropic above) — update alongside the
+        # real-time prices if Google changes Gemini pricing.
+        price_input_per_mtok_batched=2.00,
+        price_output_per_mtok_batched=9.00,
         supports_batch=os.getenv("GEMINI_BATCH_ENABLED", "false").lower() == "true",
         rate_limit_key="gemini",
     ),

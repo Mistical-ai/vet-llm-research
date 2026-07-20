@@ -16,8 +16,10 @@ This module:
     3. Provides parsers for downloaded result files (used by
        check_batch_status.py).
 
-Gemini batch is intentionally NOT here — its API doesn't follow the same
-shape, and for 250 papers the real-time call delta is negligible.
+Gemini batch support lives here too, gated behind GEMINI_BATCH_ENABLED (see
+.env.template section 12). When that flag is off (the default), callers route
+Gemini through summarizer.run_realtime() instead — see summarizer.main()'s
+provider split in the `profile.use_batch` branch.
 """
 
 from __future__ import annotations
@@ -81,9 +83,44 @@ def _assert_budget_authorised(stage: str, request_count: int) -> None:
 # Build request payloads
 # ---------------------------------------------------------------------------
 
-def build_openai_request(custom_id: str, user_message: str, model_id: str) -> dict:
-    """One row of OpenAI's batch JSONL format."""
-    from summarizer import VeterinarySummary  # noqa: E402
+def build_openai_request(custom_id: str, user_message: str, model_id: str,
+                          *, for_judge: bool = False) -> dict:
+    """One row of OpenAI's batch JSONL format.
+
+    ``for_judge=True`` builds a judge request instead of a summarisation
+    request: plain ``json_object`` mode, matching
+    ``evaluator._call_judge_openai`` exactly, rather than the strict
+    ``VeterinarySummary`` schema a judge cannot answer in.
+    """
+    if for_judge:
+        response_format = {"type": "json_object"}
+    else:
+        from summarizer import VeterinarySummary  # noqa: E402
+        # OpenAI's Structured Outputs "strict" mode requires every key in
+        # `properties` to also appear in `required` (with optional-semantics
+        # fields expressed as nullable `anyOf` unions instead of just being
+        # omitted) — plain `VeterinarySummary.model_json_schema()` follows
+        # normal JSON Schema semantics instead, so a real batch job rejected
+        # it: "'required' is required to be supplied and to be an array
+        # including every key in properties. Missing 'sample_size'."
+        # `openai.lib._pydantic` is a private module (leading underscore),
+        # but it's the exact function OpenAI's own `.parse()` helper uses
+        # internally for the real-time path (see summarizer._call_openai,
+        # which passes the Pydantic class straight to
+        # client.beta.chat.completions.parse and never hits this bug).
+        # Reusing it here keeps the batch schema byte-for-byte consistent
+        # with what real-time OpenAI calls already send successfully,
+        # instead of hand-rolling the strict-mode required/nullable
+        # transform ourselves.
+        from openai.lib._pydantic import to_strict_json_schema  # noqa: E402
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "VeterinarySummary",
+                "schema": to_strict_json_schema(VeterinarySummary),
+                "strict": True,
+            },
+        }
 
     return {
         "custom_id": custom_id,
@@ -95,43 +132,104 @@ def build_openai_request(custom_id: str, user_message: str, model_id: str) -> di
             "temperature": TEMPERATURE,
             "max_completion_tokens": MAX_OUTPUT_TOKENS,
             "seed": SEED,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "VeterinarySummary",
-                    "schema": VeterinarySummary.model_json_schema(),
-                    "strict": True,
-                },
-            },
+            "response_format": response_format,
         },
     }
 
 
-def build_anthropic_request(custom_id: str, user_message: str, model_id: str) -> dict:
+def build_gemini_batch_request(custom_id: str, user_message: str, model_id: str,
+                               *, for_judge: bool = False) -> dict:
+    """
+    One row of Gemini's Batch Mode JSONL format (ai.google.dev/gemini-api/docs/batch-mode).
+
+    Google's file-based batch input is ``{"key": ..., "request": {...}}``, where
+    ``request`` is a raw REST ``GenerateContentRequest``: ``contents`` plus a
+    ``generation_config`` field (snake_case) holding ``temperature``,
+    ``max_output_tokens``, ``response_mime_type``, and (for summaries)
+    ``response_schema``. This is confirmed against Google's live batch-mode
+    docs, whose file-based JSONL example is exactly
+    ``{"key": ..., "request": {"contents": [...], "generation_config": {...}}}``
+    — note this is *not* the same key the real-time
+    ``client.models.generate_content(config=...)`` call in
+    ``summarizer._call_gemini`` uses (that ``config`` name is an SDK wrapper
+    for inline calls only; the batch endpoint rejects it outright with
+    ``no such field: 'config'``). Our ``custom_id`` convention becomes Gemini's
+    ``key`` field, which the provider echoes back on every result line so
+    ``parse_gemini_result_line`` can rejoin it the same way the OpenAI/
+    Anthropic parsers rejoin ``custom_id``.
+
+    Unlike OpenAI/Anthropic, Gemini's batch job takes its model as a
+    ``client.batches.create(model=...)`` argument rather than a per-row field
+    — ``model_id`` is accepted here only to keep this function's signature
+    matching ``build_openai_request``/``build_anthropic_request`` for the
+    shared call sites in ``run_batch_summarisation``/``run_batch_evaluation``.
+
+    ``for_judge=True`` drops ``response_schema`` — matching
+    ``evaluator._call_judge_gemini``, which asks for JSON mime type but never
+    forces the ``VeterinarySummary`` schema a judge cannot answer in.
+    """
+    from summarizer import gemini_response_schema, _gemini_output_token_limit  # noqa: E402
+
+    config: dict[str, Any] = {
+        "temperature": TEMPERATURE,
+        "max_output_tokens": _gemini_output_token_limit(),
+        "response_mime_type": "application/json",
+        # Disable "thinking": invisible reasoning tokens were eating the output
+        # budget on real batch jobs, causing MAX_TOKENS truncation on otherwise-
+        # fine papers (large token cap configured, tiny visible output, cut off
+        # anyway). Neither summarization nor judging needs open-ended reasoning
+        # here — both are fixed-shape extraction/scoring tasks — so this is
+        # applied unconditionally for judge and non-judge requests alike.
+        "thinking_config": {"thinking_budget": 0},
+    }
+    if not for_judge:
+        config["response_schema"] = gemini_response_schema()
+
+    return {
+        "key": custom_id,
+        "request": {
+            "contents": [{"parts": [{"text": user_message}]}],
+            "generation_config": config,
+        },
+    }
+
+
+def build_anthropic_request(custom_id: str, user_message: str, model_id: str,
+                            *, for_judge: bool = False) -> dict:
     """
     One row of Anthropic's Message Batches format. The shape differs from
     OpenAI's: the request body is nested under "params" and the URL is
     implicit.
+
+    ``for_judge=True`` omits ``tools``/``tool_choice`` entirely — plain text
+    completion, matching ``evaluator._call_judge_anthropic``. This isn't just
+    a schema-accuracy detail: a forced ``tool_choice`` makes Anthropic return
+    a ``tool_use`` content block instead of a ``text`` block, and
+    ``parse_anthropic_result_line(..., expect_summary_schema=False)`` (what
+    the judge merge path uses) only reads ``text``-type blocks — so a forced
+    tool call would come back as an empty string, not just a wrong shape.
     """
-    from summarizer import VeterinarySummary  # noqa: E402
+    params: dict[str, Any] = {
+        "model": model_id,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": TEMPERATURE,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    if not for_judge:
+        from summarizer import VeterinarySummary  # noqa: E402
+        params["tools"] = [{
+            "name": "VeterinarySummary",
+            "description": (
+                "Return the veterinary article summary using exactly the "
+                "VeterinarySummary schema."
+            ),
+            "input_schema": VeterinarySummary.model_json_schema(),
+        }]
+        params["tool_choice"] = {"type": "tool", "name": "VeterinarySummary"}
 
     return {
         "custom_id": custom_id,
-        "params": {
-            "model": model_id,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-            "temperature": TEMPERATURE,
-            "messages": [{"role": "user", "content": user_message}],
-            "tools": [{
-                "name": "VeterinarySummary",
-                "description": (
-                    "Return the veterinary article summary using exactly the "
-                    "VeterinarySummary schema."
-                ),
-                "input_schema": VeterinarySummary.model_json_schema(),
-            }],
-            "tool_choice": {"type": "tool", "name": "VeterinarySummary"},
-        },
+        "params": params,
     }
 
 
@@ -199,6 +297,65 @@ def submit_anthropic_batch(jsonl_path: Path) -> dict:
     }
 
 
+def submit_gemini_batch(jsonl_path: Path, *, model_id: str) -> dict:
+    """
+    Upload the JSONL request file and create a Gemini Batch Mode job.
+
+    250 papers' worth of structured-summary requests comfortably exceed the
+    20MB inline-request limit, so this always uses the file-upload path
+    (never the alternate inline-list ``src=[...]`` form Google's SDK also
+    supports).
+
+    The per-request JSONL shape (built by ``build_gemini_batch_request``) and
+    this upload config are confirmed against Google's live batch-mode docs
+    (ai.google.dev/gemini-api/docs/batch-mode) and a real submission: the
+    file-upload example there uses
+    ``types.UploadFileConfig(display_name=..., mime_type='jsonl')``, and the
+    per-line request nests generation settings under ``generation_config``
+    (see ``build_gemini_batch_request``'s docstring). If a future SDK/API
+    change breaks this shape again, this call is where it would surface first
+    (an upload or batch-create error, or a job that never produces usable
+    results) — see the re-raise below and, before trusting the full corpus to
+    this path, run the ``--limit 2`` smoke test described in
+    ``.env.template`` section 12.
+    """
+    from google import genai  # type: ignore[import-not-found]
+    from google.genai import types  # type: ignore[import-not-found]
+
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    try:
+        uploaded = client.files.upload(
+            file=str(jsonl_path),
+            config=types.UploadFileConfig(display_name="vet-llm-sum-batch", mime_type="jsonl"),
+        )
+        job = client.batches.create(
+            model=model_id,
+            src=uploaded.name,
+            config={"display_name": f"vet-llm-sum-{_timestamp_slug()}"},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Gemini batch submission failed even though the request/upload "
+            "shape matches Google's documented file-based batch-mode format "
+            "(see this function's docstring) — before retrying, check "
+            "ai.google.dev/gemini-api/docs/batch-mode for API changes, and "
+            "consider smoke-testing with `summarize --mode batch --limit 2` "
+            "first. "
+            f"Original error: {exc}"
+        ) from exc
+
+    state = getattr(job, "state", None)
+    status = state.name if state is not None and hasattr(state, "name") else str(state)
+    return {
+        "job_id": job.name,
+        "provider": "gemini",
+        "input_file_id": uploaded.name,
+        "input_file_path": str(jsonl_path),
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Batch job ledger (crash recovery)
 # ---------------------------------------------------------------------------
@@ -211,6 +368,65 @@ def record_batch_job(entry: dict) -> None:
     BATCH_JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(BATCH_JOBS_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def safe_job_id_for_path(job_id: str) -> str:
+    """Sanitise a job_id for use in a local result-file name.
+
+    Some providers' job ids are resource paths rather than bare ids (e.g.
+    Gemini's ``batches/abc123``) — replacing ``/`` here keeps the result-file
+    name from turning into an unwanted subdirectory under ``BATCH_DIR``. The
+    real ``job_id`` (with the slash) is still what's sent back to the
+    provider's API for status/download calls; this is a path-safety
+    transform only. Shared by ``check_batch_status.poll_all`` and the
+    duplicate-submission guard below so both agree on the same filename.
+    """
+    return job_id.replace("/", "_")
+
+
+def _unresolved_batch_jobs(stage: str, providers: list[str]) -> list[dict]:
+    """Return ``batch_jobs.jsonl`` entries for this stage/providers with no
+    local ``.merged`` marker yet — i.e. jobs that may still be in flight.
+    """
+    unresolved = []
+    for job in load_batch_jobs():
+        if job.get("stage") != stage or job.get("provider") not in providers:
+            continue
+        safe_id = safe_job_id_for_path(str(job.get("job_id", "")))
+        result_path = BATCH_DIR / f"{job['provider']}_{safe_id}_results.jsonl"
+        if not result_path.with_suffix(".merged").exists():
+            unresolved.append(job)
+    return unresolved
+
+
+def _refuse_duplicate_submission(stage: str, providers: list[str], *, force: bool) -> None:
+    """Refuse to submit a new batch job when an earlier one for the same
+    stage/provider(s) hasn't been resolved yet.
+
+    A ``resume``-based skip only prevents resubmitting individual papers
+    already marked ``success``; it does nothing for a job that's merely
+    ``pending`` (or, for evaluation, has no local state at all — see
+    ``run_batch_evaluation``'s docstring) from an earlier submission that
+    hasn't been polled/merged yet. Re-running the submission step in that
+    window would create a second, duplicate paid batch job for the same
+    papers. ``--force`` bypasses this for the rare legitimate case (a truly
+    abandoned/expired job that genuinely needs resubmitting).
+    """
+    if force:
+        return
+    unresolved = _unresolved_batch_jobs(stage, providers)
+    if not unresolved:
+        return
+    lines = "\n".join(
+        f"  - {job.get('provider')} job_id={job.get('job_id')}" for job in unresolved
+    )
+    raise SystemExit(
+        f"[phase3:batch] REFUSING to submit a new {stage} batch job: "
+        f"{len(unresolved)} unresolved job(s) already exist for this stage/provider(s):\n"
+        f"{lines}\n"
+        "Run `python llm-sum/check_batch_status.py` first to check/merge them, "
+        "or pass --force if you're certain a fresh submission is correct."
+    )
 
 
 def load_batch_jobs() -> list[dict]:
@@ -312,11 +528,26 @@ def run_batch_summarisation(
     resume: bool = False,
     providers: list[str] | None = None,
     guide_summary_path: Path | None = None,
+    force: bool = False,
+    paper_limit: int | None = None,
 ) -> dict:
     """
-    Build & submit summarisation batch jobs for OpenAI and Anthropic. Gemini
-    is not batched; the summarizer's real-time loop handles it separately
-    (run summarizer.run_realtime() with providers=["gemini"]).
+    Build & submit summarisation batch jobs for whichever providers are
+    passed in — openai, anthropic, and gemini are all handled here. Callers
+    that want Gemini to skip batch and go real-time instead (the default,
+    when GEMINI_BATCH_ENABLED=false) should simply omit it from ``providers``;
+    see summarizer.main()'s provider split in the ``profile.use_batch`` branch.
+
+    ``force`` bypasses ``_refuse_duplicate_submission``'s check for an
+    unresolved prior batch job covering the same providers — see that
+    function's docstring.
+
+    ``paper_limit``, when set, stops after the first N manifest rows with
+    cached text — same "first N encountered" semantics
+    ``summarizer.run_realtime`` uses for dev/single mode (no journal
+    stratification here; that's `evaluate`'s job, not `summarize`'s). Exists
+    so `summarize --mode batch --limit N` is a real, safe way to smoke-test a
+    provider's batch path before committing the full corpus to it.
     """
     # Imported here (not at module top) so unit tests that mock the batch
     # path don't require the summarizer's full DEVELOPMENT_MODE guard to
@@ -333,6 +564,7 @@ def run_batch_summarisation(
     )
 
     providers = providers or ["openai", "anthropic"]
+    _refuse_duplicate_submission("summarize", providers, force=force)
     prompt_templates, guide_summary, resolved_guide_path, _prompt_paths = (
         load_provider_prompt_templates_with_optional_guide(
             providers, guide_summary_path or GUIDE_SUMMARY_FILE
@@ -354,8 +586,11 @@ def run_batch_summarisation(
 
     rows_per_provider: dict[str, list[dict]] = {p: [] for p in providers}
     slug_to_doi: dict[str, str] = {}
+    processed_papers = 0
 
     for record in _iter_manifest(manifest_path):
+        if paper_limit is not None and processed_papers >= paper_limit:
+            break
         doi = str(record.get("doi", "")).strip()
         if not doi:
             continue
@@ -368,13 +603,18 @@ def run_batch_summarisation(
                       f"No cached text for {custom_id} (descriptive + legacy lookups failed)")
             continue
 
+        processed_papers += 1
         slug_to_doi[custom_id] = doi
         entry = summaries_by_doi.get(summary_key) or _new_summary_entry(record, input_source)
         summaries_by_doi[summary_key] = entry
 
         for provider in providers:
             slot = entry["models"].setdefault(provider, {})
-            if resume and slot.get("status") == "success":
+            # "pending" means an earlier submission already covers this slot
+            # and is awaiting merge — resubmitting it would double-pay for
+            # the same paper. See _refuse_duplicate_submission for the
+            # job-level counterpart of this same protection.
+            if resume and slot.get("status") in ("success", "pending"):
                 continue
             spec = get_model_spec(provider)
             # Build inside the provider loop so PROMPT_MODE=provider_specific
@@ -390,10 +630,14 @@ def run_batch_summarisation(
                     build_anthropic_request(custom_id=custom_id, user_message=user_message,
                                             model_id=spec.model_id)
                 )
+            elif provider == "gemini":
+                rows_per_provider["gemini"].append(
+                    build_gemini_batch_request(custom_id=custom_id, user_message=user_message,
+                                               model_id=spec.model_id)
+                )
             else:
                 raise ValueError(
-                    f"Batch path does not handle provider '{provider}'. "
-                    "Use real-time mode for it (e.g. gemini)."
+                    f"Unknown provider '{provider}'. Valid: openai, anthropic, gemini."
                 )
 
     # Persist updated entries (with any new `pending` slots) before submission
@@ -412,8 +656,10 @@ def run_batch_summarisation(
 
         if provider == "openai":
             job_meta = submit_openai_batch(jsonl_path)
-        else:
+        elif provider == "anthropic":
             job_meta = submit_anthropic_batch(jsonl_path)
+        else:
+            job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(provider).model_id)
 
         job_meta.update({"stage": "summarize", "request_count": len(rows)})
         record_batch_job(job_meta)
@@ -448,21 +694,39 @@ def run_batch_evaluation(
     *,
     judges: list[str] | None = None,
     resume: bool = False,
+    force: bool = False,
+    doi_filter: set[str] | None = None,
 ) -> dict:
     """
-    Build & submit evaluation batch jobs for OpenAI and Anthropic judges.
+    Build & submit evaluation batch jobs for whichever judges are passed in —
+    openai, anthropic, and gemini are all handled here.
 
     The judge prompt is constructed blind — the summariser identity is placed
     only in the custom_id (format: "{slug}__{summariser}") and never enters
     the message body. This preserves the blind protocol for batch jobs the
     same way run_evaluation() does for real-time jobs.
 
-    Gemini is not supported here (no batch API); call evaluator.run_evaluation()
-    with judges=["gemini"] for the real-time path.
+    Callers that want a judge to skip batch and go real-time instead should
+    omit it from ``judges`` and call evaluator.run_evaluation() with that
+    judge separately — same split as the summarisation stage.
+
+    ``doi_filter``, when provided, restricts the run to exactly those DOIs —
+    mirrors ``run_evaluation(doi_filter=...)``'s existing behavior, so the
+    journal-stratified sampling `cmd_evaluate` already computes applies to
+    batch-submitted judges too, not just real-time ones.
+
+    Unlike ``run_batch_summarisation``, ``resume`` here has no local
+    "pending" state to skip — it only checks ``already_evaluated()`` against
+    already-*merged* rows in ``evaluations.jsonl``, which an in-flight batch
+    job hasn't produced yet. ``force`` (bypassing
+    ``_refuse_duplicate_submission`` below) is this function's only
+    protection against submitting a second batch job while an earlier one
+    for the same judge(s) is still unresolved.
     """
     from evaluator import build_judge_prompt, load_judge_prompt, already_evaluated  # noqa: E402
 
     judges = judges or ["openai"]
+    _refuse_duplicate_submission("evaluate", judges, force=force)
     prompt_template = load_judge_prompt()
 
     rows_per_judge: dict[str, list[dict]] = {j: [] for j in judges}
@@ -470,6 +734,8 @@ def run_batch_evaluation(
     for entry in _iter_summaries():
         doi = str(entry.get("doi", "")).strip()
         if not doi:
+            continue
+        if doi_filter is not None and doi not in doi_filter:
             continue
         input_source = str(entry.get("input_source") or "processed")
         slug = entry.get("custom_id") or doi_to_slug(doi)
@@ -498,18 +764,26 @@ def run_batch_evaluation(
                     rows_per_judge["openai"].append(
                         build_openai_request(custom_id=custom_id,
                                              user_message=user_message,
-                                             model_id=spec.model_id)
+                                             model_id=spec.model_id,
+                                             for_judge=True)
                     )
                 elif judge == "anthropic":
                     rows_per_judge["anthropic"].append(
                         build_anthropic_request(custom_id=custom_id,
                                                 user_message=user_message,
-                                                model_id=spec.model_id)
+                                                model_id=spec.model_id,
+                                                for_judge=True)
+                    )
+                elif judge == "gemini":
+                    rows_per_judge["gemini"].append(
+                        build_gemini_batch_request(custom_id=custom_id,
+                                                   user_message=user_message,
+                                                   model_id=spec.model_id,
+                                                   for_judge=True)
                     )
                 else:
                     raise ValueError(
-                        f"Batch evaluation does not handle judge '{judge}'. "
-                        "Use evaluator.run_evaluation() for real-time judges."
+                        f"Unknown judge '{judge}'. Valid: openai, anthropic, gemini."
                     )
 
     submitted: list[dict] = []
@@ -524,8 +798,10 @@ def run_batch_evaluation(
 
         if judge == "openai":
             job_meta = submit_openai_batch(jsonl_path)
-        else:
+        elif judge == "anthropic":
             job_meta = submit_anthropic_batch(jsonl_path)
+        else:
+            job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(judge).model_id)
 
         job_meta.update({"stage": "evaluate", "judge": judge, "request_count": len(rows)})
         record_batch_job(job_meta)
@@ -631,6 +907,84 @@ def parse_anthropic_result_line(line: str, *, expect_summary_schema: bool = True
         )
     except Exception as exc:
         return _failed_batch_result(custom_id, f"Invalid structured summary: {exc}")
+
+
+def _extract_gemini_text(response: dict) -> str:
+    """Return the concatenated text of a downloaded Gemini batch response.
+
+    Downloaded batch result JSON uses the REST/proto field casing
+    (``camelCase``), unlike the Python SDK's snake_case attribute access used
+    in ``summarizer._call_gemini`` — so this reads ``candidates`` /
+    ``content`` / ``parts`` directly from the raw dict rather than reusing
+    that real-time helper.
+    """
+    candidates = response.get("candidates") or []
+    if not candidates:
+        return ""
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts") or []
+    return "".join(str(p.get("text", "")) for p in parts)
+
+
+def _gemini_batch_finish_reason(response: dict) -> str:
+    """Extract Gemini's finish reason from a downloaded batch response dict.
+
+    Mirrors ``summarizer._gemini_finish_reason``, but reads the raw
+    downloaded-JSON dict (camelCase ``finishReason``) rather than an SDK
+    response object, consistent with how ``_extract_gemini_text`` above
+    already works for this module.
+    """
+    candidates = response.get("candidates") or []
+    if not candidates:
+        return "unknown"
+    return str(candidates[0].get("finishReason") or "unknown")
+
+
+def parse_gemini_result_line(line: str, *, expect_summary_schema: bool = True) -> dict:
+    """Parse one line of a downloaded Gemini Batch Mode result file.
+
+    Each line echoes the ``key`` we submitted as ``custom_id`` in
+    ``build_gemini_batch_request``, plus either a ``response``
+    (GenerateContentResponse-shaped dict) or a ``status``/``error`` object
+    for a failed row.
+    """
+    raw = json.loads(line)
+    custom_id = raw.get("key", "")
+    error = raw.get("error") or (raw.get("status") or {}).get("message")
+    response = raw.get("response") or {}
+
+    if error or not response:
+        return _failed_batch_result(custom_id, str(error or "no response in batch result row"))
+
+    usage = response.get("usageMetadata") or response.get("usage_metadata") or {}
+    model_version = str(response.get("modelVersion") or response.get("model_version") or "")
+    text = _extract_gemini_text(response)
+
+    if not expect_summary_schema:
+        return {
+            "custom_id": custom_id,
+            "status": "success",
+            "summary": text,
+            "input_tokens": int(usage.get("promptTokenCount") or usage.get("prompt_token_count") or 0),
+            "output_tokens": int(usage.get("candidatesTokenCount") or usage.get("candidates_token_count") or 0),
+            "model_version": model_version,
+            "system_fingerprint": None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    try:
+        payload = json.loads(text)
+        return _successful_batch_summary(
+            custom_id=custom_id,
+            payload=payload,
+            input_tokens=int(usage.get("promptTokenCount") or usage.get("prompt_token_count") or 0),
+            output_tokens=int(usage.get("candidatesTokenCount") or usage.get("candidates_token_count") or 0),
+            model_version=model_version,
+        )
+    except Exception as exc:
+        reason = _gemini_batch_finish_reason(response)
+        return _failed_batch_result(
+            custom_id, f"Invalid structured summary (finish_reason={reason}): {exc}"
+        )
 
 
 # Eval custom_id like "10_1111_jvim_16872__openai". Match suffix to find summariser.

@@ -107,6 +107,11 @@ DEV_EVALS_JSONL_DIR = DATA_DIR / "dev_evals_jsonl"
 DEV_DETAIL_EVAL_REPORTS_DIR = DATA_DIR / "dev_detailEval_reports"
 SUMMARIZE_ALL_OUTPUT_SETS = ("auto", "regular", "dev-tests")
 EVAL_INPUT_MODES = ("jsonl", "auto", "dev", "regular", "dev-jsonl")
+# "No per-journal cap" sentinel for cmd_evaluate's journal-stratified sampling
+# below. A large int (not float("inf")) so run-manifest slice_config stays
+# cleanly JSON-serializable; _sample_by_journal's min(per_journal, len(entries))
+# already does the right thing with a large sentinel.
+_NO_PER_JOURNAL_CAP = 10 ** 9
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -825,10 +830,16 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                   "Run 'extract' and 'summarize' first, or check manifest.jsonl.")
             return 1
 
+        # batch's own profile.paper_limit is None ("full corpus"), but
+        # `None or 1` previously collapsed that to 1 paper/journal — silently
+        # sampling 5 papers total instead of the whole corpus. dev's
+        # profile.paper_limit (PHASE3_DEV_LIMIT) is never None, so it's
+        # unaffected; only batch needs the explicit "no cap" sentinel.
         per_journal = (
             args.limit
             if args.limit is not None
-            else (1 if profile.name == "single" else (profile.paper_limit or 1))
+            else (1 if profile.name == "single"
+                  else (profile.paper_limit if profile.name == "dev" else _NO_PER_JOURNAL_CAP))
         )
         seed = int(os.getenv("EVAL_SAMPLE_SEED", "42"))
         doi_filter, journal_map = _sample_by_journal(by_journal, per_journal, seed=seed)
@@ -919,6 +930,37 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             if not confirm_real_judge(profile, force=args.force):
                 status = "failed"
                 result = 1
+            elif profile.use_batch:
+                # Split judges by their *_BATCH_ENABLED flag, mirroring the
+                # summarize-side split in summarizer.py main() exactly:
+                # batch-eligible judges (OpenAI/Anthropic by default) submit
+                # as real batch jobs at 50% off; the rest (Gemini by default)
+                # still run real-time, in the same command. doi_filter (the
+                # journal-stratified sample computed above) applies to both.
+                batch_judges = [j for j in judges if get_model_spec(j).supports_batch]
+                realtime_judges = [j for j in judges if not get_model_spec(j).supports_batch]
+                counts = {"success": 0, "failed": 0, "skipped": 0}
+                if batch_judges:
+                    from batch_utils import run_batch_evaluation
+                    print(f"[phase3:batch] batch-API judges: {', '.join(batch_judges)}")
+                    run_batch_evaluation(
+                        judges=batch_judges,
+                        resume=not args.no_resume,
+                        doi_filter=doi_filter,
+                        force=args.force,
+                    )
+                if realtime_judges:
+                    print(f"[phase3:batch] real-time judges (batch disabled for these): "
+                          f"{', '.join(realtime_judges)}")
+                    counts = run_evaluation(
+                        judges=realtime_judges,
+                        resume=not args.no_resume,
+                        paper_limit=None,
+                        doi_filter=doi_filter,
+                    )
+                status = "completed" if counts.get("failed", 0) == 0 else "failed"
+                _print_reveal_table(doi_filter, journal_map)
+                result = 0 if status == "completed" else 1
             else:
                 counts = run_evaluation(
                     judges=judges,
