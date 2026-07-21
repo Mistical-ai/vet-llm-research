@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,17 @@ from utils import log_error  # noqa: E402
 # PDF metadata DOI extraction
 # ---------------------------------------------------------------------------
 
+# Some publishers (observed on Wiley PDFs) stamp the journal's own
+# container/ISSN identifier into the PDF metadata's DOI-shaped field instead
+# of the article's real DOI, e.g. "10.1111/(issn)1740-8261". That string is
+# a well-formed DOI as far as _RAW_DOI's regex is concerned, so without this
+# guard it gets treated as "the" metadata DOI — and because bulk CrossRef
+# crawls often also pick up a stray container-level row under that same
+# fake DOI, the PDF reads as "already matched" even when the actual article
+# it belongs to has never been registered in the manifest.
+_ISSN_PLACEHOLDER_DOI = re.compile(r"^10\.\d{4,9}/\(issn\)", flags=re.IGNORECASE)
+
+
 def _get_pdf_metadata_doi(pdf_path: Path) -> str | None:
     """
     Return the first DOI in PDF document metadata only.
@@ -69,6 +81,10 @@ def _get_pdf_metadata_doi(pdf_path: Path) -> str | None:
     Why not page text here? Enrichment *adds* manifest rows; a reference-list DOI
     would register the wrong paper. Ingest only *matches* existing rows and can
     use page text more safely (see ingest_manual_pdfs.py).
+
+    A metadata hit that looks like a journal-level ISSN placeholder (see
+    ``_ISSN_PLACEHOLDER_DOI``) is treated as no hit at all, so callers fall
+    through to the filename/page-frequency sources instead of trusting it.
     """
     import pdfplumber  # lazy import mirrors the rest of the pipeline
 
@@ -76,7 +92,10 @@ def _get_pdf_metadata_doi(pdf_path: Path) -> str | None:
         with pdfplumber.open(pdf_path) as pdf:
             blob = _metadata_blob(pdf.metadata)
             hits = _collect_dois_from_plaintext(blob)
-            return hits[0] if hits else None
+            for hit in hits:
+                if not _ISSN_PLACEHOLDER_DOI.match(hit):
+                    return hit
+            return None
     except Exception as exc:  # noqa: BLE001
         log_error(str(pdf_path.name), "enrich_manifest", f"pdfplumber metadata read failed: {exc}")
         return None

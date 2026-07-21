@@ -216,6 +216,30 @@ def test_parse_openai_result_line_error() -> None:
     assert parsed["summary"] is None
 
 
+def test_parse_openai_result_line_truncated_reports_finish_reason() -> None:
+    """A length-truncated (empty-content) row should name the real cause,
+    not a bare JSON-decode error — see batch_utils.parse_openai_result_line."""
+    line = json.dumps({
+        "custom_id": "slug_c",
+        "response": {
+            "status_code": 200,
+            "body": {
+                "model": "gpt-5.4-preview",
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 9000,
+                    "completion_tokens_details": {"reasoning_tokens": 8500},
+                },
+            },
+        },
+    })
+    parsed = parse_openai_result_line(line)
+    assert parsed["status"] == "failed"
+    assert "finish_reason=length" in parsed["error"]
+    assert "reasoning_tokens=8500" in parsed["error"]
+
+
 # ---------------------------------------------------------------------------
 # parse_anthropic_result_line
 # ---------------------------------------------------------------------------
@@ -678,6 +702,129 @@ def test_run_batch_summarisation_resume_skips_pending_slot(
     assert submitted == [], "resubmitted a paper whose slot was already 'pending'"
 
 
+# In plain English: a paper that has NEVER been submitted before (no row in
+# summaries.jsonl yet) must still be submitted under --resume. _new_summary_entry
+# pre-populates every provider's slot via _empty_model_slot() the moment a new
+# entry is created, before the resume check runs on the very same call — if
+# that placeholder's default status were "pending" (as it used to be), --resume
+# would treat a brand-new, never-submitted paper as already in flight and skip
+# it forever, on its first-ever appearance, with no request ever built for any
+# provider. This is the regression test for that exact bug.
+def test_run_batch_summarisation_resume_still_submits_brand_new_paper(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    doi = "10.9999/brand.new.paper"
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+    monkeypatch.setattr(batch_utils, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+    monkeypatch.setattr(batch_utils, "BATCH_DIR", tmp_path / "batch")
+    monkeypatch.setattr(batch_utils, "BATCH_JOBS_PATH", tmp_path / "batch_jobs.jsonl")
+    monkeypatch.setattr(
+        batch_utils, "_iter_manifest",
+        lambda _p: iter([{"doi": doi, "journal": "JVIM", "title": "T"}]))
+    monkeypatch.setattr(batch_utils, "_read_cached_text", lambda _r: "Body.")
+    submitted: list[str] = []
+    monkeypatch.setattr(
+        batch_utils, "submit_anthropic_batch",
+        lambda p: submitted.append(str(p)) or {"job_id": "j", "provider": "anthropic"})
+    monkeypatch.setattr(batch_utils, "record_batch_job", lambda _m: None)
+
+    batch_utils.run_batch_summarisation(
+        manifest_path=tmp_path / "manifest.jsonl",
+        resume=True, providers=["anthropic"])
+
+    assert submitted != [], "a brand-new paper's first-ever appearance was skipped under --resume"
+
+    rows = [json.loads(l) for l in
+            (tmp_path / "summaries.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert rows[0]["models"]["anthropic"]["status"] == "pending", (
+        "status must be set to 'pending' once a request is actually queued for submission"
+    )
+
+
+# In plain English: one paper with a DOI that produces an invalid custom_id
+# (observed in this corpus: a bogus journal-ISSN placeholder DOI containing
+# parentheses, e.g. "10.1111/(issn)1740-8261") must not crash the whole run
+# or block every OTHER paper — a batch API validates the entire submitted
+# batch atomically, so one bad custom_id previously took down the whole job.
+def test_run_batch_summarisation_skips_paper_with_invalid_custom_id(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    good_doi = "10.9999/good.paper"
+    bad_doi = "10.1111/(issn)1740-8261"
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+    monkeypatch.setattr(batch_utils, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+    monkeypatch.setattr(batch_utils, "BATCH_DIR", tmp_path / "batch")
+    monkeypatch.setattr(batch_utils, "BATCH_JOBS_PATH", tmp_path / "batch_jobs.jsonl")
+    monkeypatch.setattr(
+        batch_utils, "_iter_manifest",
+        lambda _p: iter([
+            {"doi": bad_doi, "journal": "VRU", "title": "Bad"},
+            {"doi": good_doi, "journal": "JVIM", "title": "Good"},
+        ]))
+    monkeypatch.setattr(batch_utils, "_read_cached_text", lambda _r: "Body.")
+    submitted: list[str] = []
+    monkeypatch.setattr(
+        batch_utils, "submit_anthropic_batch",
+        lambda p: submitted.append(str(p)) or {"job_id": "j", "provider": "anthropic"})
+    monkeypatch.setattr(batch_utils, "record_batch_job", lambda _m: None)
+
+    result = batch_utils.run_batch_summarisation(
+        manifest_path=tmp_path / "manifest.jsonl",
+        resume=True, providers=["anthropic"])
+
+    assert len(submitted) == 1, "the good paper must still be submitted"
+    job = result["submitted"][0]
+    assert job["provider"] == "anthropic"
+
+    rows = {json.loads(l)["doi"]: json.loads(l) for l in
+            (tmp_path / "summaries.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()}
+    assert good_doi in rows, "the valid paper's row must exist"
+    assert bad_doi not in rows, "the invalid-custom_id paper must never get a summaries.jsonl row"
+
+
+# In plain English: if one provider's actual submission call raises (network
+# error, provider-side rejection, etc.), that provider's slots must be
+# reverted to not-yet-attempted (not left stranded at "pending" with no job
+# behind them) AND the failure must not prevent a different, working
+# provider in the same run from still submitting successfully.
+def test_run_batch_summarisation_isolates_provider_submission_failure(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    doi = "10.9999/two.provider.paper"
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+    monkeypatch.setattr(batch_utils, "SUMMARIES_PATH", tmp_path / "summaries.jsonl")
+    monkeypatch.setattr(batch_utils, "BATCH_DIR", tmp_path / "batch")
+    monkeypatch.setattr(batch_utils, "BATCH_JOBS_PATH", tmp_path / "batch_jobs.jsonl")
+    monkeypatch.setattr(
+        batch_utils, "_iter_manifest",
+        lambda _p: iter([{"doi": doi, "journal": "JVIM", "title": "T"}]))
+    monkeypatch.setattr(batch_utils, "_read_cached_text", lambda _r: "Body.")
+
+    def _boom(_p):
+        raise RuntimeError("simulated 400 from the provider")
+
+    gemini_submitted: list[str] = []
+    monkeypatch.setattr(batch_utils, "submit_anthropic_batch", _boom)
+    monkeypatch.setattr(
+        batch_utils, "submit_gemini_batch",
+        lambda p, model_id: gemini_submitted.append(model_id)
+        or {"job_id": "j-gemini", "provider": "gemini"})
+    monkeypatch.setattr(batch_utils, "record_batch_job", lambda _m: None)
+
+    result = batch_utils.run_batch_summarisation(
+        manifest_path=tmp_path / "manifest.jsonl",
+        resume=True, providers=["anthropic", "gemini"])
+
+    assert result["failed_providers"] == ["anthropic"]
+    assert gemini_submitted, "gemini must still be attempted after anthropic's failure"
+    assert {j["provider"] for j in result["submitted"]} == {"gemini"}
+
+    rows = [json.loads(l) for l in
+            (tmp_path / "summaries.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert rows[0]["models"]["anthropic"]["status"] is None, (
+        "a provider whose submission raised must have its slot reverted, "
+        "not left stranded at 'pending' with no real job behind it"
+    )
+    assert rows[0]["models"]["gemini"]["status"] == "pending"
+
+
 # ---------------------------------------------------------------------------
 # --limit on batch mode (Q2): a real, safe way to smoke-test before the full
 # corpus. Caps at the first N manifest rows with cached text.
@@ -705,6 +852,55 @@ def test_run_batch_summarisation_respects_paper_limit(
         resume=False, providers=["openai"], paper_limit=2)
 
     assert len(result["slug_to_doi"]) == 2, "paper_limit=2 should have capped the run at 2 papers"
+
+
+# In plain English: --limit exists so a large remaining backlog can be
+# chunked into submissions that fit a provider's enqueued-token cap (a real
+# incident: a 207-paper OpenAI batch was rejected outright with
+# token_limit_exceeded). That only works if the limit counts papers actually
+# queued for submission — if it counted manifest rows scanned instead,
+# --resume skipping a mostly-already-done provider would let --limit stop
+# after N already-successful rows and submit nothing.
+def test_run_batch_summarisation_paper_limit_counts_queued_not_scanned(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    summaries_path = tmp_path / "summaries.jsonl"
+    already_done = [
+        {"doi": f"10.9999/done.{i}", "custom_id": doi_to_slug(f"10.9999/done.{i}"),
+         "input_source": "processed", "models": {"openai": {"status": "success"}}}
+        for i in range(3)
+    ]
+    summaries_path.write_text(
+        "\n".join(json.dumps(e) for e in already_done) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(summarizer, "SUMMARIES_PATH", summaries_path)
+    monkeypatch.setattr(batch_utils, "SUMMARIES_PATH", summaries_path)
+    monkeypatch.setattr(batch_utils, "BATCH_DIR", tmp_path / "batch")
+    monkeypatch.setattr(batch_utils, "BATCH_JOBS_PATH", tmp_path / "batch_jobs.jsonl")
+
+    records = [{"doi": f"10.9999/done.{i}", "journal": "JVIM", "title": "T"} for i in range(3)]
+    records += [{"doi": f"10.9999/new.{i}", "journal": "JVIM", "title": "T"} for i in range(2)]
+    monkeypatch.setattr(batch_utils, "_iter_manifest", lambda _p: iter(records))
+    monkeypatch.setattr(batch_utils, "_read_cached_text", lambda _r: "Body.")
+    monkeypatch.setattr(batch_utils, "record_batch_job", lambda _m: None)
+
+    submitted_paths: list[Path] = []
+    monkeypatch.setattr(
+        batch_utils, "submit_openai_batch",
+        lambda p: submitted_paths.append(p) or {"job_id": "j", "provider": "openai"})
+
+    result = batch_utils.run_batch_summarisation(
+        manifest_path=tmp_path / "manifest.jsonl",
+        resume=True, providers=["openai"], paper_limit=2)
+
+    assert result["submitted"][0]["request_count"] == 2, (
+        "paper_limit=2 should have queued 2 NEW papers, not stopped after "
+        "scanning the first 2 (already-done) manifest rows and queuing 0"
+    )
+    queued_ids = {
+        json.loads(line)["custom_id"]
+        for line in submitted_paths[0].read_text(encoding="utf-8").splitlines()
+    }
+    assert queued_ids == {doi_to_slug("10.9999/new.0"), doi_to_slug("10.9999/new.1")}
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +1032,9 @@ def _poll_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
     monkeypatch.setattr(check_batch_status, "download_openai_results", _fake_download)
     monkeypatch.setattr(check_batch_status, "merge_evaluation_results", _fake_merge)
     monkeypatch.setattr(check_batch_status, "merge_summarisation_results", _fake_merge)
+    # A dead (failed/expired/cancelled) job now logs via log_error — must not
+    # hit the real (relative-path) data/error_log.jsonl during tests.
+    monkeypatch.setattr(check_batch_status, "log_error", lambda *_a, **_kw: None)
     calls["result_path"] = batch_dir / "openai_job-1_results.jsonl"
     return calls
 
@@ -849,6 +1048,74 @@ def test_poll_all_does_not_download_unsuccessful_jobs(
     check_batch_status.poll_all()
     assert calls["downloaded"] == 0, f"downloaded results for a '{status}' job"
     assert calls["merged"] == 0
+
+
+# In plain English: a batch that dies before processing any row (OpenAI
+# status="failed" with request_counts all 0 — a real incident, not a made-up
+# case) used to be reported and then left permanently "unresolved" with no
+# `.merged` marker, which (a) blocked every future submission for that
+# provider/stage via _refuse_duplicate_submission short of --force, and (b)
+# left every paper it covered stuck at status="pending" forever, since
+# --resume unconditionally skips "pending". Resolving it must both mark it
+# done AND un-stick its papers so a future --resume can actually retry them.
+def test_poll_all_resolves_dead_job_and_resets_pending_slots(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    batch_dir = tmp_path / "batch"
+    batch_dir.mkdir()
+
+    # The job's own input file — what a real submission writes before the
+    # provider accepts it — is how _reset_pending_slots_for_job finds which
+    # papers this dead job covered.
+    input_path = batch_dir / "openai_sum_20260101T000000Z.jsonl"
+    input_path.write_text(
+        json.dumps({"custom_id": "slug_stuck", "method": "POST", "url": "/v1/chat/completions",
+                    "body": {}}) + "\n",
+        encoding="utf-8",
+    )
+
+    summaries_path = tmp_path / "summaries.jsonl"
+    summaries_path.write_text(json.dumps({
+        "doi": "10.1/stuck", "custom_id": "slug_stuck",
+        "models": {"openai": {"status": "pending", "summary": None}},
+    }) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(check_batch_status, "BATCH_DIR", batch_dir)
+    monkeypatch.setattr(check_batch_status, "SUMMARIES_PATH", summaries_path)
+    monkeypatch.setattr(
+        check_batch_status, "load_batch_jobs",
+        lambda: [{"provider": "openai", "job_id": "job-dead", "stage": "summarize",
+                  "input_file_path": str(input_path)}],
+    )
+    monkeypatch.setattr(
+        check_batch_status, "fetch_openai_status",
+        lambda _job_id: {
+            "status": "failed", "output_file_id": None, "error_file_id": None,
+            "request_counts": {"completed": 0, "failed": 0, "total": 0},
+            "errors": [{"code": "invalid_request", "message": "file failed validation"}],
+        },
+    )
+    logged: list[str] = []
+    monkeypatch.setattr(
+        check_batch_status, "log_error",
+        lambda _doi, _stage, message: logged.append(message),
+    )
+
+    check_batch_status.poll_all()
+
+    result_path = batch_dir / "openai_job-dead_results.jsonl"
+    assert result_path.with_suffix(".merged").exists(), "dead job was never marked resolved"
+    assert any("invalid_request" in m for m in logged)
+
+    reset_entry = json.loads(summaries_path.read_text(encoding="utf-8").splitlines()[0])
+    assert reset_entry["models"]["openai"]["status"] is None, (
+        "paper stayed stuck at status='pending' with no job left to ever resolve it"
+    )
+
+    # Polling again must not re-log or re-reset — the .merged marker makes
+    # resolution idempotent, same as a normal merge.
+    logged.clear()
+    check_batch_status.poll_all()
+    assert logged == []
 
 
 # In plain English: if a previous run downloaded the results but crashed before

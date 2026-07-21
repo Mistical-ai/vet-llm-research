@@ -48,6 +48,27 @@ BATCH_SUMMARIES_JSONL_DIR = DATA_DIR / "batch_summaries_jsonl"
 # Provider status polling
 # ---------------------------------------------------------------------------
 
+def _openai_batch_level_errors(job: object) -> list[dict]:
+    """Extract the Batch object's own ``errors`` field (distinct from
+    ``error_file_id``): the reason a batch never processed a single request
+    (e.g. rejected at file validation) lives here, not in a per-row file.
+    """
+    errors_obj = getattr(job, "errors", None)
+    if errors_obj is None:
+        return []
+    data = getattr(errors_obj, "data", None)
+    if data is None and isinstance(errors_obj, dict):
+        data = errors_obj.get("data")
+    out = []
+    for item in data or []:
+        if isinstance(item, dict):
+            out.append({"code": item.get("code"), "message": item.get("message")})
+        else:
+            out.append({"code": getattr(item, "code", None),
+                        "message": getattr(item, "message", None)})
+    return out
+
+
 def fetch_openai_status(job_id: str) -> dict:
     import openai  # type: ignore[import-not-found]
     client = openai.OpenAI()
@@ -57,6 +78,7 @@ def fetch_openai_status(job_id: str) -> dict:
         "output_file_id": job.output_file_id,
         "error_file_id": job.error_file_id,
         "request_counts": dict(job.request_counts) if job.request_counts else {},
+        "errors": _openai_batch_level_errors(job),
     }
 
 
@@ -190,6 +212,60 @@ def _write_summaries(summaries: dict[str, dict]) -> None:
         for entry in summaries.values():
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     tmp.replace(SUMMARIES_PATH)
+
+
+def _reset_pending_slots_for_job(provider: str, input_file_path: str | None) -> int:
+    """Reset this job's papers' provider slot from "pending" back to the
+    not-yet-attempted state (mirrors summarizer._empty_model_slot / the
+    same-purpose reset in scripts/reset_phantom_pending_slots.py).
+
+    Called only once a job is confirmed dead (no usable results possible —
+    a batch-level failure, or a "completed" job where every row errored).
+    A --resume run skips any slot at status=="pending" unconditionally, so
+    without this reset those papers could never be retried even after the
+    dead job is marked resolved. Only touches slots still exactly "pending"
+    — a paper that already succeeded via a different job/provider run is
+    left untouched.
+    """
+    if not input_file_path or not Path(input_file_path).exists():
+        return 0
+    custom_ids: set[str] = set()
+    with open(input_file_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            cid = row.get("custom_id") or row.get("key")  # Gemini rows key on "key"
+            if cid:
+                custom_ids.add(cid)
+    if not custom_ids:
+        return 0
+
+    summaries = _load_summaries()
+    custom_id_to_key = _build_custom_id_to_key(summaries)
+    reset_count = 0
+    for cid in custom_ids:
+        key = custom_id_to_key.get(cid)
+        if not key:
+            continue
+        models = summaries[key].setdefault("models", {})
+        if (models.get(provider) or {}).get("status") == "pending":
+            models[provider] = {
+                "status": None,
+                "summary": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "model_version": None,
+                "timestamp": None,
+            }
+            reset_count += 1
+    if reset_count:
+        _write_summaries(summaries)
+    return reset_count
 
 
 def _batch_result_cost(provider: str, parsed: dict) -> float:
@@ -460,8 +536,41 @@ def poll_all(*, download_when_complete: bool = True) -> None:
         s = status["status"]
         if s not in SUCCESS_STATUSES:
             if s in TERMINAL_STATUSES:
-                print(f"[phase3:batch] {provider} {job_id} finished as '{s}' — "
-                      f"no results to download.")
+                # A batch that fails/expires/is cancelled BEFORE processing any
+                # row (e.g. OpenAI status="failed", request_counts all 0 — a
+                # file-validation rejection, not a per-row error) used to just
+                # print and `continue` here with no `.merged` marker ever
+                # written. batch_utils._unresolved_batch_jobs treats "no
+                # marker" as still-in-flight, so a dead job like this blocked
+                # every future submission for this stage/provider forever
+                # (short of --force) and its papers' "pending" slots could
+                # never be retried either. Resolve it the same way the
+                # completed-but-every-row-failed branch below does.
+                safe_job_id = safe_job_id_for_path(job_id)
+                result_path = BATCH_DIR / f"{provider}_{safe_job_id}_results.jsonl"
+                merged_marker = result_path.with_suffix(".merged")
+                if not merged_marker.exists():
+                    errors = status.get("errors") or []
+                    detail = ("; ".join(
+                        f"{e.get('code', '?')}: {e.get('message', '?')}" for e in errors
+                    ) or "no per-row/batch error detail returned by the provider")
+                    print(f"[phase3:batch] {provider} {job_id} finished as '{s}' — "
+                          f"no results to download. {detail}")
+                    reset_count = 0
+                    if job.get("stage", "summarize") == "summarize":
+                        reset_count = _reset_pending_slots_for_job(
+                            provider, job.get("input_file_path"))
+                    log_error("N/A", "batch_merge",
+                              f"{provider} {job.get('stage', 'summarize')} job {job_id} "
+                              f"ended as '{s}' with no usable results ({detail}); "
+                              f"reset {reset_count} paper(s) to retryable state.")
+                    merged_marker.write_text(
+                        f"resolved stage={job.get('stage', 'summarize')} provider={provider} "
+                        f"job_id={job_id} status=dead reason={s} reset_slots={reset_count}\n",
+                        encoding="utf-8",
+                    )
+                    print(f"[phase3:batch] {provider} {job_id}: marked resolved, "
+                          f"reset {reset_count} paper(s) for a future --resume.")
             continue
 
         # Download and merge are tracked separately on purpose. Previously a
@@ -518,13 +627,17 @@ def poll_all(*, download_when_complete: bool = True) -> None:
                 log_error(custom_id, "batch_merge", message)
                 count += 1
             stage = job.get("stage", "summarize")
+            reset_count = 0
+            if stage == "summarize":
+                reset_count = _reset_pending_slots_for_job(provider, job.get("input_file_path"))
             merged_marker.write_text(
                 f"resolved stage={stage} provider={provider} job_id={job_id} "
-                f"status=all_failed\n",
+                f"status=all_failed reset_slots={reset_count}\n",
                 encoding="utf-8",
             )
             print(f"[phase3:batch] {provider} {job_id}: all {count} requests failed — "
-                  f"see data/error_log.jsonl for details")
+                  f"see data/error_log.jsonl for details "
+                  f"(reset {reset_count} paper(s) for a future --resume)")
             continue
 
         if not result_path.exists():

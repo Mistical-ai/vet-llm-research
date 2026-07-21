@@ -23,6 +23,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Windows PowerShell's console defaults to cp1252, which can't encode the
+# checkmarks/warning glyphs this module prints — force UTF-8 so the audit
+# report doesn't crash mid-print on that platform.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_RAW_DIR          = REPO_ROOT / "data" / "raw"

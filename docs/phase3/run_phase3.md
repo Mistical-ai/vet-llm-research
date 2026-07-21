@@ -73,6 +73,10 @@ Set in `.env` or override per command with `--mode {test,single,dev,batch}`.
 
 **Important:** `summarize-all` uses different defaults than `summarize` in `single` and `dev`. For `summarize-all`, both `single` and `dev` default to **one matched article pair** (not `PHASE3_DEV_LIMIT`), which produces **six summaries** — see below.
 
+**Full batch-mode guide, every batch command, and the troubleshooting
+playbook for real batch failures (schema errors, token-limit rejections,
+duplicate submissions, stuck-pending papers):** [batch_mode.md](batch_mode.md).
+
 **Batch mode is per-provider, not all-or-nothing.** Whether a provider actually goes through the Batch API in `--mode batch` depends on its own `*_BATCH_ENABLED` flag (`.env.template` section 12): `OPENAI_BATCH_ENABLED` and `ANTHROPIC_BATCH_ENABLED` default to `true`; `GEMINI_BATCH_ENABLED` defaults to `false`. A provider with its flag off is **not skipped** — `summarize --mode batch` still summarises it, just via the same real-time call `single`/`dev` mode use, in the same command. So the default `summarize --mode batch` submits OpenAI + Anthropic as batch jobs and summarises Gemini in real time, all from one invocation; flip `GEMINI_BATCH_ENABLED=true` once you've smoke-tested it to submit Gemini as a batch job too.
 
 **Also important:** for `evaluate` in its default `jsonl` input mode, the "Default paper limit" above (and any `--limit` override) is a **per-journal quota**, not a flat total — `_sample_by_journal` draws that many papers from *each* journal represented in `data/summaries.jsonl`. So `evaluate --mode single` with no `--limit` judges 1 paper × (number of journals present), not 1 paper total, and `evaluate --mode dev` judges `PHASE3_DEV_LIMIT` papers × (number of journals). `evaluate --mode batch` with no `--limit` judges **every** journal-mapped summary in `data/summaries.jsonl` (the true "batch = full corpus" default); pass `--limit N` to cap it to N papers per journal instead. This quota behavior is specific to `evaluate`'s default `jsonl` mode; `evaluate --mode test` and `summarize`'s paper limit remain flat caps.
@@ -171,11 +175,11 @@ python llm-sum/run_phase3.py summarize --mode single --guide-summary llm-sum/pro
 | Flag | Purpose |
 |------|---------|
 | `--estimate` | Print projected cost via tiktoken; no API calls. Not available for `--input-source pdf`. |
-| `--limit N` | Override mode's paper limit. In `--mode batch`, caps BOTH the batch-submitted providers and the real-time fallback leg to the first N manifest rows with cached text — a genuine smoke test (e.g. `--limit 2`), not a partial one. |
+| `--limit N` | Override mode's paper limit. In `--mode batch`, caps BOTH the batch-submitted providers and the real-time fallback leg to N papers that actually get **queued for submission** — not the first N manifest rows scanned. With `--resume`, this is what lets you chunk a large remaining backlog (e.g. `--limit 60`) to stay under a provider's enqueued-token cap instead of submitting the whole corpus at once — see [batch_mode.md](batch_mode.md#problem-2-batch-rejected-outright-with-token_limit_exceeded). |
 | `--resume` | Skip (doi, model) pairs already at `status=success` — in batch mode, also skips ones already `status=pending` (submitted, awaiting merge), so re-running doesn't resubmit an in-flight job. |
 | `--no-skip-existing` | Dev mode only: reconsider papers already in the active output folder — the top level, or the `--output-subdir` folder if one is given (default: skip them so dev sampling is incremental) |
 | `--output-subdir NAME` | Dev mode only: write readable output to `data/dev_summaries_jsonl/NAME/` and track skip-existing against that subfolder alone. Judge it with `evaluate --source-dir data/dev_summaries_jsonl/NAME` |
-| `--force` | Bypass interactive `yes` confirmation. In batch mode, also bypasses the refusal to submit while an earlier unresolved (unmerged) batch job for the same provider(s)/stage still exists — use only once you've confirmed via `check_batch_status.py` that a fresh submission is actually correct. |
+| `--force` | Bypass interactive `yes` confirmation. In batch mode, also bypasses the refusal to submit while an earlier unresolved (unmerged) batch job for the same provider(s)/stage still exists — use only once you've confirmed via `check_batch_status.py` that a fresh submission is actually correct; passing this too early is what causes a duplicate paid job — see [batch_mode.md](batch_mode.md#problem-3-force-created-a-duplicate-batch-job). |
 | `--providers` | Comma-separated subset (default: all three) |
 | `--manifest PATH` | Manifest JSONL |
 | `--input-source` | `processed` (default), `raw_text`, or `pdf` |

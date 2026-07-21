@@ -9,6 +9,7 @@ sys.path.insert(0, str(SRC_DIR))
 from file_paths import (  # noqa: E402
     SECONDARY_PREFIX,
     descriptive_pdf_filename,
+    doi_suffix_glob_candidates,
     legacy_doi_filename,
     pdf_path_candidates,
     preferred_pdf_path,
@@ -90,3 +91,67 @@ def test_pdf_path_candidates_offers_both_bare_and_prefixed_names(tmp_path: Path)
     # Bare names first, so the common case matches on the first candidate.
     assert not candidates[0].startswith(SECONDARY_PREFIX)
     assert len(candidates) == len(set(candidates)), "duplicate candidates"
+
+
+# --- DOI-suffix glob fallback --------------------------------------------
+#
+# descriptive_pdf_filename() recomputes a paper's expected filename from the
+# manifest record's *current* journal + title every call. If title-length
+# truncation constants change, or a manifest title is edited, after a paper
+# was already downloaded, the recomputed name stops matching the file that's
+# actually on disk even though nothing about the paper changed. These tests
+# cover the DOI-suffix glob fallback that recovers such files without a
+# rename — see doi_suffix_glob_candidates()'s docstring for the real-world
+# case (43 papers in this corpus) that motivated it.
+
+def test_exact_match_wins_before_glob_fallback_runs(tmp_path: Path, monkeypatch) -> None:
+    """The glob fallback must never even execute when a primary candidate exists."""
+    primary = tmp_path / descriptive_pdf_filename(_RECORD)
+    primary.write_bytes(b"%PDF-1.4")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("doi_suffix_glob_candidates should not run when an exact match exists")
+
+    monkeypatch.setattr("file_paths.doi_suffix_glob_candidates", _boom)
+
+    assert resolve_existing_pdf_path(tmp_path, _RECORD) == primary
+
+
+def test_glob_fallback_recovers_title_truncated_bare_file(tmp_path: Path) -> None:
+    doi_suffix = "10_1111_jvim_70254"
+    drifted = tmp_path / f"jvim__a_much_shorter_title_than_today__{doi_suffix}.pdf"
+    drifted.write_bytes(b"%PDF-1.4")
+
+    # Today's record recomputes a DIFFERENT (longer/current) title, so the
+    # exact-match candidates all miss — only the DOI suffix still lines up.
+    assert resolve_existing_pdf_path(tmp_path, _RECORD) == drifted
+
+
+def test_glob_fallback_recovers_title_truncated_secondary_prefixed_file(tmp_path: Path) -> None:
+    doi_suffix = "10_1111_jvim_70254"
+    drifted = tmp_path / f"{SECONDARY_PREFIX}jvim__old_title__{doi_suffix}.pdf"
+    drifted.write_bytes(b"%PDF-1.4")
+
+    assert resolve_existing_pdf_path(tmp_path, _RECORD) == drifted
+
+
+def test_glob_fallback_collision_is_deterministic_not_arbitrary(tmp_path: Path, capsys) -> None:
+    doi_suffix = "10_1111_jvim_70254"
+    first = tmp_path / f"aaa__old_title__{doi_suffix}.pdf"
+    second = tmp_path / f"zzz__other_title__{doi_suffix}.pdf"
+    first.write_bytes(b"%PDF-1.4")
+    second.write_bytes(b"%PDF-1.4")
+
+    matches = doi_suffix_glob_candidates(tmp_path, _RECORD["doi"], ".pdf")
+
+    assert matches == sorted(matches)
+    assert matches[0] == first
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_glob_fallback_returns_none_when_doi_suffix_absent(tmp_path: Path) -> None:
+    """A DOI-suffix that was itself truncated away can't be recovered by glob."""
+    (tmp_path / "jvim__title_with_no_doi_suffix_at_all.pdf").write_bytes(b"%PDF-1.4")
+
+    assert resolve_existing_pdf_path(tmp_path, _RECORD) is None
+    assert doi_suffix_glob_candidates(tmp_path, _RECORD["doi"], ".pdf") == []

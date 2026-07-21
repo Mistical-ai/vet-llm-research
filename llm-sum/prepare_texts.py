@@ -49,6 +49,7 @@ from extract import (  # noqa: E402
     REMOVE_REFERENCES,
 )
 from file_paths import (  # noqa: E402
+    doi_suffix_glob_candidates,
     doi_to_slug,
     descriptive_stem,
     pdf_path_candidates,
@@ -130,9 +131,16 @@ def find_processed_jsonl(record_or_doi) -> Path | None:
     """
     Locate the cache file for a paper on disk, trying both naming schemes.
 
-    Order: descriptive name (new) → legacy ``{slug}.jsonl``. Returns None
-    if neither exists. This is the lookup that summariser/evaluator use,
-    so a partially-migrated ``data/processed/`` directory still works.
+    Order: descriptive name (new) → legacy ``{slug}.jsonl`` → DOI-suffix glob
+    fallback. Returns None if none exist. This is the lookup that
+    summariser/evaluator use, so a partially-migrated ``data/processed/``
+    directory still works.
+
+    The glob fallback recovers a cache file whose descriptive name no longer
+    matches the *current* manifest title (e.g. title truncation constants
+    changed, or the manifest title was edited after extraction) even though
+    the cached text itself is still there under the paper's stable DOI
+    suffix — see ``file_paths.doi_suffix_glob_candidates``.
     """
     preferred = processed_jsonl_path(record_or_doi)
     if preferred.exists():
@@ -144,6 +152,9 @@ def find_processed_jsonl(record_or_doi) -> Path | None:
             legacy = PROCESSED_DIR / f"{doi_to_slug(doi)}.jsonl"
             if legacy.exists() and legacy != preferred:
                 return legacy
+            fallback_matches = doi_suffix_glob_candidates(PROCESSED_DIR, doi, ".jsonl")
+            if fallback_matches:
+                return fallback_matches[0]
     return None
 
 
@@ -171,6 +182,9 @@ def find_cached_jsonl(record_or_doi, input_source: str = "processed") -> Path | 
             legacy = RAW_TEXT_DIR / f"{doi_to_slug(doi)}.jsonl"
             if legacy.exists() and legacy != preferred:
                 return legacy
+            fallback_matches = doi_suffix_glob_candidates(RAW_TEXT_DIR, doi, ".jsonl")
+            if fallback_matches:
+                return fallback_matches[0]
     return None
 
 

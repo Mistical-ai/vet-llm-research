@@ -1335,10 +1335,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(resolve_mode(args.mode).banner())
     raw_text = list(RAW_TEXT_DIR.glob("*.jsonl")) if RAW_TEXT_DIR.exists() else []
     processed = list(PROCESSED_DIR.glob("*.jsonl")) if PROCESSED_DIR.exists() else []
-    print(f"[phase3:status] data/raw_text/*.jsonl  : {len(raw_text)} files")
-    print(f"[phase3:status] data/processed/*.jsonl : {len(processed)} files")
+    # Print the actual resolved directory (PROCESSED_DIR_NAME may point at
+    # something other than "processed", e.g. "processedv2") instead of a
+    # hardcoded label that would silently lie about which folder was counted.
+    print(f"[phase3:status] {RAW_TEXT_DIR}/*.jsonl  : {len(raw_text)} files")
+    print(f"[phase3:status] {PROCESSED_DIR}/*.jsonl : {len(processed)} files")
 
-    per_model = {p: {"success": 0, "failed": 0, "pending": 0} for p in all_providers()}
+    per_model = {p: {"success": 0, "failed": 0, "pending": 0, "not_started": 0} for p in all_providers()}
     paper_total = 0
     if SUMMARIES_PATH.exists():
         with open(SUMMARIES_PATH, encoding="utf-8") as f:
@@ -1353,13 +1356,20 @@ def cmd_status(args: argparse.Namespace) -> int:
                 paper_total += 1
                 for prov, slot in (entry.get("models") or {}).items():
                     if prov not in per_model:
-                        per_model[prov] = {"success": 0, "failed": 0, "pending": 0}
-                    status = slot.get("status") or "pending"
+                        per_model[prov] = {"success": 0, "failed": 0, "pending": 0, "not_started": 0}
+                    # None means a placeholder slot that was never queued for
+                    # submission (e.g. a provider not requested in whatever
+                    # run created this entry) — distinct from "pending", which
+                    # means a request WAS built and submitted and is awaiting
+                    # merge. Collapsing the two used to make an unsubmitted
+                    # paper indistinguishable from one genuinely in flight.
+                    status = slot.get("status") or "not_started"
                     per_model[prov][status] = per_model[prov].get(status, 0) + 1
     print(f"[phase3:status] data/summaries.jsonl  : {paper_total} papers")
     for prov, c in per_model.items():
         print(f"    {prov:>10}: success={c.get('success',0)} "
-              f"failed={c.get('failed',0)} pending={c.get('pending',0)}")
+              f"failed={c.get('failed',0)} pending={c.get('pending',0)} "
+              f"not_started={c.get('not_started',0)}")
 
     eval_total = 0
     dry_run_total = 0

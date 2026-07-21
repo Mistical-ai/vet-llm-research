@@ -152,17 +152,72 @@ def pdf_path_candidates(
     return unique
 
 
+def doi_suffix_glob_candidates(
+    root_dir: Path,
+    doi: str,
+    extension: str,
+) -> list[Path]:
+    """
+    Fallback lookup: find files ending in this DOI's filename suffix.
+
+    ``descriptive_pdf_filename``/``descriptive_stem`` recompute a file's name
+    from the manifest record's *current* journal + title every time they're
+    called. If ``TITLE_MAX_LENGTH``/``PDF_FILENAME_MAX_LENGTH`` change, or a
+    manifest title gets edited, after a paper was downloaded, the recomputed
+    name silently stops matching the file that's actually on disk even
+    though nothing about the paper itself changed. The DOI suffix segment is
+    derived only from the DOI, so it stays stable across any title/journal
+    drift — globbing for it recovers the file without needing a rename.
+
+    Matches both the bare name (``...__{doi_suffix}{extension}``) and the
+    ``2_`` secondary-research-prefixed variant, since a reclassified review
+    PDF is just as exposed to this drift as a primary one.
+    """
+    if not doi or not root_dir.exists():
+        return []
+    doi_suffix = sanitize_filename_part(doi, max_length=DOI_SUFFIX_MAX_LENGTH)
+    if not doi_suffix:
+        return []
+
+    patterns = [f"*__{doi_suffix}{extension}", f"{SECONDARY_PREFIX}*__{doi_suffix}{extension}"]
+    matches: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for path in sorted(root_dir.glob(pattern)):
+            if path not in seen:
+                seen.add(path)
+                matches.append(path)
+
+    if len(matches) > 1:
+        # A 48-char truncated suffix could theoretically collide across two
+        # different DOIs. Never guess silently — surface it and fall back to
+        # a deterministic choice rather than picking whichever glob() happened
+        # to return first.
+        print(
+            f"[file_paths] WARNING: {len(matches)} files matched DOI suffix "
+            f"'{doi_suffix}' in {root_dir}: {[p.name for p in matches]}. "
+            f"Using {matches[0].name}."
+        )
+    return matches
+
+
 def resolve_existing_pdf_path(
     raw_dir: Path,
     record_or_doi: Mapping[str, object] | str,
 ) -> Path | None:
     """
     Return the first existing PDF path for a manifest record or DOI.
+
+    Falls back to a DOI-suffix glob (see ``doi_suffix_glob_candidates``) only
+    when none of the exact recomputed candidates exist on disk.
     """
     for candidate in pdf_path_candidates(raw_dir, record_or_doi):
         if candidate.exists():
             return candidate
-    return None
+
+    doi = _record_value(record_or_doi, "doi").strip()
+    fallback_matches = doi_suffix_glob_candidates(raw_dir, doi, ".pdf")
+    return fallback_matches[0] if fallback_matches else None
 
 
 def preferred_pdf_path(

@@ -41,6 +41,14 @@ BATCH_JOBS_PATH = DATA_DIR / "batch_jobs.jsonl"
 SUMMARIES_PATH = DATA_DIR / "summaries.jsonl"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 
+# Strictest common denominator across providers' custom_id/key constraints
+# (observed: Anthropic rejects the ENTIRE batch if any one custom_id fails
+# its pattern check). doi_to_slug() only escapes '.', '/', ':' — a DOI with
+# any other character (e.g. the literal parentheses in a bogus journal-ISSN
+# placeholder DOI) produces a custom_id that fails this, so it's checked
+# before a request is ever built — see run_batch_summarisation.
+_VALID_CUSTOM_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 SEED = int(os.getenv("SEED", "42"))
 # Keep batch and real-time runs on one output cap. A lower batch-only default
@@ -542,12 +550,16 @@ def run_batch_summarisation(
     unresolved prior batch job covering the same providers — see that
     function's docstring.
 
-    ``paper_limit``, when set, stops after the first N manifest rows with
-    cached text — same "first N encountered" semantics
-    ``summarizer.run_realtime`` uses for dev/single mode (no journal
-    stratification here; that's `evaluate`'s job, not `summarize`'s). Exists
-    so `summarize --mode batch --limit N` is a real, safe way to smoke-test a
-    provider's batch path before committing the full corpus to it.
+    ``paper_limit``, when set, stops after N papers that actually get queued
+    for at least one requested provider — NOT the first N manifest rows
+    scanned. Those differ once ``resume`` is skipping most of the corpus for
+    a provider that's mostly done already (e.g. resuming just OpenAI after
+    Anthropic/Gemini finished): counting scanned rows would let ``--limit``
+    silently stop after N already-resolved papers and submit nothing, which
+    defeats the reason ``--limit`` exists here — chunking a large remaining
+    backlog into submissions that fit a provider's enqueued-token cap (see
+    the ``token_limit_exceeded`` batch error) without resubmitting anything
+    already merged.
     """
     # Imported here (not at module top) so unit tests that mock the batch
     # path don't require the summarizer's full DEVELOPMENT_MODE guard to
@@ -585,6 +597,11 @@ def run_batch_summarisation(
     summaries_by_doi: dict[str, dict] = dict(existing)
 
     rows_per_provider: dict[str, list[dict]] = {p: [] for p in providers}
+    # Parallel to rows_per_provider: the actual slot dict each row came from,
+    # so a failed submission (see the submit loop below) can revert exactly
+    # those slots back to not-yet-attempted instead of leaving them stranded
+    # at "pending" with no job behind them.
+    slots_per_provider: dict[str, list[dict]] = {p: [] for p in providers}
     slug_to_doi: dict[str, str] = {}
     processed_papers = 0
 
@@ -596,6 +613,20 @@ def run_batch_summarisation(
             continue
         input_source = "processed"
         custom_id = _custom_id_for_source(doi, input_source)
+        if not _VALID_CUSTOM_ID.match(custom_id):
+            # doi_to_slug only escapes '.', '/', ':' — a DOI with any other
+            # disallowed character (seen in this corpus: bogus journal-ISSN
+            # placeholder "DOIs" like "10.1111/(issn)1740-8261" on mistagged,
+            # non-article PDFs) produces a custom_id every batch API rejects.
+            # Skip just this one paper rather than letting one bad row abort
+            # the whole submission — a provider validates the ENTIRE batch
+            # atomically, so one invalid custom_id previously blocked every
+            # other paper in the same request, for every provider still left
+            # in the loop below.
+            log_error(doi, "summarize",
+                      f"custom_id {custom_id!r} does not match the batch API's allowed "
+                      "pattern ([a-zA-Z0-9_-], 1-64 chars) — skipping this paper.")
+            continue
         summary_key = _summary_key(doi, input_source)
         article_text = _read_cached_text(record)
         if article_text is None:
@@ -603,17 +634,24 @@ def run_batch_summarisation(
                       f"No cached text for {custom_id} (descriptive + legacy lookups failed)")
             continue
 
-        processed_papers += 1
         slug_to_doi[custom_id] = doi
         entry = summaries_by_doi.get(summary_key) or _new_summary_entry(record, input_source)
         summaries_by_doi[summary_key] = entry
 
+        queued_this_paper = False
         for provider in providers:
             slot = entry["models"].setdefault(provider, {})
             # "pending" means an earlier submission already covers this slot
             # and is awaiting merge — resubmitting it would double-pay for
             # the same paper. See _refuse_duplicate_submission for the
             # job-level counterpart of this same protection.
+            #
+            # This only works because _empty_model_slot() defaults "status"
+            # to None, not "pending" — a brand-new paper's slot must NOT look
+            # already-submitted before a request has ever been built for it,
+            # or --resume would skip it forever on its very first appearance.
+            # "pending" is set explicitly below, only once a request is
+            # actually queued into rows_per_provider for submission this run.
             if resume and slot.get("status") in ("success", "pending"):
                 continue
             spec = get_model_spec(provider)
@@ -639,12 +677,19 @@ def run_batch_summarisation(
                 raise ValueError(
                     f"Unknown provider '{provider}'. Valid: openai, anthropic, gemini."
                 )
+            slot["status"] = "pending"
+            slots_per_provider[provider].append(slot)
+            queued_this_paper = True
+
+        if queued_this_paper:
+            processed_papers += 1
 
     # Persist updated entries (with any new `pending` slots) before submission
     # so a crash between build and submit still leaves a valid summaries file.
     _write_all_summaries(SUMMARIES_PATH, summaries_by_doi)
 
     submitted: list[dict] = []
+    failed_providers: list[str] = []
     timestamp = _timestamp_slug()
     for provider, rows in rows_per_provider.items():
         if not rows:
@@ -654,12 +699,30 @@ def run_batch_summarisation(
         jsonl_path = BATCH_DIR / f"{provider}_sum_{timestamp}.jsonl"
         write_batch_jsonl(rows, jsonl_path)
 
-        if provider == "openai":
-            job_meta = submit_openai_batch(jsonl_path)
-        elif provider == "anthropic":
-            job_meta = submit_anthropic_batch(jsonl_path)
-        else:
-            job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(provider).model_id)
+        # Isolated per provider: one provider's submission failing (network,
+        # a provider-side validation error, etc.) must not prevent the other
+        # requested providers from still getting submitted this run.
+        try:
+            if provider == "openai":
+                job_meta = submit_openai_batch(jsonl_path)
+            elif provider == "anthropic":
+                job_meta = submit_anthropic_batch(jsonl_path)
+            else:
+                job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(provider).model_id)
+        except Exception as exc:  # noqa: BLE001
+            # The submission never succeeded, so these slots must NOT be left
+            # at "pending" — that would strand them exactly like the bug this
+            # revert exists to avoid (a slot marked pending with no job behind
+            # it, permanently skipped by a future --resume).
+            for slot in slots_per_provider[provider]:
+                slot["status"] = None
+            _write_all_summaries(SUMMARIES_PATH, summaries_by_doi)
+            log_error("N/A", "summarize", f"{provider} batch submission failed: {exc}")
+            print(f"[phase3:batch] {provider} submission FAILED ({exc}); "
+                  f"{len(rows)} slot(s) reverted to not-yet-attempted. "
+                  "Continuing with remaining providers.")
+            failed_providers.append(provider)
+            continue
 
         job_meta.update({"stage": "summarize", "request_count": len(rows)})
         record_batch_job(job_meta)
@@ -667,7 +730,7 @@ def run_batch_summarisation(
         print(f"[phase3:batch] submitted {provider} job_id={job_meta['job_id']} "
               f"({len(rows)} requests)")
 
-    return {"submitted": submitted, "slug_to_doi": slug_to_doi}
+    return {"submitted": submitted, "slug_to_doi": slug_to_doi, "failed_providers": failed_providers}
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +896,19 @@ def parse_openai_result_line(line: str, *, expect_summary_schema: bool = True) -
     choices = body.get("choices") or [{}]
     usage = body.get("usage") or {}
     content = choices[0].get("message", {}).get("content", "")
+    if not content:
+        finish_reason = choices[0].get("finish_reason", "unknown")
+        completion_tokens = usage.get("completion_tokens", "?")
+        reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+        return _failed_batch_result(
+            custom_id,
+            f"OpenAI batch row returned empty content (finish_reason={finish_reason}, "
+            f"completion_tokens={completion_tokens}, reasoning_tokens={reasoning_tokens}, "
+            f"cap=MAX_OUTPUT_TOKENS={MAX_OUTPUT_TOKENS}). "
+            + ("Reasoning consumed the whole output budget — raise MAX_OUTPUT_TOKENS."
+               if reasoning_tokens and finish_reason == "length"
+               else "Raise MAX_OUTPUT_TOKENS if finish_reason is 'length'."),
+        )
     if not expect_summary_schema:
         return {
             "custom_id": custom_id,
@@ -855,7 +931,13 @@ def parse_openai_result_line(line: str, *, expect_summary_schema: bool = True) -
             system_fingerprint=body.get("system_fingerprint"),
         )
     except Exception as exc:
-        return _failed_batch_result(custom_id, f"Invalid structured summary: {exc}")
+        finish_reason = choices[0].get("finish_reason", "unknown")
+        hint = (
+            f" (finish_reason={finish_reason}, completion_tokens={usage.get('completion_tokens', '?')}, "
+            f"cap=MAX_OUTPUT_TOKENS={MAX_OUTPUT_TOKENS} — raise MAX_OUTPUT_TOKENS if truncated)"
+            if finish_reason == "length" else ""
+        )
+        return _failed_batch_result(custom_id, f"Invalid structured summary: {exc}{hint}")
 
 
 def _extract_anthropic_summary_payload(content_blocks: list[dict]) -> Any:

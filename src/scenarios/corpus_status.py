@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from collect import JOURNAL_TARGETS
-from file_paths import pdf_path_candidates
+from file_paths import doi_suffix_glob_candidates, pdf_path_candidates
 from scenarios.base import Scenario, ScenarioPaths
 
 
@@ -173,6 +173,11 @@ class PrimaryResearchCorpusScenario(Scenario):
         The shared helper intentionally owns normal legacy/descriptive naming.
         This scenario adds only the documented ``2_`` variant so status reporting
         can count secondary review PDFs without changing downloader path logic.
+
+        Falls back to a DOI-suffix glob (see ``file_paths.doi_suffix_glob_candidates``)
+        when none of the recomputed candidates exist — a manifest title edited
+        (or a naming-constant change) after download can leave a real, already-
+        downloaded PDF undiscoverable by exact-name matching alone.
         """
         candidates = pdf_path_candidates(self.paths.raw_dir, record)
         for candidate in candidates:
@@ -181,7 +186,10 @@ class PrimaryResearchCorpusScenario(Scenario):
             secondary_candidate = candidate.with_name(f"2_{candidate.name}")
             if secondary_candidate.exists():
                 return secondary_candidate
-        return None
+
+        doi = str(record.get("doi", "") or "").strip()
+        fallback_matches = doi_suffix_glob_candidates(self.paths.raw_dir, doi, ".pdf")
+        return fallback_matches[0] if fallback_matches else None
 
     def counts_toward_quota(self, record: dict[str, Any]) -> bool:
         """Primary papers count; secondary review PDFs remain reference material."""

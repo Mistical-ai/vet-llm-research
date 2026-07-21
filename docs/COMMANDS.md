@@ -14,6 +14,7 @@ a methods explanation — for the "why," see the linked doc.
 | Shorter command tables + first-time setup | [README.md](../README.md) — see "The commands you need to know" |
 | Phase 3 (extract/summarize/evaluate) beginner walkthrough | [docs/phase3/README.md](phase3/README.md) |
 | Phase 3 full CLI/flag reference | [docs/phase3/run_phase3.md](phase3/run_phase3.md) |
+| Batch mode only — every command, `--resume`/`--force`/`--limit`, and how to fix a stuck/failed batch | [docs/phase3/batch_mode.md](phase3/batch_mode.md) |
 | Phase 5 human validation, full rationale | [docs/phase5/human_validation.md](phase5/human_validation.md) |
 
 **Live-API rule (see `CLAUDE.md`):** every command below that can spend real
@@ -79,6 +80,11 @@ python llm-sum/run_phase3.py summarize          # PAID — submits batch jobs, r
 
 python llm-sum/check_batch_status.py            # collect finished results into data/summaries.jsonl
 ```
+
+Batch submissions can be rejected wholesale by a provider's token limit, or
+need resuming/chunking/force-resubmitting after a failure — see
+[docs/phase3/batch_mode.md](phase3/batch_mode.md) for the commands and
+troubleshooting playbook before reaching for `--force`.
 
 Six-summary PDF-vs-processed-text comparison (one matched article, 3
 providers x 2 input sources):

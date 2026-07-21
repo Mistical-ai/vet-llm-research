@@ -338,6 +338,82 @@ def test_get_best_doi_no_doi_found(tmp_path: Path) -> None:
     assert source == "none"
 
 
+# ---------------------------------------------------------------------------
+# _get_pdf_metadata_doi ISSN-placeholder guard
+# ---------------------------------------------------------------------------
+#
+# Some publishers (observed on Wiley PDFs in this corpus) stamp the journal's
+# container/ISSN identifier into the DOI-shaped metadata field instead of the
+# article's real DOI, e.g. "10.1111/(issn)1740-8261". Because bulk CrossRef
+# crawls sometimes also pick up a stray container-level manifest row under
+# that same fake DOI, trusting it as "the" metadata DOI made 43 real, already-
+# downloaded papers in this corpus read as "already matched" to audit_raw.py
+# even though the actual article had never been registered.
+
+def _mock_pdfplumber(metadata: dict) -> MagicMock:
+    mock_pdf = MagicMock()
+    mock_pdf.__enter__ = MagicMock(return_value=mock_pdf)
+    mock_pdf.__exit__ = MagicMock(return_value=False)
+    mock_pdf.metadata = metadata
+    mock_pdf.pages = []
+    return mock_pdf
+
+
+def test_metadata_doi_rejects_issn_placeholder(tmp_path: Path) -> None:
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    mock_pdf = _mock_pdfplumber({"Subject": "10.1111/(issn)1740-8261"})
+    with patch("pdfplumber.open", return_value=mock_pdf):
+        doi = enrich._get_pdf_metadata_doi(pdf)
+
+    assert doi is None
+
+
+def test_metadata_doi_falls_through_to_next_metadata_hit_past_issn_placeholder(tmp_path: Path) -> None:
+    """If a real DOI is ALSO present in metadata, it's still returned."""
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    mock_pdf = _mock_pdfplumber({
+        "Subject": "10.1111/(issn)1740-8261",
+        "doi": "10.1111/vsu.14160",
+    })
+    with patch("pdfplumber.open", return_value=mock_pdf):
+        doi = enrich._get_pdf_metadata_doi(pdf)
+
+    assert doi == "10.1111/vsu.14160"
+
+
+def test_metadata_doi_still_returns_normal_dois_unchanged(tmp_path: Path) -> None:
+    """The guard must not regress the common case of a legitimate metadata DOI."""
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    mock_pdf = _mock_pdfplumber({"doi": "10.1111/jvim.70254"})
+    with patch("pdfplumber.open", return_value=mock_pdf):
+        doi = enrich._get_pdf_metadata_doi(pdf)
+
+    assert doi == "10.1111/jvim.70254"
+
+
+def test_get_best_doi_falls_through_issn_placeholder_to_filename(tmp_path: Path) -> None:
+    """Integration: an ISSN-placeholder metadata DOI must not shadow a good filename DOI.
+
+    Exercises the real (unpatched) _get_pdf_metadata_doi so the whole chain —
+    metadata reader -> ISSN guard -> filename fallback — runs end to end.
+    """
+    pdf = tmp_path / "10.1177_1098612X231170159.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    mock_pdf = _mock_pdfplumber({"Subject": "10.1111/(issn)1740-8261"})
+    with patch("pdfplumber.open", return_value=mock_pdf):
+        doi, source = enrich._get_best_doi_for_enrichment(pdf)
+
+    assert doi == "10.1177/1098612x231170159"
+    assert source == "filename"
+
+
 def test_get_page_dois_with_frequency_prefers_high_count(tmp_path: Path) -> None:
     """DOI appearing on more pages sorts before single-occurrence DOIs."""
     pdf = tmp_path / "paper.pdf"

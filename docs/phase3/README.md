@@ -18,6 +18,7 @@ This is a hands-on walkthrough for turning your collected PDFs into LLM summarie
 | [verify_extraction.md](verify_extraction.md) | Operator how-to for the extraction audit tool. |
 | [cost_estimator.md](cost_estimator.md) | Operator how-to for offline cost forecasting. |
 | [check_batch_status.md](check_batch_status.md) | Operator how-to for collecting batch-API results. |
+| [batch_mode.md](batch_mode.md) | Everything batch-specific in one place: every `summarize --mode batch` / `check_batch_status.py` command, `--resume`/`--force`/`--limit` semantics, and the troubleshooting playbook for real batch failures (schema errors, token-limit rejections, duplicate submissions, stuck-pending papers). |
 | [../phase4/README.md](../phase4/README.md) | Scenarios, offline rubric, and run-manifest provenance (Phase 4). |
 | [../phase5/human_validation.md](../phase5/human_validation.md) | Blind human validation of the LLM jury — export packets, ingest scoresheets, agreement/correlation (Phase 5). |
 | [../phase5/pilot_human_review.md](../phase5/pilot_human_review.md) | Trial the human-validation workflow on the dev pool before the real run — incremental `humanN/` folders, `.xlsx` scoresheet, copied PDFs. |

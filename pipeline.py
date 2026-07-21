@@ -68,6 +68,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Windows PowerShell's console defaults to cp1252, which can't encode the
+# checkmarks/warning glyphs this module prints — force UTF-8 so the status
+# report doesn't crash mid-print on that platform.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Add src/ to the Python path so pipeline.py (at workspace root) can import
 # from src/collect.py, src/utils.py, etc. without an installed package.
 sys.path.insert(0, str(Path(__file__).parent / "src"))

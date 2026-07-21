@@ -1317,8 +1317,20 @@ def generate_summary_from_pdf(
 # ---------------------------------------------------------------------------
 
 def _empty_model_slot() -> dict:
+    """Placeholder for a provider slot that has never been submitted.
+
+    ``status`` starts as ``None``, not ``"pending"``. A brand-new paper's
+    entry gets one of these for every provider the moment it's first seen
+    (see ``_new_summary_entry``) — if this defaulted to ``"pending"``,
+    ``run_batch_summarisation``'s ``--resume`` skip check
+    (``status in ("success", "pending")``) would treat that never-attempted
+    slot as already in flight and skip it forever, on its very first
+    appearance, before any request was ever built or submitted. ``"pending"``
+    is set explicitly, only once a request for this slot is actually queued
+    for submission — see the per-provider loop in ``run_batch_summarisation``.
+    """
     return {
-        "status": "pending",
+        "status": None,
         "summary": None,
         "input_tokens": None,
         "output_tokens": None,

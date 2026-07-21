@@ -1,5 +1,9 @@
 # check_batch_status.py
 
+**For the full batch-mode picture — every command, `--resume`/`--force`/
+`--limit`, and the troubleshooting playbook this page's error table
+summarizes — see [batch_mode.md](batch_mode.md).**
+
 ## What it does
 
 Polls every batch job recorded in `data/batch_jobs.jsonl`, fetches results when a job is complete, and merges them into `data/summaries.jsonl` (for summarisation batches) or `data/evaluations.jsonl` (for judge batches). Read-only with respect to the providers — it does not submit new jobs.
@@ -46,8 +50,16 @@ There is no `--mode` flag because the script ignores the active mode by design.
 | Provider state | Action                                                                                |
 |----------------|---------------------------------------------------------------------------------------|
 | `validating` / `in_progress` | Logged; nothing merged this run.                                          |
-| `completed`    | Result JSONL downloaded and merged into `summaries.jsonl` or `evaluations.jsonl`. Job marked `merged` in the ledger. |
-| `failed` / `expired` / `cancelled` | Logged to `error_log.jsonl`; ledger updated; nothing merged.            |
+| `completed`, every row succeeded | Result JSONL downloaded and merged into `summaries.jsonl` or `evaluations.jsonl`. `.merged` marker written. |
+| `completed`, every row failed (e.g. a schema error) | Per-row error text downloaded and logged to `data/error_log.jsonl`. `.merged` marker written. For `summarize`-stage jobs, every paper this job covered has its `pending` slot reset back to not-yet-attempted so a future `--resume` can retry it. |
+| `failed` / `expired` / `cancelled` (rejected before processing any row — e.g. `token_limit_exceeded`) | Batch-level error text (from the provider's own `errors` field) printed and logged. `.merged` marker written. Same `pending`-slot reset as above. |
+
+The last two rows both mean "this job will never produce results" — the
+difference is only *when* it died (mid-processing vs. before the first
+row). Either way, `check_batch_status.py` now marks it resolved and un-sticks
+its papers automatically; you don't need to do anything extra beyond running
+it. See [batch_mode.md](batch_mode.md#problem-4-a-batch-fails-and-its-papers-stay-stuck-at-pending-forever)
+for the failure this fixed.
 
 ## Common errors and fixes
 
@@ -56,6 +68,9 @@ There is no `--mode` flag because the script ignores the active mode by design.
 | `No batch jobs found at data/batch_jobs.jsonl`     | No batches have been submitted yet.                                  | Run `python llm-sum/run_phase3.py summarize` with `PHASE3_MODE=batch` first.              |
 | Status stays `in_progress` for >24h                | Provider batch backlog (rare).                                       | Check the provider's status page; rerun the polling script periodically.                  |
 | `failed` status with `error: rate_limited`         | Submission was too large for the batch endpoint at that moment.      | Resubmit by re-running `summarize`; resume picks up only the unsuccessful slots.          |
+| `failed` status, `request_counts` all `0`, error text `token_limit_exceeded: Enqueued token limit reached ...` | The whole batch file's prompt tokens exceeded the provider's per-model enqueued-token cap (900,000 for `gpt-5.4` at time of writing) — a real incident on this project's ~207-paper corpus. Not a per-row error and not related to `MAX_OUTPUT_TOKENS`. | Resubmit in smaller chunks with `--resume --limit N` (e.g. `--limit 60`), waiting for each chunk to reach `completed` before submitting the next. Full writeup: [batch_mode.md](batch_mode.md#problem-2-batch-rejected-outright-with-token_limit_exceeded). |
+| Every row's error mentions `'required' is required to be supplied ... Missing 'sample_size'` | OpenAI Structured Outputs strict-mode schema rejection — already fixed in `build_openai_request` (`llm-sum/batch_utils.py`) via `to_strict_json_schema()`. | Should not recur; if it does, the schema-building code has regressed. See [batch_mode.md](batch_mode.md#problem-1-request-rejected-with-a-missing-sample_size-schema-error). |
+| A resubmission was refused: `REFUSING to submit ... unresolved job(s) already exist` | An earlier batch job for the same provider/stage has no `.merged` marker yet — by design, to prevent a duplicate paid submission. | Run this script first to resolve or merge it. Only pass `--force` once you've confirmed the earlier job is genuinely dead — see [batch_mode.md](batch_mode.md#problem-3-force-created-a-duplicate-batch-job). |
 | Duplicate rows in `summaries.jsonl`                | Merge keys use the batch `custom_id`, which encodes DOI plus input source, then replace the matching provider slot in place. | Report a bug if the same `(doi, input_source, provider)` appears twice. |
 
 ## Worked example
