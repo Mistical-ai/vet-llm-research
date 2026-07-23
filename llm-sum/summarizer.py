@@ -704,7 +704,7 @@ def _mock_summary(model_name: str, article_text: str, title_hint: str = "") -> d
     Returned shape matches the real success shape so downstream code never
     has to branch on dry-run vs live.
     """
-    spec = get_model_spec(model_name)
+    spec = get_model_spec(model_name, role="summarize")
     snippet = (article_text.strip().split("\n", 1)[0])[:120]
     summary = f"[MOCK {model_name}] {title_hint or snippet or 'summary'}".strip()
     parsed = VeterinarySummary(
@@ -851,7 +851,7 @@ def _call_openai(article_text: str, *, prompt_template: str | None) -> dict:
     """
     import openai  # type: ignore[import-not-found]
 
-    spec = get_model_spec("openai")
+    spec = get_model_spec("openai", role="summarize")
     user_message = build_user_message(article_text, prompt_template)
     client = openai.OpenAI()  # picks up OPENAI_API_KEY from env
 
@@ -897,7 +897,7 @@ def _call_anthropic(article_text: str, *, prompt_template: str | None) -> dict:
     """Real-time Anthropic call."""
     import anthropic  # type: ignore[import-not-found]
 
-    spec = get_model_spec("anthropic")
+    spec = get_model_spec("anthropic", role="summarize")
     user_message = build_user_message(article_text, prompt_template)
     client = anthropic.Anthropic()  # picks up ANTHROPIC_API_KEY from env
 
@@ -974,7 +974,7 @@ def _call_gemini(article_text: str, *, prompt_template: str | None) -> dict:
     """Real-time Gemini call (no batch API)."""
     genai, types = _load_google_genai()
 
-    spec = get_model_spec("gemini")
+    spec = get_model_spec("gemini", role="summarize")
     user_message = build_user_message(article_text, prompt_template)
 
     # The newer google-genai SDK reads GEMINI_API_KEY automatically, but we pass
@@ -1049,7 +1049,7 @@ def _call_openai_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     """
     import openai  # type: ignore[import-not-found]
 
-    spec = get_model_spec("openai")
+    spec = get_model_spec("openai", role="summarize")
     user_message = build_pdf_user_message(prompt_template)
     client = openai.OpenAI()
 
@@ -1105,7 +1105,7 @@ def _call_anthropic_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     """
     import anthropic  # type: ignore[import-not-found]
 
-    spec = get_model_spec("anthropic")
+    spec = get_model_spec("anthropic", role="summarize")
     user_message = build_pdf_user_message(prompt_template)
     pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
     client = anthropic.Anthropic()
@@ -1158,7 +1158,7 @@ def _call_gemini_pdf(pdf_path: Path, *, prompt_template: str | None) -> dict:
     """
     genai, types = _load_google_genai()
 
-    spec = get_model_spec("gemini")
+    spec = get_model_spec("gemini", role="summarize")
     user_message = build_pdf_user_message(prompt_template)
 
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
@@ -2514,8 +2514,8 @@ def main(argv: list[str] | None = None) -> int:
     # matching .env.template section 12's description of what batch mode
     # does. Flipping GEMINI_BATCH_ENABLED=true moves it into batch_providers
     # instead, with no other command-line change.
-    batch_providers = [p for p in providers if get_model_spec(p).supports_batch] if profile.use_batch else None
-    realtime_providers = [p for p in providers if not get_model_spec(p).supports_batch] if profile.use_batch else None
+    batch_providers = [p for p in providers if get_model_spec(p, role="summarize").supports_batch] if profile.use_batch else None
+    realtime_providers = [p for p in providers if not get_model_spec(p, role="summarize").supports_batch] if profile.use_batch else None
 
     if not confirm_real_batch(profile, force=args.force,
                               batch_providers=batch_providers,

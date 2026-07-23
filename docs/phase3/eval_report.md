@@ -1,5 +1,11 @@
 # eval_report.py
 
+**Not sure whether you want `eval-report`, `eval-report --publication`,
+`report-figures`, or `stats-engine`?** See
+[reporting_and_batch_explained.md](reporting_and_batch_explained.md) for a
+plain-language, side-by-side comparison first — this page is the detailed
+flag reference for `eval-report` specifically.
+
 ## What it does
 
 Reads `data/evaluations.jsonl` and prints a MedHELM-style stratified summary:
@@ -30,6 +36,31 @@ for the jury-score formula and
 [../phase5/human_validation.md](../phase5/human_validation.md) for the full
 human-validation workflow.
 
+The aggregate report also averages the per-summary **automatic metrics**
+(compression ratio, extractive coverage, section coverage, ROUGE-1/2/L —
+computed once per candidate summary by `eval_metrics.calculate_automatic_metrics`)
+across the whole corpus: the corpus-wide average appears as extra rows in the
+`## Headline` table (text report: the `[Automatic metrics]` block), and a
+per-provider breakdown appears in a `### Automatic Metrics (averaged per
+summary)` table under `## By Provider`. A summary scored by a 3-judge panel
+still counts as one item — `_collect_automatic_metrics_by_item` dedupes to one
+`(doi, input_source, summarizer)` entry before averaging, the same pairing
+`report_tables.collect_item_scores` uses for jury scores, so a 3-judge paper
+can't outweigh a 1-judge paper. This is the corpus-wide counterpart to the
+per-paper automatic-metrics table in `--rich-detail`/`data/dev_detailEval_reports/`
+— see [medhelm_evaluation.md](medhelm_evaluation.md) and
+[evaluator.md](evaluator.md) for what each metric measures.
+
+`--rich-detail` renders a third, richer view of the same rows: one Markdown
+file *per paper* (not one bundled file per run) to `data/results/detail_rich/`,
+using the same deep-dive template `evaluate --mode dev` writes to
+`data/dev_detailEval_reports/` — an automatic-metrics table, a cross-judge
+agreement table, and a full per-judge breakdown (every criterion's score
+*and* reasoning, not just the aggregate) for every summarizer. It reads only
+`data/evaluations.jsonl` + `data/manifest.jsonl`, same as the rest of this
+report, so it's offline and safe to re-run any time — it does not require
+`--markdown` and does not touch the legacy `data/results/detail/` file.
+
 `--publication` is a different code path entirely: it delegates to
 `report_tables.py` instead of `eval_report.py`, producing bootstrap
 confidence intervals, paired Wilcoxon/Friedman significance tests, and a
@@ -55,14 +86,19 @@ folder of CSVs rather than any of the output described above. See its own
 | Path                                                       | When                                                        |
 |--------------------------------------------------------------|--------------------------------------------------------------|
 | Stdout — text table, `--json`, or `--markdown`                | Always.                                                       |
-| `data/results/eval_report_<UTC timestamp>.json`               | Every run, unless `--no-save` or there are zero evaluation rows to report. |
-| `data/results/eval_report_<UTC timestamp>.md`                 | With `--markdown` (same rule as the `.json` file above).      |
-| `data/results/eval_report_<UTC timestamp>_detail.md`          | With `--markdown`, unless `--no-detail` is also passed.       |
+| `data/results/json/eval_report_<UTC timestamp>.json`          | Every run, unless `--no-save` or there are zero evaluation rows to report. |
+| `data/results/reports/eval_report_<UTC timestamp>.md`         | With `--markdown` (same rule as the `.json` file above).      |
+| `data/results/detail/eval_report_<UTC timestamp>_detail.md`   | With `--markdown`, unless `--no-detail` is also passed.       |
+| `data/results/detail_rich/<doi-slug>.md`                       | With `--rich-detail` (independent of `--markdown`). One file per DOI in the report; a re-run overwrites each paper's file in place rather than piling up timestamped duplicates. |
 
-Each run writes its own timestamped file(s) — nothing in `data/results/` is
-ever overwritten, so past snapshots survive a later `evaluate` run changing
-`data/evaluations.jsonl`. The `.json`, `.md`, and `_detail.md` files from one
-run always share the same timestamp.
+Each of the three timestamped file kinds gets its own subfolder under
+`data/results/` — `json/`, `reports/`, `detail/` — so browsing one kind
+never mixes in the others. Each run writes its own timestamped file(s) —
+nothing in those three folders is ever overwritten, so past snapshots
+survive a later `evaluate` run changing `data/evaluations.jsonl`. The
+`.json`, `.md`, and `_detail.md` files from one run always share the same
+timestamp, just in different folders. `detail_rich/` is keyed by DOI slug
+instead of timestamp, so it always reflects the latest run's data per paper.
 
 ## CLI
 
@@ -71,6 +107,7 @@ python llm-sum/run_phase3.py eval-report                        # text report; s
 python llm-sum/run_phase3.py eval-report --json                  # full report JSON on stdout; also saves
 python llm-sum/run_phase3.py eval-report --markdown               # plain-English summary + per-article detail .md files
 python llm-sum/run_phase3.py eval-report --markdown --no-detail   # summary .md only, skip the per-article detail file
+python llm-sum/run_phase3.py eval-report --rich-detail             # one rich per-paper .md per DOI in data/results/detail_rich/
 python llm-sum/run_phase3.py eval-report --no-save                # print only, skip the data/results/ file
 python llm-sum/run_phase3.py eval-report --results-dir data/tmp   # save elsewhere for one run
 python llm-sum/run_phase3.py eval-report --evaluations data/evaluations_backup.jsonl
@@ -84,11 +121,63 @@ You can also call the script directly: `python llm-sum/eval_report.py --json`.
 | `--json` | Print the full report as JSON instead of the compact text tables. |
 | `--markdown` | Print a plain-English Markdown report; also saves it and a companion per-article detail file. Mutually exclusive with `--json`. |
 | `--no-detail` | With `--markdown`, skip the per-article detail file (aggregate summary only). |
+| `--rich-detail` | Write one rich per-paper Markdown file per DOI (automatic metrics, cross-judge agreement, every judge's individual scores/reasoning) to `--results-dir/detail_rich/` — the same format `evaluate --mode dev` uses for `data/dev_detailEval_reports/`. Works with or without `--markdown`. Offline; safe to re-run. Does not apply with `--publication`. |
 | `--human-reviews PATH` | Normalized human-review rows to validate against (default: `data/human_reviews.jsonl`; missing is fine). Point at `data/pilot_human_reviews.jsonl` to inspect a pilot rehearsal instead of the real study. Does not apply with `--publication`. |
 | `--human-validation-mode {per_reviewer,pooled,both}` | How to report human-vs-jury correlation: `per_reviewer` (default; each reviewer validated on their own scores), `pooled` (all reviewers averaged), or `both`. Overrides `HUMAN_VALIDATION_MODE` from `.env`. |
 | `--publication` | Emit publication tables instead of the operator summary: provider comparison with 95% bootstrap CIs, paired Wilcoxon/Friedman significance tests, per-stratum and processed-vs-PDF breakdowns, and cost-per-quality-point. Delegates to `report_tables.py` instead of `eval_report.py`; writes JSON + Markdown + a folder of CSVs. Offline; `--no-detail` and `--human-validation-mode` do not apply. |
 | `--results-dir PATH` | Where to save the report snapshot (default: `data/results/`). |
 | `--no-save` | Print only; don't write a report file. |
+
+## Cache-token fields and "absent vs zero"
+
+`data/evaluations.jsonl` rows written by the current code carry four fields
+tied to the judge-prompt caching work (see `docs/phase3/batch_mode.md`'s
+Prompt caching section and `.env.template` section 12):
+
+| Field | Meaning |
+|---|---|
+| `judge_prompt_shape` | `"segmented_v1"` once the judge prompt is split into rubric/reference/candidate blocks (every path, batch and real-time). |
+| `input_tokens` | Total prompt tokens (uncached + cache-write + cache-read) — unchanged meaning for a row with no caching involved. |
+| `cache_read_input_tokens` | Tokens served from cache on this call. |
+| `cache_creation_input_tokens` | Tokens written to cache on this call. |
+
+**Absent (missing key / `None`) is not the same as `0`, and this report
+never conflates them:**
+
+- **Absent** means the row predates this code — cache-token accounting
+  (or the segmented prompt shape) didn't exist yet when it was written.
+- **`0`** means the current code ran and either caching was off, or it was
+  on and this call missed the cache.
+
+`eval_report.compute_cache_summary()` computes the prompt-cache hit rate
+using only rows where `cache_read_input_tokens` is not `None` — an absent
+row is excluded from both the numerator and the denominator, not counted as
+a miss. Both the text report (`[Prompt cache]`) and the Markdown report
+(**Prompt-cache hit rate**) print this, along with how many rows were
+excluded as pre-caching. The full report JSON carries it under the `"cache"`
+key.
+
+## Mixed-provenance warnings
+
+`eval_report.detect_mixed_provenance()` flags two situations where pooling
+every row into one average would be misleading, printed as
+`[WARNING: mixed-provenance corpus]` in the text report and a
+`## ⚠ Data-quality warnings` section in Markdown (empty/absent when the
+corpus is uniform):
+
+1. **Mixed `judge_prompt_shape`** — some rows were judged before the
+   segmented-prompt change landed (no `judge_prompt_shape` field) and some
+   after (`"segmented_v1"`). This is a real change to what the judge saw, not
+   just a billing detail — see `docs/phase3/batch_mode.md`. Re-run the older
+   rows, or partition the report by shape, rather than averaging them.
+2. **Mixed `judge_model_version` for one judge** — the same judge answered
+   with more than one model version across the corpus (a mid-study provider
+   upgrade, or a `MODEL_TIER` change between runs — see `.env.template`
+   section 16). Re-run the older rows, or partition by version.
+
+Both checks look at the full set of rows passed to `build_report()` — the
+warnings are advisory (printed, not fatal): a researcher can still choose to
+proceed, but not without seeing the warning first.
 
 ## Common errors and fixes
 
@@ -96,7 +185,7 @@ You can also call the script directly: `python llm-sum/eval_report.py --json`.
 |-------------------------------------------------------|-----------------------------------------------------------|------------------------------------------------------------|
 | `No evaluation rows found yet.`                       | `data/evaluations.jsonl` is empty or missing.             | Run `python llm-sum/run_phase3.py evaluate` first.          |
 | `(No breakdown for: ...)` at the end of the report    | Those rows have no `species`/`study_design`/etc. metadata (common for `summarize-all` `.txt`-sourced rows). | Expected — `manifest.jsonl`-backed rows carry that metadata; `.txt`-sourced rows don't. |
-| No file appears in `data/results/`                    | `--no-save` was passed, or there were zero rows to report. | Drop `--no-save`; confirm `data/evaluations.jsonl` has rows. |
+| No file appears in `data/results/json\|reports\|detail\|detail_rich/`    | `--no-save` was passed, there were zero rows to report, or (for `detail_rich/`) `--rich-detail` wasn't passed. | Drop `--no-save`; confirm `data/evaluations.jsonl` has rows; add `--rich-detail` for the per-paper deep-dive files. |
 | Detail file says "Summary text not found..." for a model | The candidate summary wasn't found in `data/summaries.jsonl` or `data/*summaries_txt/` for that `(doi, summarizer)` — the source file may have moved, or the row predates both. | Expected in some cases; the score, judge reasoning, and hallucination claims are still shown — only the raw candidate text is missing. |
 
 See [MedHELM-Style Evaluation](medhelm_evaluation.md#example-report-output) for

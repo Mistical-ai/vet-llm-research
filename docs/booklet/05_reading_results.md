@@ -125,9 +125,11 @@ the aggregate summary.
 
 ### Where results go
 
-Every run writes its own timestamped file(s) under `data/results/` — nothing
-is ever overwritten, so a report from last week survives a fresh `evaluate`
-run changing `evaluations.jsonl`. Pass `--no-save` to print only.
+Every run writes its own timestamped file(s) under `data/results/` — split
+into a `json/`, `reports/`, and `detail/` subfolder so each kind never mixes
+with the others — and nothing is ever overwritten, so a report from last week
+survives a fresh `evaluate` run changing `evaluations.jsonl`. Pass `--no-save`
+to print only.
 
 ---
 

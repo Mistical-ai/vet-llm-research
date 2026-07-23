@@ -48,7 +48,7 @@ Calling `run_phase3.py <cmd>` and calling the underlying script directly do exac
 
 ## When to run it
 
-Every time you want to make Phase 3 progress. Read `docs/phase3/README.md`'s "Three named recipes" — they're all written against this script.
+Every time you want to make Phase 3 progress. Read `docs/phase3/README.md`'s "6. Copy-paste recipes" (Recipe A/A2/B/C) — they're all written against this script.
 
 ## Inputs
 
@@ -265,6 +265,7 @@ python llm-sum/run_phase3.py evaluate --mode single
 python llm-sum/run_phase3.py evaluate --mode dev          # folder-driven dev loop
 python llm-sum/run_phase3.py evaluate --mode dev --limit 3
 python llm-sum/run_phase3.py evaluate --mode batch
+python llm-sum/run_phase3.py evaluate --mode batch --max-requests 50   # cap NEW judge requests per judge this call
 python llm-sum/run_phase3.py evaluate --mode dev --judges openai,anthropic
 python llm-sum/run_phase3.py evaluate --mode dev --jury
 python llm-sum/run_phase3.py evaluate --mode dev --no-resume   # re-judge papers already done
@@ -284,6 +285,7 @@ python llm-sum/run_phase3.py evaluate --mode batch --input-mode regular
 | Flag | Purpose |
 |------|---------|
 | `--limit N` | Override mode's paper limit. In the default `jsonl` input mode this is a **per-journal quota** — N papers are judged from *each* journal in `data/summaries.jsonl`, so total judged = N × number of journals present (see the "Also important" note under **Modes** above). |
+| `--max-requests N` | Batch mode only: cap how many NEW judge requests get queued **per judge** in this submission (not a cap on papers scanned). Evaluated live against already-judged pairs each call, so repeating the same command with `--resume` (the default) sweeps a large backlog chunk by chunk without resampling — the correct fix for a provider's enqueued-token cap on the judge side. See [batch_mode.md](batch_mode.md#submitting-the-judge-evaluate---mode-batch). |
 | `--judges` | Comma-separated judge provider keys. Overrides `--jury` and `JURY_PRESET`. Default judges: the full 3-judge panel `openai,anthropic,gemini`. |
 | `--jury` | Full 3-judge panel (`openai,anthropic,gemini`); same as `JURY_PRESET=panel`. Presets: `panel` (3, default) / `duo` (2: `openai,anthropic`) / `solo` (1: `openai`). |
 | `--input-mode` | `jsonl` (default), `dev-jsonl`, `dev`, `regular`, or `auto` — where to read summaries from. `--mode dev` defaults to `dev-jsonl` regardless of `EVAL_INPUT_MODE`. See [evaluator.md](evaluator.md#choosing-the-input-source-run_phase3py-evaluate). |
@@ -300,6 +302,7 @@ inter-judge reliability when a jury scored the data. See
 ```powershell
 python llm-sum/run_phase3.py eval-report
 python llm-sum/run_phase3.py eval-report --json
+python llm-sum/run_phase3.py eval-report --markdown
 python llm-sum/run_phase3.py eval-report --no-save
 ```
 
@@ -307,8 +310,15 @@ python llm-sum/run_phase3.py eval-report --no-save
 |------|---------|
 | `--evaluations PATH` | Evaluation rows to summarize (default: `data/evaluations.jsonl`) |
 | `--json` | Print the full report as JSON |
-| `--results-dir PATH` | Where to save the report snapshot (default: `data/results/`) |
+| `--markdown` | Also write the aggregate Markdown report and (unless `--no-detail`) the per-article detail Markdown |
+| `--no-detail` | With `--markdown`, skip the per-article detail file |
+| `--human-reviews PATH` | Human-validation ledger to fold in (default: `data/human_reviews.jsonl`; point at `data/pilot_human_reviews.jsonl` to inspect a pilot rehearsal) |
+| `--human-validation-mode {per_reviewer,pooled,both}` | How to aggregate multiple human reviewers |
+| `--publication` | Emit publication tables (provider comparison, significance tests, per-stratum breakdowns) instead of the operator summary; delegates to `report_tables.py` |
+| `--results-dir PATH` | Where to save the report snapshot (default: `data/results/`) — the JSON, aggregate Markdown, and per-article detail Markdown each land in their own `json/`/`reports/`/`detail/` subfolder underneath it |
 | `--no-save` | Print only; skip writing to `data/results/` |
+
+Full flag reference and behavior notes: [eval_report.md](eval_report.md).
 
 ### `report-figures` (always free, read-only)
 
@@ -478,7 +488,7 @@ python llm-sum/run_phase3.py summarize            # type 'yes'; submits batch jo
 # Hours later (or next day):
 python llm-sum/check_batch_status.py              # collect results
 python llm-sum/run_phase3.py evaluate             # judge the collected summaries
-python llm-sum/run_phase3.py eval-report          # snapshot saved to data/results/
+python llm-sum/run_phase3.py eval-report          # snapshot saved under data/results/json/ (+ reports/, detail/ with --markdown)
 python llm-sum/run_phase3.py status               # final counts
 python llm-sum/run_phase3.py clean                # tidy up
 ```

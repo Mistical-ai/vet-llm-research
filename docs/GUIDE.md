@@ -748,6 +748,15 @@ Tradeoff:
 - More complex result collection
 - Not suitable for direct PDF comparison in this project
 
+Batch mode is per-provider, not all-or-nothing (`OPENAI_BATCH_ENABLED`,
+`ANTHROPIC_BATCH_ENABLED`, `GEMINI_BATCH_ENABLED` — `.env.template` §12), and
+that same section also holds prompt-caching options
+(`PROMPT_CACHE_ENABLED`/`PROMPT_CACHE_TTL`/`PROMPT_CACHE_KEY_SCOPE`) for the
+judge/evaluate stage, plus `MODEL_TIER` (§16) for swapping in a
+stronger/pricier model lineup. Every batch command, `--resume`/`--force`/
+`--limit`/`--max-requests`, and the troubleshooting playbook for a stuck or
+rejected batch job: [docs/phase3/batch_mode.md](phase3/batch_mode.md).
+
 ---
 
 ## 13. Testing Method
@@ -813,6 +822,19 @@ One real PDF run:
 
 ```powershell
 python llm-sum/run_phase3.py summarize --mode single --input-source pdf
+```
+
+Full batch run (submit, then collect later — see
+[docs/phase3/batch_mode.md](phase3/batch_mode.md) for the complete
+reference, chunking flags, and troubleshooting):
+
+```powershell
+python llm-sum/run_phase3.py summarize --estimate --mode batch
+python llm-sum/run_phase3.py summarize --mode batch
+#   ... hours later ...
+python llm-sum/check_batch_status.py
+python llm-sum/run_phase3.py evaluate --mode batch
+python llm-sum/run_phase3.py eval-report
 ```
 
 Run tests:

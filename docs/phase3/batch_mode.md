@@ -1,5 +1,10 @@
 # Batch mode — full guide & troubleshooting
 
+**New to batch mode, or trying to make sense of `evaluate --mode batch --max-requests 50`?**
+See [reporting_and_batch_explained.md](reporting_and_batch_explained.md) for
+a plain-language walkthrough first — this page is the detailed reference it
+links out to.
+
 One page for everything specific to `PHASE3_MODE=batch`: the commands, what
 each flag actually does, how state is tracked on disk, and the playbook for
 every batch failure this project has actually hit. For the other modes
@@ -44,6 +49,56 @@ visible completion budget for a single request. Raising `MAX_OUTPUT_TOKENS`
 fixes neither of these — it only helps if a real, visible completion is
 being truncated (`finish_reason=length` with actual partial content).
 
+## Prompt caching (judge/evaluate batch jobs only)
+
+Every judge request — batch and real-time, all three providers — is now
+**segmented** into rubric / reference / candidate blocks: Anthropic gets the
+rubric as its own `system` block plus two content blocks (reference,
+candidate) in the one user message; OpenAI gets a `system` message (rubric)
+plus a `user` message (reference + candidate); Gemini gets three ordered
+`contents[0].parts[]` entries. This split is **unconditional** — it lands the
+same way whether `PROMPT_CACHE_ENABLED` is true or false, because it's the
+prompt SHAPE, not the caching mechanism itself. Summarisation batch requests
+are untouched: there's nothing to cache there (one call per paper per
+provider, no shared prefix worth a cache breakpoint).
+
+`PROMPT_CACHE_ENABLED=false` (`.env.template` section 12, the default) means
+the segmented shape is sent with no cache marker at all — same text, same
+blocks, zero caching-related billing difference from before. Setting it
+`true` adds Anthropic's `cache_control` marker (system + reference blocks
+only, never candidate) and OpenAI's `prompt_cache_key`. Gemini gets no marker
+either way — its caching is implicit, keyed on prefix ordering, which the
+three-part segmentation already gives it.
+
+`data/evaluations.jsonl` rows written after this segmentation lands carry
+`judge_prompt_shape: "segmented_v1"`, plus `cache_read_input_tokens` /
+`cache_creation_input_tokens` (present as real integers — 0 counts as "tried
+and missed", not absent). A row with **no** cache fields at all predates this
+change entirely — see `docs/phase3/eval_report.md`'s "Absent vs zero"
+section before averaging old and new rows into one hit rate.
+
+**Pilot before trusting the full judge run to it:**
+
+```powershell
+# .env: PROMPT_CACHE_ENABLED=true
+python llm-sum/run_phase3.py evaluate --mode batch --limit 4 --judges anthropic
+python llm-sum/check_batch_status.py
+```
+
+`merge_evaluation_results`'s print line reports the merge's own hit rate —
+`cache read=... write=... hit_rate=...% of N input tokens` — so a 4-paper
+pilot answers the "is this actually caching?" question with no extra
+tooling. If `cache_read_input_tokens` stays ~0, the article-level breakpoint
+isn't paying off for this corpus: leave the flag off, or set
+`PROMPT_CACHE_TTL=1h` (batch jobs run over up to 24h with no adjacency
+guarantee — a longer TTL survives a bigger gap between an article's three
+judge requests) and re-pilot before committing the full run. `PROMPT_CACHE_KEY_SCOPE`
+(default `run`, alternative `article`) only affects OpenAI's `prompt_cache_key`
+routing hint — `run` uses one key for the whole invocation, `article` emits a
+per-DOI key (`veteval-judge-{doi_slug}`); it has no effect on Anthropic or
+Gemini. See `.env.template` section 12 for the full break-even arithmetic and
+the per-model minimum cacheable prefix.
+
 ## The lifecycle: submit → wait → collect
 
 ```powershell
@@ -84,7 +139,19 @@ python llm-sum/run_phase3.py summarize --mode batch --force
 | `--force` | Bypass the interactive `yes` confirmation, **and** bypass the refusal to submit while an earlier unresolved batch job for the same provider(s)/stage still exists. | This is the flag that caused a real duplicate submission in this project (same 207 papers submitted twice). Only pass it after `check_batch_status.py` confirms the earlier job is genuinely dead — see [Problem 3](#problem-3-force-created-a-duplicate-batch-job). |
 | `--estimate` | Offline tiktoken-based cost forecast. No API calls. | Estimates the whole corpus, not just what `--resume` would still submit — treat it as a ceiling, not a precise "remaining work" number. |
 
-`evaluate --mode batch` takes the same `--resume`/`--force`/`--limit`/`--judges` flags for the judge side — see [run_phase3.md](run_phase3.md#evaluate-paid-unless---mode-test).
+### Submitting the judge: `evaluate --mode batch`
+
+`evaluate --mode batch` takes the same `--resume`/`--force`/`--limit`/`--judges` flags for the judge side — see [run_phase3.md](run_phase3.md#evaluate-paid-unless---mode-test) — plus one judge-only flag:
+
+```powershell
+python llm-sum/run_phase3.py evaluate --mode batch --max-requests 50
+#  ... wait for check_batch_status.py to show status=completed ...
+python llm-sum/run_phase3.py evaluate --mode batch --max-requests 50   # --resume is on by default; sweeps the next chunk
+```
+
+| Flag | What it does | Batch-specific gotcha |
+|------|--------------|------------------------|
+| `--max-requests N` | Caps how many NEW judge requests get queued **per judge** in this submission (not a cap on papers scanned). Evaluate-only — `summarize` has no equivalent flag; use `--limit` for that side. | This is the recommended fix for the same enqueued-token cap described in [Problem 2](#problem-2-batch-rejected-outright-with-token_limit_exceeded), but for judge batches: unlike `--limit`'s fixed-seed sampling (not guaranteed to be a stable superset across sizes), `--max-requests` is checked live against `already_evaluated()` every call, so repeating the same command with `--resume` (the default) genuinely sweeps the remaining backlog chunk by chunk instead of resampling. When a judge hits the cap, the command prints `hit max_new_requests=N` and tells you to re-run once the job is merged. |
 
 ### Collecting: `check_batch_status.py`
 
@@ -238,6 +305,48 @@ placeholder for "no result yet," not a failure. Nothing was lost.
 
 **Fix:** run `check_batch_status.py` to check whether the covering job is
 done; if it's genuinely dead, see Problem 4 (now automatic).
+
+### Problem 6: `check_batch_status.py` fails immediately with `ModuleNotFoundError`
+
+**Symptom:** running the script fails before it ever reaches the network:
+
+```
+ModuleNotFoundError: No module named 'openai'
+```
+
+(or `anthropic`, or `google.genai`).
+
+**Cause:** `check_batch_status.py` imports all three provider SDKs to poll
+each batch. Those packages (`openai`, `anthropic`, `google-genai`) are listed
+in `requirements.txt`, so this means they aren't installed in the venv that's
+currently active — a fresh or partially-completed venv, or a different
+`python`/`pip` running than the one `.venv\Scripts\activate` put on `PATH`.
+It is **not** a bad batch ID or an API-key problem: Python can't find the
+libraries before it even talks to an API.
+
+**Fix:** in the same PowerShell session where you'll run the script:
+
+```powershell
+# Reinstall everything from requirements.txt...
+python -m pip install -r requirements.txt
+
+# ...or target just the three provider SDKs:
+python -m pip install openai anthropic google-genai
+
+# Confirm the interpreter you're using actually has them:
+python -c "import sys; print(sys.executable)"
+python -c "import openai, anthropic; from google import genai; print('ok')"
+```
+
+`pip install` only installs the Python **client libraries** that call each
+provider's API — it never downloads a model onto your machine. Model IDs
+live in `.env` / `llm-sum/models_config.py`; the actual GPT/Claude/Gemini
+models stay on the providers' servers and are only reached over the network
+at request time. Once the `import` check above prints `ok`, rerun:
+
+```powershell
+python llm-sum/check_batch_status.py
+```
 
 ## Golden safety rules
 

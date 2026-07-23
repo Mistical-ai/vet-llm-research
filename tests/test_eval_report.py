@@ -9,8 +9,11 @@ import eval_report
 from conftest import make_eval_row
 from eval_report import (
     build_report,
+    compute_cache_summary,
+    detect_mixed_provenance,
     main,
     summarize_rows,
+    _collect_automatic_metrics_by_item,
     _dedupe_by_doi_summarizer,
     _markdown_stratum_table,
     _render_markdown,
@@ -149,7 +152,7 @@ def test_main_saves_report_to_results_dir(tmp_path: Path) -> None:
     result = main(["--evaluations", str(evaluations_path), "--results-dir", str(results_dir)])
 
     assert result == 0
-    saved = sorted(results_dir.glob("eval_report_*.json"))
+    saved = sorted((results_dir / "json").glob("eval_report_*.json"))
     assert len(saved) == 1
     saved_report = json.loads(saved[0].read_text(encoding="utf-8"))
     assert saved_report["by_summarizer"][0]["group"] == "openai"
@@ -310,11 +313,11 @@ def test_main_markdown_saves_json_and_paired_markdown_files(monkeypatch, tmp_pat
     ])
 
     assert result == 0
-    json_files = sorted(results_dir.glob("eval_report_*.json"))
+    json_files = sorted((results_dir / "json").glob("eval_report_*.json"))
     assert len(json_files) == 1
     ts = json_files[0].stem[len("eval_report_"):]
-    assert (results_dir / f"eval_report_{ts}.md").exists()
-    assert (results_dir / f"eval_report_{ts}_detail.md").exists()
+    assert (results_dir / "reports" / f"eval_report_{ts}.md").exists()
+    assert (results_dir / "detail" / f"eval_report_{ts}_detail.md").exists()
 
 
 def test_main_markdown_no_detail_skips_detail_file(monkeypatch, tmp_path: Path) -> None:
@@ -338,9 +341,141 @@ def test_main_markdown_no_detail_skips_detail_file(monkeypatch, tmp_path: Path) 
     ])
 
     assert result == 0
-    md_files = sorted(results_dir.glob("*.md"))
+    md_files = sorted((results_dir / "reports").glob("*.md"))
     assert len(md_files) == 1
     assert not md_files[0].stem.endswith("_detail")
+    assert not (results_dir / "detail").exists()
+
+
+_D1_METRICS = {
+    "compression_ratio": 0.05, "extractive_coverage": 0.9,
+    "section_coverage": {"covered_count": 4, "coverage_ratio": 0.6667},
+    "rouge_1": 0.5, "rouge_2": 0.25, "rouge_l": 0.35,
+}
+_D2_METRICS = {
+    "compression_ratio": 0.07, "extractive_coverage": 0.95,
+    "section_coverage": {"covered_count": 5, "coverage_ratio": 0.8333},
+    "rouge_1": 0.6, "rouge_2": 0.3, "rouge_l": 0.4,
+}
+
+
+def test_collect_automatic_metrics_by_item_dedupes_judges_and_averages_items() -> None:
+    # d1 was scored by three judges (same automatic_metrics on every row, since
+    # it's computed once per summary) -- must count as ONE item, not three.
+    rows = [
+        make_eval_row("d1", "openai", judge="anthropic", automatic_metrics=_D1_METRICS),
+        make_eval_row("d1", "openai", judge="gemini", automatic_metrics=_D1_METRICS),
+        make_eval_row("d1", "openai", judge="openai", automatic_metrics=_D1_METRICS),
+        make_eval_row("d2", "openai", judge="anthropic", automatic_metrics=_D2_METRICS),
+    ]
+
+    result = _collect_automatic_metrics_by_item(rows)
+
+    assert result["n_items_with_metrics"] == 2
+    assert result["compression_ratio"] == 0.06
+    assert result["extractive_coverage"] == 0.925
+    assert result["section_coverage_covered_count"] == 4.5
+    assert result["section_coverage_ratio"] == 0.75
+    assert result["rouge_1"] == 0.55
+    assert result["rouge_2"] == 0.275
+    assert result["rouge_l"] == 0.375
+
+
+def test_collect_automatic_metrics_by_item_skips_rows_without_metrics() -> None:
+    rows = [
+        make_eval_row("d1", "openai", judge="anthropic", automatic_metrics=_D1_METRICS),
+        make_eval_row("d2", "openai", judge="anthropic"),  # no automatic_metrics field
+    ]
+
+    result = _collect_automatic_metrics_by_item(rows)
+
+    assert result["n_items_with_metrics"] == 1
+    assert result["compression_ratio"] == 0.05
+
+
+def test_main_markdown_shows_corpus_wide_automatic_metrics(monkeypatch, tmp_path: Path) -> None:
+    _isolate_detail_lookups(monkeypatch, tmp_path)
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    rows = [
+        make_eval_row("d1", "openai", judge="anthropic", automatic_metrics=_D1_METRICS),
+        make_eval_row("d1", "openai", judge="gemini", automatic_metrics=_D1_METRICS),
+        make_eval_row("d2", "openai", judge="anthropic", automatic_metrics=_D2_METRICS),
+    ]
+    evaluations_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+    )
+    results_dir = tmp_path / "results"
+
+    result = main([
+        "--evaluations", str(evaluations_path),
+        "--results-dir", str(results_dir),
+        "--markdown",
+    ])
+
+    assert result == 0
+    md_files = sorted((results_dir / "reports").glob("*.md"))
+    markdown = md_files[0].read_text(encoding="utf-8")
+    assert "| Compression ratio (avg) | 0.0600 |" in markdown
+    assert "| Extractive coverage (avg) | 0.9250 |" in markdown
+    assert "| Section coverage (avg) | 4.50 of 6 (0.7500) |" in markdown
+    assert "| ROUGE-1 / ROUGE-2 / ROUGE-L (avg) | 0.5500 / 0.2750 / 0.3750 |" in markdown
+    assert "### Automatic Metrics (averaged per summary)" in markdown
+    assert (
+        "| openai | 2 | 0.0600 | 0.9250 | 4.50 of 6 (0.7500) | 0.5500 | 0.2750 | 0.3750 |"
+        in markdown
+    )
+
+
+def test_main_rich_detail_writes_one_file_per_doi(monkeypatch, tmp_path: Path) -> None:
+    _isolate_detail_lookups(monkeypatch, tmp_path)
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    rows = [
+        make_eval_row("d1", "openai", judge="anthropic"),
+        make_eval_row("d2", "openai", judge="anthropic"),
+    ]
+    evaluations_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+    )
+    results_dir = tmp_path / "results"
+
+    result = main([
+        "--evaluations", str(evaluations_path),
+        "--results-dir", str(results_dir),
+        "--rich-detail",
+    ])
+
+    assert result == 0
+    rich_dir = results_dir / "detail_rich"
+    d1_text = (rich_dir / "d1.md").read_text(encoding="utf-8")
+    assert (rich_dir / "d2.md").exists()
+    assert "Cross-judge agreement" in d1_text
+    assert "### Judge: anthropic" in d1_text
+    assert "Factual Accuracy" in d1_text
+    # --rich-detail works standalone, without --markdown, and does not touch
+    # the legacy bundled detail file.
+    assert not (results_dir / "detail").exists()
+
+
+def test_main_rich_detail_combines_with_markdown(monkeypatch, tmp_path: Path) -> None:
+    _isolate_detail_lookups(monkeypatch, tmp_path)
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    evaluations_path.write_text(
+        json.dumps(make_eval_row("d1", "openai", judge="anthropic")) + "\n",
+        encoding="utf-8",
+    )
+    results_dir = tmp_path / "results"
+
+    result = main([
+        "--evaluations", str(evaluations_path),
+        "--results-dir", str(results_dir),
+        "--markdown",
+        "--rich-detail",
+    ])
+
+    assert result == 0
+    assert (results_dir / "detail_rich" / "d1.md").exists()
+    ts_dirs = sorted((results_dir / "detail").glob("eval_report_*_detail.md"))
+    assert len(ts_dirs) == 1
 
 
 def _human_review_row(item_id: str, doi: str, human: float, jury: float) -> dict:
@@ -593,3 +728,106 @@ def test_count_dry_run_rows(tmp_path) -> None:
     _write_ledger(ledger, [_mock_eval_row(), _mock_eval_row(), _real_eval_row()])
 
     assert eval_report.count_dry_run_rows(ledger) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase A2/A3: cache-token hit rate — absent-vs-zero (verification #7)
+# ---------------------------------------------------------------------------
+
+def test_compute_cache_summary_excludes_absent_rows_not_counted_as_miss() -> None:
+    """A row with no cache_read_input_tokens key at all (pre-caching row)
+    must be excluded from the hit-rate math entirely — NOT counted as a
+    miss (which would silently drag the rate down for no real reason)."""
+    rows = [
+        make_eval_row("10.1/pre", "openai", input_tokens=1000),  # no cache fields at all
+        make_eval_row("10.1/post", "openai", input_tokens=1000,
+                      cache_read_input_tokens=800, cache_creation_input_tokens=0),
+    ]
+    summary = compute_cache_summary(rows)
+    assert summary["available"] is True
+    assert summary["n_rows_with_cache_data"] == 1
+    assert summary["n_rows_excluded_pre_caching"] == 1
+    # Hit rate computed ONLY over the one row with real cache data: 800/1000.
+    assert summary["hit_rate"] == 0.8
+    assert summary["input_tokens"] == 1000
+    assert summary["cache_read_input_tokens"] == 800
+
+
+def test_compute_cache_summary_zero_is_a_counted_miss_not_excluded() -> None:
+    """An explicit 0 (caching attempted, this call missed) IS counted —
+    distinct from the absent case above."""
+    rows = [
+        make_eval_row("10.1/a", "openai", input_tokens=500,
+                      cache_read_input_tokens=0, cache_creation_input_tokens=500),
+    ]
+    summary = compute_cache_summary(rows)
+    assert summary["n_rows_with_cache_data"] == 1
+    assert summary["n_rows_excluded_pre_caching"] == 0
+    assert summary["hit_rate"] == 0.0
+
+
+def test_compute_cache_summary_unavailable_when_every_row_predates_caching() -> None:
+    rows = [make_eval_row("10.1/a", "openai"), make_eval_row("10.1/b", "openai")]
+    summary = compute_cache_summary(rows)
+    assert summary["available"] is False
+    assert summary["n_rows_excluded_pre_caching"] == 2
+
+
+def test_compute_cache_summary_empty_rows() -> None:
+    summary = compute_cache_summary([])
+    assert summary["available"] is False
+
+
+# ---------------------------------------------------------------------------
+# Phase A1/B3: mixed-provenance warnings
+# ---------------------------------------------------------------------------
+
+def test_detect_mixed_provenance_empty_for_uniform_corpus() -> None:
+    rows = [
+        make_eval_row("10.1/a", "openai", judge="anthropic",
+                      judge_prompt_shape="segmented_v1", judge_model_version="claude-x"),
+        make_eval_row("10.1/b", "openai", judge="anthropic",
+                      judge_prompt_shape="segmented_v1", judge_model_version="claude-x"),
+    ]
+    assert detect_mixed_provenance(rows) == []
+
+
+def test_detect_mixed_provenance_flags_mixed_judge_prompt_shape() -> None:
+    rows = [
+        make_eval_row("10.1/a", "openai", judge_prompt_shape="segmented_v1"),
+        make_eval_row("10.1/b", "openai"),  # absent — pre-change row
+    ]
+    warnings = detect_mixed_provenance(rows)
+    assert len(warnings) == 1
+    assert "judge_prompt_shape" in warnings[0]
+
+
+def test_detect_mixed_provenance_flags_mixed_judge_model_version() -> None:
+    rows = [
+        make_eval_row("10.1/a", "openai", judge="anthropic", judge_model_version="claude-old"),
+        make_eval_row("10.1/b", "openai", judge="anthropic", judge_model_version="claude-new"),
+    ]
+    warnings = detect_mixed_provenance(rows)
+    assert len(warnings) == 1
+    assert "anthropic" in warnings[0]
+    assert "model_version" in warnings[0]
+
+
+def test_detect_mixed_provenance_reports_both_warnings_independently() -> None:
+    rows = [
+        make_eval_row("10.1/a", "openai", judge="anthropic",
+                      judge_prompt_shape="segmented_v1", judge_model_version="claude-old"),
+        make_eval_row("10.1/b", "openai", judge="anthropic",
+                      judge_model_version="claude-new"),  # absent shape + different version
+    ]
+    warnings = detect_mixed_provenance(rows)
+    assert len(warnings) == 2
+
+
+def test_build_report_carries_cache_and_provenance_keys() -> None:
+    """build_report() always exposes 'cache' and 'provenance_warnings', even
+    for a uniform, pre-caching corpus (self-describing, like 'reliability')."""
+    rows = [make_eval_row("10.1/a", "openai")]
+    report = build_report(rows)
+    assert "cache" in report and report["cache"]["available"] is False
+    assert report["provenance_warnings"] == []

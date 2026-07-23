@@ -136,6 +136,8 @@ Non-negotiable. Three structural guarantees:
 2. The forbidden-token check `BLIND_FORBIDDEN_TOKENS = ("openai", "anthropic", "gemini", "gpt", "claude", "chatgpt")` is asserted against the rendered prompt by `test_blind_judge_prompt_contains_no_model_identifiers` in `tests/test_evaluator.py`.
 3. The judge's own model name is logged in `data/evaluations.jsonl` only as `judge_model_version` — never re-injected into a subsequent judge call.
 
+`build_judge_prompt` is a thin wrapper around `build_judge_prompt_segments(reference_text, candidate_summary, ...)`, which returns the rubric, reference, and candidate as three separate strings instead of one flat block. Every real judge call — real-time and batch, all three providers — sends them as separate message parts (Anthropic: rubric as its own `system` block, reference+candidate as two content blocks in the user message; OpenAI: rubric as a `system` message, reference+candidate as the `user` message; Gemini: three ordered `contents[0].parts[]` entries). This segmentation is unconditional and identity-blind either way — it's a prompt-shape change, not a caching mechanism (see [batch_mode.md](batch_mode.md#prompt-caching-judgeevaluate-batch-jobs-only) for how `PROMPT_CACHE_ENABLED` builds on top of it). Rows written after this landed carry `judge_prompt_shape: "segmented_v1"` in `data/evaluations.jsonl`; older rows have no such field.
+
 ## Parsing the judge response
 
 Tried in order:
@@ -144,6 +146,8 @@ Tried in order:
 2. **First balanced `{...}` block** if the response wraps the JSON in conversational text (e.g. "Sure! Here is..." prefix).
 3. **Regex fallback** on `quality_score:`, `hallucination_count:`, etc.
 4. **`SCORE_SENTINEL_MALFORMED = 99`** — the row is written with `requires_human_review=True` so a human can adjudicate in Phase 5.
+
+`parse_method` records which of these succeeded: `"json"` for a clean parse, or `"json_repaired"` when `_repair_trailing_repetition_glitch` had to intervene first (same score data either way — this just keeps an audit trail of which rows needed the repair).
 
 `requires_human_review` also fires when `confidence_score < 3`.
 

@@ -40,10 +40,30 @@ This script polls OpenAI/Anthropic and downloads real batch results, so it is a 
 
 ```powershell
 python llm-sum/check_batch_status.py                # poll, merge, exit
-python llm-sum/check_batch_status.py --no-download   # only print statuses; do not download or merge
+python llm-sum/check_batch_status.py --no-download   # only print statuses; never download, merge, or resolve anything
 ```
 
+`--no-download` `continue`s immediately after printing each job's status
+(`poll_all(download_when_complete=False)`), before the terminal-failure
+handling below runs — so it also skips the automatic dead-job pending-slot
+reset described in "Behaviour by job state", not just the download/merge step.
+
 There is no `--mode` flag because the script ignores the active mode by design.
+
+### Before running: confirm the provider SDKs are installed
+
+This script imports `openai`, `anthropic`, and `google.genai` at the top of
+the file to poll each provider. If any is missing you'll get a
+`ModuleNotFoundError` before a single network call happens — see the
+"Common errors and fixes" table below. In the same PowerShell session:
+
+```powershell
+python -m pip install -r requirements.txt
+# or, to target just the three provider SDKs:
+python -m pip install openai anthropic google-genai
+
+python -c "import openai, anthropic; from google import genai; print('ok')"
+```
 
 ## Behaviour by job state
 
@@ -65,6 +85,7 @@ for the failure this fixed.
 
 | Symptom                                            | Cause                                                                | Fix                                                                                       |
 |----------------------------------------------------|----------------------------------------------------------------------|-------------------------------------------------------------------------------------------|
+| `ModuleNotFoundError: No module named 'openai'` (or `'anthropic'`, `'google.genai'`) | This script imports all three provider SDKs to poll each batch, and one isn't installed in the currently active venv — a fresh/incomplete venv, or a different `python`/`pip` than the one you activated. Not a bad batch ID or API-key issue; Python can't find the libraries before it talks to any API. | `python -m pip install -r requirements.txt` (or targeted: `python -m pip install openai anthropic google-genai`), then verify with `python -c "import openai, anthropic; from google import genai; print('ok')"` — confirm it's the same interpreter with `python -c "import sys; print(sys.executable)"`. Full writeup: [batch_mode.md](batch_mode.md#problem-6-check_batch_statuspy-fails-immediately-with-modulenotfounderror). |
 | `No batch jobs found at data/batch_jobs.jsonl`     | No batches have been submitted yet.                                  | Run `python llm-sum/run_phase3.py summarize` with `PHASE3_MODE=batch` first.              |
 | Status stays `in_progress` for >24h                | Provider batch backlog (rare).                                       | Check the provider's status page; rerun the polling script periodically.                  |
 | `failed` status with `error: rate_limited`         | Submission was too large for the batch endpoint at that moment.      | Resubmit by re-running `summarize`; resume picks up only the unsuccessful slots.          |

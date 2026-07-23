@@ -26,6 +26,7 @@ from pathlib import Path
 from batch_utils import (  # noqa: E402
     BATCH_JOBS_PATH,
     SUMMARIES_PATH,
+    _read_cached_text,
     load_batch_jobs,
     parse_anthropic_result_line,
     parse_gemini_result_line,
@@ -33,7 +34,7 @@ from batch_utils import (  # noqa: E402
     parse_evaluation_custom_id,
     safe_job_id_for_path,
 )
-from models_config import compute_cost  # noqa: E402
+from models_config import compute_cost, PROMPT_CACHE_TTL  # noqa: E402
 from utils import BudgetGuard, log_error  # noqa: E402
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
@@ -288,6 +289,9 @@ def _batch_result_cost(provider: str, parsed: dict) -> float:
         int(parsed.get("input_tokens") or 0),
         int(parsed.get("output_tokens") or 0),
         batched=True,
+        cache_read_tokens=int(parsed.get("cache_read_input_tokens") or 0),
+        cache_write_tokens=int(parsed.get("cache_creation_input_tokens") or 0),
+        cache_ttl=PROMPT_CACHE_TTL,
     )
 
 
@@ -400,20 +404,40 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
     output has the same schema as real-time evaluations: quality_score,
     requires_human_review, parse_method, confidence_score, etc. are all set.
 
+    Also builds ``strata`` (species/study_design/clinical_topic/journal) the
+    same way the real-time path (eval_instances.iter_evaluation_instances)
+    does, via the same build_strata()/load_manifest_index() helpers — this
+    function used to omit strata entirely, silently leaving every batch-
+    merged row's stratified breakdowns unpopulated (eval_report's "By
+    Journal"/"By Species"/etc. tables would show it as "(no metadata)")
+    even though the journal/species/etc. were sitting right there in
+    summaries.jsonl and manifest.jsonl the whole time.
+
     ``guard`` records the real cost of each merged judge result — see
     _charge_batch_result for why merge time is where batch spend is booked.
     """
     # Imported inside the function to avoid a circular import at module load.
     from evaluator import build_evaluation_row, append_evaluation  # noqa: E402
+    from eval_instances import build_strata, load_manifest_index  # noqa: E402
 
     guard = guard if guard is not None else BudgetGuard()
 
     parser = _RESULT_PARSERS[provider]
     summaries = _load_summaries()
     custom_id_to_key = _build_custom_id_to_key(summaries)
+    manifest_index = load_manifest_index()
 
     merged = 0
     run_cost = 0.0
+    # Cache-token totals across this merge, so the pilot's own hit rate is
+    # visible right here with no extra tooling (Phase A3) — summed from
+    # whatever the result-line parser reported, which is None (not counted)
+    # on a pre-caching row and an explicit int (possibly 0) on any row
+    # produced by the current segmented-prompt code (see the "absent vs
+    # zero" note in build_evaluation_row).
+    run_cache_read = 0
+    run_cache_creation = 0
+    run_input_tokens = 0
     with open(result_path, encoding="utf-8") as in_f:
         for line in in_f:
             line = line.strip()
@@ -447,6 +471,9 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
             # not, and re-running would then duplicate the appended ones in an
             # append-only ledger.
             run_cost += _batch_result_cost(provider, parsed)
+            run_input_tokens += int(parsed.get("input_tokens") or 0)
+            run_cache_read += int(parsed.get("cache_read_input_tokens") or 0)
+            run_cache_creation += int(parsed.get("cache_creation_input_tokens") or 0)
 
             # The result line parsers reuse the "summary" field name for the
             # model's text output — for judge results that is the raw JSON
@@ -456,29 +483,47 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
                 "input_tokens": parsed.get("input_tokens", 0),
                 "output_tokens": parsed.get("output_tokens", 0),
                 "model_version": parsed.get("model_version", ""),
+                "cache_read_input_tokens": parsed.get("cache_read_input_tokens"),
+                "cache_creation_input_tokens": parsed.get("cache_creation_input_tokens"),
+                "judge_prompt_shape": parsed.get("judge_prompt_shape"),
             }
 
             entry = summaries[summary_key]
             doi = str(entry.get("doi", "")).strip()
             input_source = str(entry.get("input_source") or "processed")
             candidate_summary = (entry.get("models") or {}).get(summariser, {}).get("summary", "")
+            manifest_record = manifest_index.get(doi, {})
+            strata = build_strata(entry, manifest_record)
+            # NOT stored raw in the output row (build_evaluation_row only keeps
+            # the computed automatic_metrics dict) — but it IS needed as input
+            # to that computation. Passing "" here used to silently zero out
+            # every ROUGE/compression/coverage stat for every batch-merged row
+            # (a blank reference makes ROUGE recall mathematically always 0),
+            # since calculate_automatic_metrics() has no other source for the
+            # article text. Same cached-text lookup run_batch_evaluation()
+            # already uses when it first builds the judge request.
+            reference_text = _read_cached_text(entry) or ""
 
             row = build_evaluation_row(
                 doi=doi,
                 summariser=summariser,
                 judge=judge,
                 input_source=input_source,
-                reference_text="",   # not stored in the output row — safe to omit
+                reference_text=reference_text,
                 candidate_summary=candidate_summary,
                 judge_response=judge_response,
+                strata=strata,
             )
             # Pass path explicitly so tests can redirect by monkeypatching
             # check_batch_status.EVALUATIONS_PATH without touching evaluator's module state.
             append_evaluation(row, EVALUATIONS_PATH)
             merged += 1
 
+    hit_rate = (run_cache_read / run_input_tokens) if run_input_tokens else 0.0
     print(f"[phase3:batch] appended {merged} evaluations to {EVALUATIONS_PATH.name}"
-          f"  (batch cost ${run_cost:.4f})")
+          f"  (batch cost ${run_cost:.4f}, cache read={run_cache_read} "
+          f"write={run_cache_creation} tokens, hit_rate={hit_rate:.1%} of "
+          f"{run_input_tokens} input tokens)")
     # Charged only once every row is safely appended — see the note in
     # merge_summarisation_results for why the hard stop must not fire mid-loop.
     guard.add_cost(run_cost)

@@ -166,6 +166,15 @@ class RunManifest(BaseModel):
     judges: list[str]
     model_ids: dict[str, str] = Field(default_factory=dict)
     resolved_model_versions: dict[str, str] = Field(default_factory=dict)
+    # Model tier ("regular" | "premium") active for this run — see
+    # models_config.MODEL_TIER. Defaulted (not required) so a manifest
+    # written before Phase B still validates when re-read.
+    model_tier: str = "unknown"
+    # "segmented_v1" once the judge prompt is split into rubric/reference/
+    # candidate blocks on every path (see evaluator.JUDGE_PROMPT_SHAPE); None
+    # on a manifest written before that change. eval-report flags a corpus
+    # whose rows carry more than one shape — see eval_report.py.
+    judge_prompt_shape: str | None = None
 
     prompt_template_id: str
     prompt_path: str
@@ -198,6 +207,8 @@ def build_run_manifest(
     seed: int,
     evaluation_config: dict[str, Any],
     selected_instance_ids: list[str],
+    model_tier: str = "unknown",
+    judge_prompt_shape: str | None = None,
 ) -> RunManifest:
     """Build a run manifest with environment and dataset provenance.
 
@@ -205,6 +216,11 @@ def build_run_manifest(
     caller that forgets one gets an immediate ``TypeError``, and Pydantic
     re-validates types on top of that. This is the "fail fast" guarantee:
     there is no code path that produces a manifest silently missing a field.
+
+    ``model_tier``/``judge_prompt_shape`` default to "unknown"/None so
+    existing callers (and tests) that don't pass them keep working —
+    ``run_phase3.py``'s evaluate commands pass
+    ``models_config.MODEL_TIER``/``evaluator.JUDGE_PROMPT_SHAPE`` explicitly.
     """
     branch, sha = collect_git_metadata()
     return RunManifest(
@@ -225,6 +241,8 @@ def build_run_manifest(
         max_output_tokens=max_output_tokens,
         seed=seed,
         evaluation_config=evaluation_config,
+        model_tier=model_tier,
+        judge_prompt_shape=judge_prompt_shape,
     )
 
 

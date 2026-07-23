@@ -89,7 +89,14 @@ from typing import Any, Iterable
 
 # These lines import specific helper functions/classes from other files in
 # this same project (llm-sum/*.py), rather than a general Python toolkit.
-from models_config import compute_cost, get_model_spec  # noqa: E402
+from models_config import (  # noqa: E402
+    anthropic_cache_control,
+    compute_cost,
+    get_model_spec,
+    openai_prompt_cache_key,
+    PROMPT_CACHE_ENABLED,
+    PROMPT_CACHE_TTL,
+)
 from file_paths import doi_to_slug  # noqa: E402
 from utils import BudgetGuard, log_error, require_positive_budget_for_real_run, sleep_for_model  # noqa: E402
 from phase3_mode import ModeProfile, resolve_mode, VALID_MODES  # noqa: E402
@@ -194,6 +201,15 @@ def resolve_judges(cli_judges: str | None = None, *, jury: bool = False) -> list
 BENCHMARK_NAME = os.getenv("EVAL_BENCHMARK_NAME", "vet_lit_summary_medhelm")
 RUBRIC_VERSION = os.getenv("EVAL_RUBRIC_VERSION", "vet_medhelm_score_v1.0")
 EVALUATOR_VERSION = os.getenv("EVALUATOR_VERSION", "evaluator-medhelm-v1.0")
+
+# Stamped onto every evaluations.jsonl row written by the current code (batch
+# and real-time alike): the judge prompt is split into rubric/reference/
+# candidate blocks (see build_judge_prompt_segments below) on every path, a
+# one-way prompt-shape change landed deliberately before caching was ever
+# turned on. ABSENT on a row means "written before this change" — a pre-
+# existing study corpus should not be pooled with new rows under this value;
+# see docs/phase3/medhelm_evaluation.md and eval_report.py's mixed-shape check.
+JUDGE_PROMPT_SHAPE = "segmented_v1"
 
 # A "dict" (dictionary, the curly-brace notation below) is like a lookup
 # table: you give it a key (here, a criterion name such as "faithfulness")
@@ -307,6 +323,45 @@ def load_judge_prompt(prompt_file: Path = JUDGE_PROMPT_FILE) -> str:
     return template
 
 
+def build_judge_prompt_segments(reference_text: str, candidate_summary: str,
+                                template: str | None = None) -> tuple[str, str, str]:
+    """
+    IN PLAIN ENGLISH: Same rendering as build_judge_prompt below, but instead
+    of gluing everything into one long string, this hands back the three
+    pieces separately: the fixed rubric instructions, the reference article
+    text, and the candidate summary. Splitting it this way lets each judge
+    call put the rubric in a "system" slot and the reference text in its own
+    block — the shape prompt caching needs — without changing a single word
+    of what the judge actually reads.
+
+    Return (rubric_prefix, reference_block, candidate_block), split on the
+    two placeholders {REFERENCE_TEXT} and {CANDIDATE_SUMMARY} that
+    load_judge_prompt() already validates as present, in that fixed order
+    (Finding A: the shipped rubric already puts rubric -> reference ->
+    candidate, so no reordering is needed here, only splitting).
+
+    Any template text between/after the two placeholders (e.g. the
+    "Candidate Summary:" label between them, or trailing whitespace after the
+    last one) is folded into the reference_block/candidate_block segment that
+    precedes it, so the three segments joined back together reproduce the
+    exact same string build_judge_prompt() returns — see
+    test_evaluator.py's segment-invariant test.
+    """
+    tmpl = template if template is not None else load_judge_prompt()
+    ref_marker = "{REFERENCE_TEXT}"
+    cand_marker = "{CANDIDATE_SUMMARY}"
+    ref_idx = tmpl.index(ref_marker)
+    cand_idx = tmpl.index(cand_marker)
+
+    rubric_prefix = tmpl[:ref_idx]
+    between = tmpl[ref_idx + len(ref_marker):cand_idx]
+    suffix = tmpl[cand_idx + len(cand_marker):]
+
+    reference_block = reference_text + between
+    candidate_block = candidate_summary + suffix
+    return rubric_prefix, reference_block, candidate_block
+
+
 def build_judge_prompt(reference_text: str, candidate_summary: str,
                        template: str | None = None) -> str:
     """
@@ -318,11 +373,13 @@ def build_judge_prompt(reference_text: str, candidate_summary: str,
     summariser name is deliberately NOT a parameter — keeping it out of the
     signature makes the blind protocol enforceable by code review and by
     the dedicated unit test that scans the rendered output.
+
+    A thin join over build_judge_prompt_segments()'s three pieces — one
+    source of truth for the rendered text, whether a caller wants it as one
+    string (this function; used by anything that doesn't need cache
+    boundaries) or as separate blocks (segmented judge calls below).
     """
-    tmpl = template if template is not None else load_judge_prompt()
-    return (tmpl
-            .replace("{REFERENCE_TEXT}", reference_text)
-            .replace("{CANDIDATE_SUMMARY}", candidate_summary))
+    return "".join(build_judge_prompt_segments(reference_text, candidate_summary, template))
 
 
 # ---------------------------------------------------------------------------
@@ -630,21 +687,71 @@ def _normalize_criteria_scores(raw_scores: Any) -> dict[str, dict[str, Any]]:
     return normalized
 
 
-def _try_parse_json_block(text: str) -> dict | None:
+def _repair_trailing_repetition_glitch(candidate: str) -> str | None:
+    """
+    Recover from an observed judge-response corruption: after the properly
+    closed "reasoning" string value (always the LAST top-level key in every
+    schema this project's judge prompts use), the model sometimes echoes a
+    bare, unquoted fragment of the text it just generated — occasionally
+    several cascading repeats — before finally emitting the closing brace.
+    The score data itself is complete and correct; only this trailing
+    artifact breaks JSON syntax, so the fallback below (regex over legacy
+    fields only) can't rescue a MedHELM response damaged this way — it goes
+    straight to the malformed-sentinel path even though a valid judgment
+    exists.
+
+    Confirmed directly against real batch results (see project history —
+    ~half the "malformed" rows in one Gemini judge batch were this exact
+    pattern, e.g. a "reasoning" value followed by
+    '\\nreference study."\\n}' or several repeated fragments before '}').
+
+    Locates "reasoning"'s real closing quote (respecting \\" escaping, so an
+    escaped quote inside the reasoning text itself isn't mistaken for the
+    end), discards everything between that quote and the object's close, and
+    reattaches a single closing brace — "reasoning" is always a top-level
+    key here, so exactly one is needed. Returns the repaired string, or None
+    if no "reasoning" key is found (nothing to repair).
+
+    NOTE: every per-criterion object ALSO has its own "reasoning" sub-field
+    (e.g. "faithfulness": {"score": 5, "reasoning": "..."}), so this must
+    match the LAST occurrence of the key in the text — the top-level one —
+    not the first, which would land inside "faithfulness" and corrupt
+    everything after it.
+    """
+    matches = list(re.finditer(r'"reasoning"\s*:\s*"', candidate))
+    if not matches:
+        return None
+    i = matches[-1].end()
+    while i < len(candidate):
+        if candidate[i] == "\\":
+            i += 2
+            continue
+        if candidate[i] == '"':
+            return candidate[:i + 1] + "}"
+        i += 1
+    return None  # no unescaped closing quote found — not this pattern
+
+
+def _try_parse_json_block(text: str) -> tuple[dict | None, bool]:
     """
     IN PLAIN ENGLISH: Tries to find and read the judge's answer as JSON (a
     structured, computer-friendly text format using {} and "quotes"), even if
     the AI wrapped it in extra chatty sentences like "Sure! Here's my
-    evaluation: {...}". Returns None (nothing) if no usable JSON is found
+    evaluation: {...}". Returns (None, False) if no usable JSON is found
     anywhere in the text.
 
     Try strict JSON parse, then a relaxed search for the first {...} block.
-    Returns None if no valid JSON object is found.
+    Returns (dict, was_repaired) — was_repaired is True only when
+    _repair_trailing_repetition_glitch had to intervene, so callers can mark
+    the row's parse_method as "json_repaired" instead of "json": the score
+    data is equally real either way, but this keeps an audit trail of which
+    rows needed the repair, distinguishing them from a clean first-try parse
+    without requiring anyone to diff raw_response_excerpt by hand.
     """
     text = text.strip()
     # First, the easy case: maybe the whole response IS valid JSON already.
     try:
-        return json.loads(text)
+        return json.loads(text), False
     except json.JSONDecodeError:
         pass
 
@@ -665,11 +772,31 @@ def _try_parse_json_block(text: str) -> dict | None:
                 if depth == 0:
                     candidate = text[start:i + 1]
                     try:
-                        return json.loads(candidate)
+                        return json.loads(candidate), False
                     except json.JSONDecodeError:
+                        repaired = _repair_trailing_repetition_glitch(candidate)
+                        if repaired is not None:
+                            try:
+                                return json.loads(repaired), True
+                            except json.JSONDecodeError:
+                                pass
                         break
+        else:
+            # The loop ran to the end of the text without depth ever
+            # reaching 0 — no closing brace at all. Observed cause: the
+            # same trailing-repetition glitch _repair_trailing_repetition_glitch
+            # targets, but severe enough that the model never emitted the
+            # final "}" — it just trails off after repeating fragments of
+            # its own "reasoning" text. Try the same repair over everything
+            # from this opening brace to the end of the response.
+            repaired = _repair_trailing_repetition_glitch(text[start:])
+            if repaired is not None:
+                try:
+                    return json.loads(repaired), True
+                except json.JSONDecodeError:
+                    pass
         start = text.find("{", start + 1)
-    return None
+    return None, False
 
 
 # A "regular expression" (or "regex", built with re.compile) is a pattern
@@ -720,7 +847,9 @@ def parse_judge_response(raw_text: str) -> dict:
     # Step 1: try to read the response as JSON at all (see
     # _try_parse_json_block above). `obj` will be a dict if this worked, or
     # None if the text wasn't JSON-shaped in any recognisable way.
-    obj = _try_parse_json_block(raw_text)
+    # `was_repaired` is True only when the trailing-repetition-glitch repair
+    # had to run — see the "json_repaired" parse_method below.
+    obj, was_repaired = _try_parse_json_block(raw_text)
 
     if isinstance(obj, dict) and "criteria_scores" in obj:
         # --- Path 1a: MedHELM-style schema (the current, expected format) ---
@@ -764,7 +893,7 @@ def parse_judge_response(raw_text: str) -> dict:
             "confidence_score": confidence,
             "reasoning": str(obj.get("reasoning", "")),
             "quality_score": scale_jury_to_quality_score(jury_score),
-            "parse_method": "json",
+            "parse_method": "json_repaired" if was_repaired else "json",
         }
 
     if isinstance(obj, dict) and "factual_accuracy" in obj:
@@ -799,7 +928,7 @@ def parse_judge_response(raw_text: str) -> dict:
             "reasoning": str(obj.get("reasoning", "")),
             # quality_score kept for backward compat with any Phase 5 code
             "quality_score": round(composite),
-            "parse_method": "json",
+            "parse_method": "json_repaired" if was_repaired else "json",
         }
 
     if isinstance(obj, dict) and "quality_score" in obj:
@@ -823,7 +952,7 @@ def parse_judge_response(raw_text: str) -> dict:
             "hallucination_categories": list(obj.get("hallucination_categories") or []),
             "confidence_score": confidence,
             "reasoning": str(obj.get("reasoning", "")),
-            "parse_method": "json",
+            "parse_method": "json_repaired" if was_repaired else "json",
         }
 
     # --- Step 2: none of the JSON paths above matched (obj was None, or a
@@ -977,7 +1106,7 @@ def _mock_judge_response(provider: str, reference_text: str,
     different summaries get different (but reproducible) scores. Returns
     the MedHELM schema so dry-run/test mode exercises the default parse path.
     """
-    spec = get_model_spec(provider)
+    spec = get_model_spec(provider, role="judge")
     h_cand = _stable_hash_int(candidate_summary)
     h_ref  = _stable_hash_int(reference_text)
     # Criterion scores: deterministic, spread across 1-5 so dry-run exercises
@@ -1009,6 +1138,14 @@ def _mock_judge_response(provider: str, reference_text: str,
         "input_tokens": max(200, len(reference_text) // 4),
         "output_tokens": 120,
         "model_version": f"{spec.model_id}{DRY_RUN_MODEL_SUFFIX}",
+        # Mock rows run through the current (post-A1/A2) code path, so they
+        # carry explicit zero cache counts (no caching happens in dry-run)
+        # rather than an absent field — absence is reserved for rows written
+        # before this code existed at all. See "Absent vs zero" in
+        # docs/phase3/eval_report.md.
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "judge_prompt_shape": JUDGE_PROMPT_SHAPE,
     }
 
 
@@ -1098,23 +1235,29 @@ def is_production_path(candidate: Path | None, canonical: Path) -> bool:
 
 def call_judge(provider: str, reference_text: str, candidate_summary: str,
                *, prompt_template: str | None = None,
-               max_retries: int = 3) -> dict:
+               max_retries: int = 3, article_id: str | None = None) -> dict:
     """
     IN PLAIN ENGLISH: The single entry point for asking one specific judge
     ("openai", "anthropic", or "gemini") to grade one summary. In dry-run
     mode it calls the fake mock instead. On a real run, it builds the blind
-    prompt, sends it to the right provider's function below, and retries a
-    few times (waiting a little longer each time) if something goes wrong
-    before finally giving up and raising an error.
+    prompt (split into rubric/reference/candidate blocks — see
+    build_judge_prompt_segments), sends it to the right provider's function
+    below, and retries a few times (waiting a little longer each time) if
+    something goes wrong before finally giving up and raising an error.
 
     Call a judge model and return the raw text + token + version metadata.
     Parsing happens in a separate step so failed parses can still log the
     raw text for inspection.
+
+    ``article_id`` (typically a DOI slug) is only used when
+    PROMPT_CACHE_KEY_SCOPE=article — it lets OpenAI's optional
+    prompt_cache_key route one paper's three judgments together. Harmless to
+    omit; see models_config.openai_prompt_cache_key.
     """
     if _is_dry_run():
         return _mock_judge_response(provider, reference_text, candidate_summary)
 
-    user_message = build_judge_prompt(reference_text, candidate_summary, prompt_template)
+    segments = build_judge_prompt_segments(reference_text, candidate_summary, prompt_template)
 
     last_error: Exception | None = None
     # Try up to `max_retries` times. Real API calls sometimes fail for
@@ -1123,11 +1266,11 @@ def call_judge(provider: str, reference_text: str, candidate_summary: str,
     for attempt in range(max_retries):
         try:
             if provider == "openai":
-                return _call_judge_openai(user_message)
+                return _call_judge_openai(segments, article_id=article_id)
             if provider == "anthropic":
-                return _call_judge_anthropic(user_message)
+                return _call_judge_anthropic(segments)
             if provider == "gemini":
-                return _call_judge_gemini(user_message)
+                return _call_judge_gemini(segments)
             raise ValueError(f"Unknown judge provider '{provider}'")
         except Exception as exc:
             last_error = exc
@@ -1147,13 +1290,42 @@ def call_judge(provider: str, reference_text: str, candidate_summary: str,
 # job — send the judge prompt, get back the AI's raw text answer plus how
 # many "tokens" (word-pieces) were used — just with each provider's own
 # function names and response shape.
-def _call_judge_openai(user_message: str) -> dict:
+def _openai_cached_tokens(usage: Any) -> int | None:
+    """Return usage.prompt_tokens_details.cached_tokens, or None if absent.
+
+    ``prompt_tokens`` already includes cached tokens (OpenAI does not split
+    them out of the total) — this is reported alongside, never re-added.
+    Accepts both the SDK's typed usage object and a plain dict (batch results
+    downloaded as raw JSON use the latter).
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None and isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details")
+    if details is None:
+        return None
+    cached = getattr(details, "cached_tokens", None)
+    if cached is None and isinstance(details, dict):
+        cached = details.get("cached_tokens")
+    return int(cached) if cached is not None else None
+
+
+def _call_judge_openai(segments: tuple[str, str, str], *,
+                       article_id: str | None = None) -> dict:
     import openai  # type: ignore[import-not-found]
-    spec = get_model_spec("openai")
+    spec = get_model_spec("openai", role="judge")
+    rubric_prefix, reference_block, candidate_block = segments
     client = openai.OpenAI()
-    response = client.chat.completions.create(
+    # Segmented on every path (Phase A1): rubric goes in its own "system"
+    # message, reference+candidate stay together in "user" — OpenAI has no
+    # cache_control marker to place, it caches automatically above ~1024
+    # tokens, so this split exists for consistency with the other two
+    # providers' block layout, not to enable caching itself.
+    request_kwargs: dict[str, Any] = dict(
         model=spec.model_id,
-        messages=[{"role": "user", "content": user_message}],
+        messages=[
+            {"role": "system", "content": rubric_prefix},
+            {"role": "user", "content": reference_block + candidate_block},
+        ],
         temperature=TEMPERATURE,
         # Newer reasoning-capable OpenAI models (e.g. gpt-5.x) reject the
         # older `max_tokens` name and require `max_completion_tokens`
@@ -1164,37 +1336,72 @@ def _call_judge_openai(user_message: str) -> dict:
         # conversational response is unstable across providers and versions.
         response_format={"type": "json_object"},
     )
+    # PROMPT_CACHE_ENABLED toggles ONLY this key — a routing hint, not a
+    # scoring or block-structure change (Phase A3).
+    if PROMPT_CACHE_ENABLED:
+        request_kwargs["prompt_cache_key"] = openai_prompt_cache_key(article_id)
+
+    response = client.chat.completions.create(**request_kwargs)
     return {
         "raw_text": response.choices[0].message.content or "",
         "input_tokens": int(response.usage.prompt_tokens),
         "output_tokens": int(response.usage.completion_tokens),
         "model_version": str(response.model),
         "system_fingerprint": getattr(response, "system_fingerprint", None),
+        "cache_read_input_tokens": _openai_cached_tokens(response.usage),
+        # OpenAI does not report a separate cache-write token count.
+        "cache_creation_input_tokens": None,
+        "judge_prompt_shape": JUDGE_PROMPT_SHAPE,
     }
 
 
 # Sends the judge prompt to Anthropic's Claude API and returns its answer.
-def _call_judge_anthropic(user_message: str) -> dict:
+def _call_judge_anthropic(segments: tuple[str, str, str]) -> dict:
     import anthropic  # type: ignore[import-not-found]
-    spec = get_model_spec("anthropic")
+    spec = get_model_spec("anthropic", role="judge")
+    rubric_prefix, reference_block, candidate_block = segments
     client = anthropic.Anthropic()
+
+    # Segmented on every path (Phase A1): rubric in its own system block,
+    # reference and candidate as two separate content blocks in the one user
+    # message. Cache markers (Phase A3, flag-gated) go on the system block
+    # and the reference block ONLY — never on the candidate block, which is
+    # unique to this call and would never be re-read from cache anyway.
+    system_block: dict[str, Any] = {"type": "text", "text": rubric_prefix}
+    reference_content_block: dict[str, Any] = {"type": "text", "text": reference_block}
+    candidate_content_block: dict[str, Any] = {"type": "text", "text": candidate_block}
+    if PROMPT_CACHE_ENABLED:
+        marker = anthropic_cache_control()
+        system_block["cache_control"] = marker
+        reference_content_block["cache_control"] = marker
+
     response = client.messages.create(
         model=spec.model_id,
         max_tokens=MAX_OUTPUT_TOKENS,
         temperature=TEMPERATURE,
-        messages=[{"role": "user", "content": user_message}],
+        system=[system_block],
+        messages=[{"role": "user", "content": [reference_content_block, candidate_content_block]}],
     )
     text = "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
+    usage = response.usage
+    # Anthropic's usage.input_tokens is the UNCACHED remainder only — total
+    # input is the sum of all three (Finding C). Always present (0 when no
+    # caching happened), so this is never None for a real call.
+    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    cache_creation = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
     return {
         "raw_text": text,
-        "input_tokens": int(response.usage.input_tokens),
-        "output_tokens": int(response.usage.output_tokens),
+        "input_tokens": int(usage.input_tokens) + cache_read + cache_creation,
+        "output_tokens": int(usage.output_tokens),
         "model_version": str(response.model),
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+        "judge_prompt_shape": JUDGE_PROMPT_SHAPE,
     }
 
 
 # Sends the judge prompt to Google's Gemini API and returns its answer.
-def _call_judge_gemini(user_message: str) -> dict:
+def _call_judge_gemini(segments: tuple[str, str, str]) -> dict:
     # This loads the Gemini library by name at runtime (rather than a normal
     # `import` line at the top of the file) so the rest of this file — and
     # every test that doesn't touch Gemini — still works even if that
@@ -1209,11 +1416,23 @@ def _call_judge_gemini(user_message: str) -> dict:
             "virtual environment. Run: python -m pip install -r requirements.txt"
         ) from exc
 
-    spec = get_model_spec("gemini")
+    spec = get_model_spec("gemini", role="judge")
+    rubric_prefix, reference_block, candidate_block = segments
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    # Segmented on every path (Phase A1): three parts in segment order,
+    # matching batch_utils.build_gemini_batch_request exactly (verification
+    # item 3: batch and real-time carry the same segments in the same order).
+    # Deliberately plain contents[0].parts[], not systemInstruction — prefix
+    # ordering is what implicit caching keys on, and parts give that without
+    # touching the riskier config shape (see build_gemini_batch_request's
+    # docstring on the batch REST request's "no such field: 'config'" history).
     response = client.models.generate_content(
         model=spec.model_id,
-        contents=user_message,
+        contents=[{"parts": [
+            {"text": rubric_prefix},
+            {"text": reference_block},
+            {"text": candidate_block},
+        ]}],
         config=types.GenerateContentConfig(
             temperature=TEMPERATURE,
             max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -1221,12 +1440,18 @@ def _call_judge_gemini(user_message: str) -> dict:
         ),
     )
     usage = response.usage_metadata
+    cached = getattr(usage, "cached_content_token_count", None)
     return {
         "raw_text": response.text or "",
+        # prompt_token_count already includes cached tokens — do not re-add.
         "input_tokens": int(usage.prompt_token_count),
         "output_tokens": int(usage.candidates_token_count),
         "model_version": spec.model_id,
         "system_fingerprint": None,
+        "cache_read_input_tokens": int(cached) if cached is not None else None,
+        # Gemini's implicit caching has no separate "write" step to report.
+        "cache_creation_input_tokens": None,
+        "judge_prompt_shape": JUDGE_PROMPT_SHAPE,
     }
 
 
@@ -1308,6 +1533,15 @@ def build_evaluation_row(*, doi: str, summariser: str, judge: str,
         "reasoning": parsed["reasoning"],
         "input_tokens": judge_response["input_tokens"],
         "output_tokens": judge_response["output_tokens"],
+        # Absent (None) means this judge_response predates cache-token
+        # accounting entirely — NOT that caching was attempted and missed
+        # (that case is an explicit 0). See docs/phase3/eval_report.md's
+        # "Absent vs zero" section; eval-report must not average the two.
+        "cache_read_input_tokens": judge_response.get("cache_read_input_tokens"),
+        "cache_creation_input_tokens": judge_response.get("cache_creation_input_tokens"),
+        # Absent means this row predates the segmented-prompt change
+        # (Phase A1) — see JUDGE_PROMPT_SHAPE above.
+        "judge_prompt_shape": judge_response.get("judge_prompt_shape"),
         "raw_response_excerpt": judge_response["raw_text"][:500],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1959,6 +2193,7 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                 response = call_judge(
                     judge, instance.reference_text, instance.candidate_summary,
                     prompt_template=prompt_template,
+                    article_id=doi_to_slug(instance.doi),
                 )
             except Exception as exc:
                 # A failed judge call for one pair should not stop the whole
@@ -1987,6 +2222,9 @@ def run_evaluation(*, judges: list[str] | None = None, resume: bool = True,
                 int(response["input_tokens"] or 0),
                 int(response["output_tokens"] or 0),
                 batched=False,
+                cache_read_tokens=int(response.get("cache_read_input_tokens") or 0),
+                cache_write_tokens=int(response.get("cache_creation_input_tokens") or 0),
+                cache_ttl=PROMPT_CACHE_TTL,
             )
             guard.add_cost(cost)
             score = row.get("jury_score") or row.get("quality_score")

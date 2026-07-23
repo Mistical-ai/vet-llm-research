@@ -49,7 +49,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from models_config import all_providers, get_model_spec  # noqa: E402
+from models_config import all_providers, get_model_spec, MODEL_TIER  # noqa: E402
 from phase3_mode import resolve_mode, VALID_MODES  # noqa: E402
 from run_manifest import (  # noqa: E402
     build_run_manifest,
@@ -740,14 +740,20 @@ def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]])
             judge_version = str(row.get("judge_model_version", ""))
             if judge_version:
                 judge_model_seen.add(judge_version)
-            # Approximate cost from token counts (display only)
+            # Approximate cost from token counts (display only). Batch is the
+            # default and near-universal path for judge calls in this
+            # project, so batched=True here — batched=False silently doubled
+            # this display versus the real, correctly-priced merge-time cost
+            # BudgetGuard actually tracks (see check_batch_status._batch_result_cost).
             try:
                 from models_config import compute_cost
                 cost = compute_cost(
                     judge,
                     int(row.get("input_tokens") or 0),
                     int(row.get("output_tokens") or 0),
-                    batched=False,
+                    batched=True,
+                    cache_read_tokens=int(row.get("cache_read_input_tokens") or 0),
+                    cache_write_tokens=int(row.get("cache_creation_input_tokens") or 0),
                 )
                 total_cost += cost
             except Exception:
@@ -759,7 +765,13 @@ def _print_reveal_table(doi_filter: set[str], journal_map: dict[str, list[str]])
     if judge_model_seen:
         print(f"  Judge model version(s): {', '.join(sorted(judge_model_seen))}")
     if total_cost > 0:
-        print(f"  Total cost this run: ${total_cost:.4f}")
+        # This sums every row currently on disk for the DOIs shown above —
+        # i.e. their full evaluation history, not just requests submitted in
+        # this invocation (a batch job's results aren't even back yet when
+        # this prints). "this run" in the label means "for the DOIs this run
+        # touched", not "billed by this run" — don't read it as a fresh charge.
+        print(f"  Total judged cost for the papers above (full history, "
+              f"not just this submission): ${total_cost:.4f}")
     print("=" * 68 + "\n")
 
 
@@ -778,7 +790,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # > JUDGE_MODELS. Default is the full 3-judge panel (openai,anthropic,gemini).
     judges = evaluator.resolve_judges(args.judges, jury=args.jury)
     active_judges = judges
-    model_ids = {j: get_model_spec(j).model_id for j in active_judges}
+    model_ids = {j: get_model_spec(j, role="judge").model_id for j in active_judges}
     if len(active_judges) > 1:
         print(f"[phase3:evaluate] jury of {len(active_judges)} judges: "
               f"{', '.join(active_judges)} (reliability stats will be reported)")
@@ -898,6 +910,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         seed=evaluator.SEED,
         evaluation_config=evaluation_config,
         selected_instance_ids=selected_instance_ids,
+        model_tier=MODEL_TIER,
+        judge_prompt_shape=evaluator.JUDGE_PROMPT_SHAPE,
     )
     manifest_path = RUN_MANIFEST_DIR / f"run_manifest_{manifest.run_id}.json"
     write_run_manifest(manifest, manifest_path)
@@ -937,8 +951,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 # as real batch jobs at 50% off; the rest (Gemini by default)
                 # still run real-time, in the same command. doi_filter (the
                 # journal-stratified sample computed above) applies to both.
-                batch_judges = [j for j in judges if get_model_spec(j).supports_batch]
-                realtime_judges = [j for j in judges if not get_model_spec(j).supports_batch]
+                batch_judges = [j for j in judges if get_model_spec(j, role="judge").supports_batch]
+                realtime_judges = [j for j in judges if not get_model_spec(j, role="judge").supports_batch]
                 counts = {"success": 0, "failed": 0, "skipped": 0}
                 if batch_judges:
                     from batch_utils import run_batch_evaluation
@@ -948,6 +962,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                         resume=not args.no_resume,
                         doi_filter=doi_filter,
                         force=args.force,
+                        max_new_requests=args.max_requests,
                     )
                 if realtime_judges:
                     print(f"[phase3:batch] real-time judges (batch disabled for these): "
@@ -1061,6 +1076,8 @@ def _cmd_evaluate_from_txt_folder(
         seed=evaluator.SEED,
         evaluation_config=evaluation_config,
         selected_instance_ids=dois,
+        model_tier=MODEL_TIER,
+        judge_prompt_shape=evaluator.JUDGE_PROMPT_SHAPE,
     )
     manifest_path = RUN_MANIFEST_DIR / f"run_manifest_{manifest.run_id}.json"
     write_run_manifest(manifest, manifest_path)
@@ -1255,6 +1272,8 @@ def _cmd_evaluate_from_dev_jsonl(
         seed=evaluator.SEED,
         evaluation_config=evaluation_config,
         selected_instance_ids=sorted(target_dois),
+        model_tier=MODEL_TIER,
+        judge_prompt_shape=evaluator.JUDGE_PROMPT_SHAPE,
     )
     manifest_path = RUN_MANIFEST_DIR / f"run_manifest_{manifest.run_id}.json"
     write_run_manifest(manifest, manifest_path)
@@ -1427,6 +1446,8 @@ def cmd_eval_report(args: argparse.Namespace) -> int:
         delegate.append("--markdown")
     if args.no_detail:
         delegate.append("--no-detail")
+    if args.rich_detail:
+        delegate.append("--rich-detail")
     if args.no_save:
         delegate.append("--no-save")
     if args.human_validation_mode is not None:
@@ -1848,6 +1869,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mode_arg(p_eval)
     p_eval.add_argument("--limit", type=int, default=None,
                         help="Override the mode's paper_limit.")
+    p_eval.add_argument("--max-requests", type=int, default=None,
+                        help="Batch mode only: cap how many NEW judge requests get "
+                             "queued PER JUDGE in this submission (not a cap on papers "
+                             "scanned). Use this to chunk a large remaining backlog "
+                             "safely under a provider's per-organization enqueued-token "
+                             "limit — OpenAI has been observed rejecting an entire batch "
+                             "outright ('token_limit_exceeded') above roughly 900,000 "
+                             "enqueued tokens for gpt-5.4, which for this project's judge "
+                             "prompts is on the order of 50-60 requests; see "
+                             "data/error_log.jsonl for confirmed past failures. Unlike "
+                             "--limit (a fixed-seed per-journal SAMPLE), this reflects "
+                             "live already_evaluated() state each call, so repeated runs "
+                             "with --resume (the default) progressively sweep through the "
+                             "backlog instead of resampling the same combinations.")
     p_eval.add_argument("--judges", default=None,
                         help="Comma-separated judge provider keys. Overrides --jury "
                              "and JURY_PRESET.")
@@ -1906,6 +1941,13 @@ def build_parser() -> argparse.ArgumentParser:
                                "companion per-article detail file to --results-dir.")
     p_report.add_argument("--no-detail", action="store_true",
                           help="With --markdown, skip the per-article detail file.")
+    p_report.add_argument("--rich-detail", action="store_true",
+                          help="Write one rich per-paper Markdown file per DOI (automatic "
+                               "metrics, cross-judge agreement, every judge's individual "
+                               "scores/reasoning) to --results-dir/detail_rich/, in the same "
+                               "format 'evaluate --mode dev' uses for "
+                               "data/dev_detailEval_reports/. Works with or without --markdown. "
+                               "Offline; safe to re-run. Does not apply with --publication.")
     p_report.add_argument("--human-validation-mode",
                           choices=("per_reviewer", "pooled", "both"), default=None,
                           help="How to report human-vs-jury correlation: per_reviewer "

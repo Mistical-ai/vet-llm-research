@@ -29,7 +29,7 @@ from eval_instances import load_manifest_index
 # evaluator.py owns the dry-run predicates because it owns the mock that
 # stamps the marker. Safe as a top-level import: evaluator does not import
 # eval_report, so there is no cycle.
-from evaluator import dry_run_sibling, is_dry_run_row
+from evaluator import dry_run_sibling, is_dry_run_row, write_dev_detail_eval_outputs
 
 EVALUATIONS_PATH = DATA_DIR / "evaluations.jsonl"
 HUMAN_REVIEWS_PATH = DATA_DIR / "human_reviews.jsonl"
@@ -40,29 +40,35 @@ DEFAULT_GROUP_FIELDS = ("summarizer", "species", "study_design", "clinical_topic
 
 
 def save_report(report: dict[str, Any], ts: str, out_dir: Path = RESULTS_DIR) -> Path:
-    """Write the full report JSON to a timestamped file under data/results/.
+    """Write the full report JSON to a timestamped file under data/results/json/.
 
     Every eval-report run is saved so past results survive a fresh
-    'evaluate' run overwriting evaluations.jsonl aggregates.
+    'evaluate' run overwriting evaluations.jsonl aggregates. Kept in its own
+    'json/' subfolder, separate from the two Markdown files below, so a
+    reader browsing data/results/ isn't wading through all three kinds of
+    file to find one.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"eval_report_{ts}.json"
+    json_dir = out_dir / "json"
+    json_dir.mkdir(parents=True, exist_ok=True)
+    out_path = json_dir / f"eval_report_{ts}.json"
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return out_path
 
 
 def save_markdown_report(markdown: str, ts: str, out_dir: Path = RESULTS_DIR) -> Path:
-    """Write the plain-English aggregate Markdown report (File 1)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"eval_report_{ts}.md"
+    """Write the plain-English aggregate Markdown report (File 1) to data/results/reports/."""
+    reports_dir = out_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out_path = reports_dir / f"eval_report_{ts}.md"
     out_path.write_text(markdown, encoding="utf-8")
     return out_path
 
 
 def save_markdown_detail_report(markdown: str, ts: str, out_dir: Path = RESULTS_DIR) -> Path:
-    """Write the per-article Markdown detail report (File 2)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"eval_report_{ts}_detail.md"
+    """Write the per-article Markdown detail report (File 2) to data/results/detail/."""
+    detail_dir = out_dir / "detail"
+    detail_dir.mkdir(parents=True, exist_ok=True)
+    out_path = detail_dir / f"eval_report_{ts}_detail.md"
     out_path.write_text(markdown, encoding="utf-8")
     return out_path
 
@@ -121,6 +127,96 @@ def iter_evaluation_rows(path: Path | None = None, *,
                 yield row
 
 
+def compute_cache_summary(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Cache-hit-rate summary over rows that carry cache-token fields.
+
+    IN PLAIN ENGLISH: Answers "is prompt caching actually saving us input
+    tokens?" using only the rows that could answer it. A row written before
+    cache-token accounting existed has NO cache fields at all (``None``) —
+    that is different from a row where caching was attempted and missed
+    (an explicit ``0``). Counting the first case as a miss would blend
+    pre-caching rows into the hit rate and understate it for no reason; this
+    excludes them from both the numerator and the denominator instead.
+
+    See docs/phase3/eval_report.md's "Absent vs zero" section — this
+    function is the one place that rule is enforced for reporting.
+    """
+    total_input = 0
+    total_read = 0
+    n_included = 0
+    n_excluded = 0
+    for row in rows:
+        cache_read = row.get("cache_read_input_tokens")
+        if cache_read is None:
+            n_excluded += 1
+            continue
+        n_included += 1
+        total_read += int(cache_read)
+        total_input += int(row.get("input_tokens") or 0)
+
+    if n_included == 0:
+        return {
+            "available": False,
+            "reason": (
+                "No rows carry cache-token fields yet — either this corpus predates "
+                "cache-token accounting, or no judge call has been made since."
+            ),
+            "n_rows_excluded_pre_caching": n_excluded,
+        }
+    return {
+        "available": True,
+        "hit_rate": round(total_read / total_input, 3) if total_input else 0.0,
+        "cache_read_input_tokens": total_read,
+        "input_tokens": total_input,
+        "n_rows_with_cache_data": n_included,
+        "n_rows_excluded_pre_caching": n_excluded,
+    }
+
+
+def detect_mixed_provenance(rows: Iterable[dict[str, Any]]) -> list[str]:
+    """Human-readable warnings when a corpus mixes incomparable row shapes.
+
+    IN PLAIN ENGLISH: Two specific ways a corpus can silently contain scores
+    that should never be averaged together: (1) some rows were judged with
+    the old flat judge prompt and some with the new segmented one (a
+    one-way, deliberate change — see evaluator.JUDGE_PROMPT_SHAPE), or (2)
+    the same judge answered with more than one model version across the
+    corpus (a mid-study provider upgrade, or a MODEL_TIER change between
+    runs). Either makes "the average score" a number that mixes two
+    different measurement instruments. This returns a list of warning
+    strings (empty when the corpus is uniform) rather than raising, so a
+    researcher can still choose to proceed with eyes open.
+    """
+    rows = list(rows)
+    warnings: list[str] = []
+
+    shapes = {row.get("judge_prompt_shape") for row in rows}
+    if len(shapes) > 1:
+        labels = sorted("absent (pre-change)" if s is None else str(s) for s in shapes)
+        warnings.append(
+            "Mixed judge_prompt_shape in this corpus: " + ", ".join(labels) + ". "
+            "The judge prompt's rubric/reference/candidate block layout changed "
+            "mid-corpus (see evaluator.JUDGE_PROMPT_SHAPE) — these rows should not "
+            "be pooled. Re-run the older rows, or partition the report by shape."
+        )
+
+    versions_by_judge: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        judge = row.get("judge")
+        version = row.get("judge_model_version")
+        if judge and version:
+            versions_by_judge[str(judge)].add(str(version))
+    for judge, versions in sorted(versions_by_judge.items()):
+        if len(versions) > 1:
+            warnings.append(
+                f"Judge '{judge}' answered with more than one model_version in this "
+                f"corpus: {', '.join(sorted(versions))}. A mid-study provider upgrade "
+                "(or a MODEL_TIER change between runs) makes these rows non-comparable "
+                "— re-run the older rows, or partition the report by model_version."
+            )
+    return warnings
+
+
 def _load_human_reviews(path: Path | None) -> list[dict[str, Any]] | None:
     """Load normalized human-review rows, or None when none have been ingested.
 
@@ -177,6 +273,62 @@ def _strata_value(row: dict[str, Any], field: str) -> str:
     return str(value or "unknown")
 
 
+def _collect_automatic_metrics_by_item(group_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Average ``automatic_metrics`` (compression ratio, extractive coverage,
+    section coverage, ROUGE-1/2/L) across the items in this group.
+
+    IN PLAIN ENGLISH: ``automatic_metrics`` is computed once per candidate
+    summary (see ``eval_metrics.calculate_automatic_metrics``) and is
+    identical on every judge row that scored that summary. Averaging every
+    row directly would over-count each summary once per judge on the panel
+    (typically 3x) -- so this dedupes to one representative row per
+    (doi, input_source, summarizer) item first, exactly like
+    ``report_tables.collect_item_scores`` does for jury scores, before
+    averaging across items.
+    """
+    from report_tables import _input_source  # noqa: E402  (lazy: avoids circular import)
+
+    seen: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in group_rows:
+        doi = str(row.get("doi", "")).strip()
+        summarizer = str(row.get("summarizer", "")).strip()
+        if not doi or not summarizer:
+            continue
+        metrics = row.get("automatic_metrics")
+        if not isinstance(metrics, dict):
+            continue
+        key = (doi, _input_source(row), summarizer)
+        seen.setdefault(key, metrics)
+
+    def _values(metric_key: str) -> list[float]:
+        return [
+            m[metric_key] for m in seen.values()
+            if isinstance(m.get(metric_key), (int, float))
+        ]
+
+    def _section_values(section_key: str) -> list[float]:
+        out = []
+        for m in seen.values():
+            section = m.get("section_coverage")
+            if isinstance(section, dict) and isinstance(section.get(section_key), (int, float)):
+                out.append(section[section_key])
+        return out
+
+    def _mean(values: list[float]) -> float | None:
+        return round(sum(values) / len(values), 4) if values else None
+
+    return {
+        "n_items_with_metrics": len(seen),
+        "compression_ratio": _mean(_values("compression_ratio")),
+        "extractive_coverage": _mean(_values("extractive_coverage")),
+        "section_coverage_ratio": _mean(_section_values("coverage_ratio")),
+        "section_coverage_covered_count": _mean(_section_values("covered_count")),
+        "rouge_1": _mean(_values("rouge_1")),
+        "rouge_2": _mean(_values("rouge_2")),
+        "rouge_l": _mean(_values("rouge_l")),
+    }
+
+
 def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarizer") -> list[dict[str, Any]]:
     """Aggregate scores and reliability signals by one grouping field.
 
@@ -219,6 +371,7 @@ def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarize
         major = _rate(aggregates, "major_hallucination")
         low_confidence = _rate(aggregates, "low_confidence")
         parse_failure = _rate(aggregates, "parse_failure")
+        automatic_metrics = _collect_automatic_metrics_by_item(group_rows)
 
         # Rows carrying no (doi, summarizer) identity cannot be attributed to an
         # item, so collect_item_scores drops them. Surface the count rather than
@@ -265,6 +418,10 @@ def summarize_rows(rows: Iterable[dict[str, Any]], group_field: str = "summarize
             "mean_judge_disagreement": (
                 round(sum(disagreements) / len(disagreements), 3) if disagreements else None
             ),
+            # Text-overlap/structure signals, averaged once per summary (not
+            # once per judge) across every item in this group -- see
+            # _collect_automatic_metrics_by_item's docstring.
+            "automatic_metrics": automatic_metrics,
         })
     return summary
 
@@ -315,6 +472,13 @@ def build_report(
     materialized = list(rows)
     return {
         "taxonomy": VET_TAXONOMY_V1.describe(VeterinarySummaryQualityScenario.name),
+        # Data-quality guardrails — a corpus mixing pre/post prompt-shape or
+        # mid-study model-version rows should not be pooled; see
+        # detect_mixed_provenance's docstring. Empty list = uniform corpus.
+        "provenance_warnings": detect_mixed_provenance(materialized),
+        # Prompt-caching hit rate, computed only over rows that carry cache
+        # fields at all (see compute_cache_summary's absent-vs-zero rule).
+        "cache": compute_cache_summary(materialized),
         # Inter-judge reliability. Like "taxonomy" this is a header block, not a
         # stratum: it is a single dict, so main() prints it separately from the
         # per-stratum tables. It self-reports available=False (with a reason)
@@ -352,6 +516,64 @@ def _fmt_score(value: float | None) -> str:
 
 def _fmt_pct(value: float | None) -> str:
     return "-" if value is None else f"{value * 100:.0f}%"
+
+
+def _fmt_metric(value: float | None) -> str:
+    return "-" if value is None else f"{value:.4f}"
+
+
+def _fmt_section_coverage(metrics: dict[str, Any] | None) -> str:
+    metrics = metrics or {}
+    count = metrics.get("section_coverage_covered_count")
+    ratio = metrics.get("section_coverage_ratio")
+    if count is None or ratio is None:
+        return "-"
+    return f"{count:.2f} of 6 ({ratio:.4f})"
+
+
+def _headline_automatic_metrics_rows(metrics: dict[str, Any] | None) -> list[str]:
+    """Extra '| Metric | Value |' rows for the Headline table: corpus-wide
+    automatic metrics, averaged once per summary (not once per judge) across
+    every item reporting them -- see _collect_automatic_metrics_by_item.
+    """
+    if not metrics or not metrics.get("n_items_with_metrics"):
+        return []
+    return [
+        f"| Compression ratio (avg) | {_fmt_metric(metrics.get('compression_ratio'))} |",
+        f"| Extractive coverage (avg) | {_fmt_metric(metrics.get('extractive_coverage'))} |",
+        f"| Section coverage (avg) | {_fmt_section_coverage(metrics)} |",
+        f"| ROUGE-1 / ROUGE-2 / ROUGE-L (avg) | {_fmt_metric(metrics.get('rouge_1'))} / "
+        f"{_fmt_metric(metrics.get('rouge_2'))} / {_fmt_metric(metrics.get('rouge_l'))} |",
+    ]
+
+
+def _markdown_automatic_metrics_table(rows: list[dict[str, Any]]) -> list[str]:
+    """Render one stratum's per-group automatic-metrics averages (compression
+    ratio, extractive coverage, section coverage, ROUGE) as a Markdown table.
+    Returns [] when no group in this stratum has any automatic_metrics yet.
+    """
+    body: list[str] = []
+    for row in rows:
+        metrics = row.get("automatic_metrics") or {}
+        if not metrics.get("n_items_with_metrics"):
+            continue
+        group = str(row["group"])
+        label = "(no metadata)" if group.strip().lower() == "unknown" else group
+        body.append(
+            f"| {label} | {metrics['n_items_with_metrics']} | "
+            f"{_fmt_metric(metrics.get('compression_ratio'))} | "
+            f"{_fmt_metric(metrics.get('extractive_coverage'))} | "
+            f"{_fmt_section_coverage(metrics)} | "
+            f"{_fmt_metric(metrics.get('rouge_1'))} | {_fmt_metric(metrics.get('rouge_2'))} | "
+            f"{_fmt_metric(metrics.get('rouge_l'))} |"
+        )
+    if not body:
+        return []
+    header = [
+        "| Group | Items | Compression | Extractive Cov. | Section Cov. | ROUGE-1 | ROUGE-2 | ROUGE-L |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    return header + body
 
 
 def _print_table(title: str, rows: list[dict[str, Any]]) -> bool:
@@ -393,6 +615,49 @@ def _print_table(title: str, rows: list[dict[str, Any]]) -> bool:
     for r in body:
         print("  " + "  ".join(cell.ljust(w) for cell, w in zip(r, widths)))
     return True
+
+
+def _print_automatic_metrics(
+    overall_metrics: dict[str, Any] | None, by_summarizer_rows: list[dict[str, Any]],
+) -> None:
+    """Print corpus-wide automatic metrics, then a per-provider breakdown.
+
+    Mirrors _print_cache_summary's "header block, then detail" shape.
+    Silent (prints nothing) when no row in the corpus carries automatic_metrics
+    yet -- e.g. rows written before eval_metrics was wired in.
+    """
+    if not overall_metrics or not overall_metrics.get("n_items_with_metrics"):
+        return
+    print("\n[Automatic metrics] (averaged once per summary, across "
+          f"{overall_metrics['n_items_with_metrics']} item(s))")
+    print(f"  Compression ratio:   {_fmt_metric(overall_metrics.get('compression_ratio'))}")
+    print(f"  Extractive coverage: {_fmt_metric(overall_metrics.get('extractive_coverage'))}")
+    print(f"  Section coverage:    {_fmt_section_coverage(overall_metrics)}")
+    print(f"  ROUGE-1 / 2 / L:     {_fmt_metric(overall_metrics.get('rouge_1'))} / "
+          f"{_fmt_metric(overall_metrics.get('rouge_2'))} / {_fmt_metric(overall_metrics.get('rouge_l'))}")
+
+    provider_rows = [r for r in by_summarizer_rows if (r.get("automatic_metrics") or {}).get("n_items_with_metrics")]
+    if not provider_rows:
+        return
+    headers = ["Provider", "Items", "Compression", "Extractive", "SectionCov", "ROUGE-1", "ROUGE-2", "ROUGE-L"]
+    body = [
+        [
+            str(row["group"]),
+            str(row["automatic_metrics"]["n_items_with_metrics"]),
+            _fmt_metric(row["automatic_metrics"].get("compression_ratio")),
+            _fmt_metric(row["automatic_metrics"].get("extractive_coverage")),
+            _fmt_section_coverage(row["automatic_metrics"]),
+            _fmt_metric(row["automatic_metrics"].get("rouge_1")),
+            _fmt_metric(row["automatic_metrics"].get("rouge_2")),
+            _fmt_metric(row["automatic_metrics"].get("rouge_l")),
+        ]
+        for row in provider_rows
+    ]
+    widths = [max(len(headers[i]), *(len(r[i]) for r in body)) for i in range(len(headers))]
+    print("  " + "  ".join(h.ljust(w) for h, w in zip(headers, widths)))
+    print("  " + "  ".join("-" * w for w in widths))
+    for r in body:
+        print("  " + "  ".join(cell.ljust(w) for cell, w in zip(r, widths)))
 
 
 def _bold_top(cell: str, value: float | None, top: float | None) -> str:
@@ -668,6 +933,29 @@ def _render_markdown(report: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         lines.append(
             f"| Needed human review (low judge confidence) | {_fmt_pct(overall['low_confidence_rate'])} |"
         )
+        lines.extend(_headline_automatic_metrics_rows(overall.get("automatic_metrics")))
+        lines.append("")
+
+    warnings = report.get("provenance_warnings") or []
+    if warnings:
+        lines.append("## ⚠ Data-quality warnings")
+        lines.append("")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    cache = report.get("cache") or {}
+    if cache.get("available"):
+        lines.append(
+            f"**Prompt-cache hit rate:** {_fmt_pct(cache.get('hit_rate'))} of "
+            f"{cache.get('input_tokens', 0)} input tokens across "
+            f"{cache.get('n_rows_with_cache_data', 0)} row(s) with cache data"
+            + (
+                f" ({cache['n_rows_excluded_pre_caching']} pre-caching row(s) excluded)."
+                if cache.get("n_rows_excluded_pre_caching")
+                else "."
+            )
+        )
         lines.append("")
 
     lines.extend(_render_markdown_reliability(report.get("reliability")))
@@ -688,6 +976,13 @@ def _render_markdown(report: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         lines.append("")
         lines.extend(_markdown_stratum_table(section_rows))
         lines.append("")
+        if section == "by_summarizer":
+            automatic_metrics_table = _markdown_automatic_metrics_table(section_rows)
+            if automatic_metrics_table:
+                lines.append("### Automatic Metrics (averaged per summary)")
+                lines.append("")
+                lines.extend(automatic_metrics_table)
+                lines.append("")
 
     if any_parse_failures:
         lines.append(
@@ -723,6 +1018,24 @@ def _render_markdown(report: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     lines.append(
         "- **Low-confidence rate** -- share of summaries where the judge's own confidence "
         "was below 3/5, flagging them for human review."
+    )
+    lines.append(
+        "- **Compression ratio** -- summary length divided by article length; lower means "
+        "more condensed."
+    )
+    lines.append(
+        "- **Extractive coverage** -- share of the summary's words that also appear in the "
+        "source article; a coarse copy-vs-paraphrase signal, not a faithfulness score."
+    )
+    lines.append(
+        "- **Section coverage** -- how many of the 6 expected veterinary-summary sections "
+        "(objective, methods, species/sample size, results, clinical significance, "
+        "limitations) the summary appears to address, out of 6."
+    )
+    lines.append(
+        "- **ROUGE-1 / ROUGE-2 / ROUGE-L** -- word- and phrase-overlap recall against the "
+        "reference text (unigram / bigram / longest-common-subsequence); a text-similarity "
+        "proxy, not a substitute for the judge's faithfulness score."
     )
     lines.append("")
 
@@ -944,6 +1257,12 @@ def main(argv: list[str] | None = None) -> int:
                              "companion per-article detail file to --results-dir.")
     parser.add_argument("--no-detail", action="store_true",
                         help="With --markdown, skip the per-article detail file.")
+    parser.add_argument("--rich-detail", action="store_true",
+                        help="Write one rich per-paper Markdown file per DOI (automatic "
+                             "metrics, cross-judge agreement, every judge's individual "
+                             "scores/reasoning) to --results-dir/detail_rich/, in the same "
+                             "format 'evaluate --mode dev' uses for data/dev_detailEval_reports/. "
+                             "Works independently of --markdown/--json. Offline; safe to re-run.")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                         help="Where to save the report JSON (default: data/results/).")
     parser.add_argument("--no-save", action="store_true",
@@ -967,12 +1286,23 @@ def main(argv: list[str] | None = None) -> int:
     # Nothing scored yet -- skip writing an empty placeholder file.
     saved_path = save_report(report, ts, args.results_dir) if should_save else None
 
+    manifest_index = None
+    if should_save and (args.rich_detail or (args.markdown and not args.no_detail)):
+        manifest_index = load_manifest_index()
+
+    if args.rich_detail and should_save:
+        dois = {str(r.get("doi", "")).strip() for r in rows if str(r.get("doi", "")).strip()}
+        rich_dir = args.results_dir / "detail_rich"
+        n_written = write_dev_detail_eval_outputs(
+            dois, output_dir=rich_dir, evaluations_path=args.evaluations, manifest_index=manifest_index,
+        )
+        print(f"Saved {n_written} rich per-paper detail file(s) to: {rich_dir}", file=sys.stderr)
+
     if args.markdown:
         markdown_text = _render_markdown(report, rows)
         saved_md_path = save_markdown_report(markdown_text, ts, args.results_dir) if should_save else None
         saved_detail_path = None
         if should_save and not args.no_detail:
-            manifest_index = load_manifest_index()
             saved_detail_path = save_markdown_detail_report(
                 _render_markdown_detail(rows, manifest_index), ts, args.results_dir
             )
@@ -1022,8 +1352,15 @@ def main(argv: list[str] | None = None) -> int:
         "ParseFail% = judge response could not be parsed."
     )
 
+    _print_provenance_warnings(report.get("provenance_warnings"))
+    _print_cache_summary(report.get("cache"))
     _print_reliability(report.get("reliability"))
     _print_human_validation(report.get("human_validation"))
+    overall_list = report.get("overall") or []
+    _print_automatic_metrics(
+        overall_list[0].get("automatic_metrics") if overall_list else None,
+        report.get("by_summarizer", []),
+    )
 
     skipped: list[str] = []
     for section, title in _SECTION_TITLES.items():
@@ -1037,6 +1374,30 @@ def main(argv: list[str] | None = None) -> int:
               "manifest.jsonl.)")
 
     return 0
+
+
+def _print_provenance_warnings(warnings: list[str] | None) -> None:
+    """Print mixed judge_prompt_shape / mixed judge_model_version warnings."""
+    if not warnings:
+        return
+    print("\n[WARNING: mixed-provenance corpus]")
+    for warning in warnings:
+        print(f"  ! {warning}")
+
+
+def _print_cache_summary(cache: dict[str, Any] | None) -> None:
+    """Print the prompt-cache hit rate, or why it isn't available yet."""
+    if not cache:
+        return
+    print("\n[Prompt cache]")
+    if not cache.get("available"):
+        print(f"  {cache.get('reason', 'not available')}")
+        return
+    excluded = cache.get("n_rows_excluded_pre_caching") or 0
+    print(f"  Hit rate: {_fmt_pct(cache.get('hit_rate'))} of "
+          f"{cache.get('input_tokens', 0)} input tokens across "
+          f"{cache.get('n_rows_with_cache_data', 0)} row(s) with cache data"
+          + (f"  ({excluded} pre-caching row(s) excluded)" if excluded else ""))
 
 
 def _print_reliability(reliability: dict[str, Any] | None) -> None:

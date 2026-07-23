@@ -320,6 +320,8 @@ A run manifest's full field list:
 | `prompt_template_id`, `prompt_path`, `prompt_sha256` | Which judge-prompt file was used, and a hash of its exact wording. |
 | `temperature`, `max_output_tokens`, `seed`, `top_p` | The generation settings in force for this run. |
 | `evaluation_config` | Extra run-specific settings (e.g. rubric version, which mode/slice was evaluated). |
+| `model_tier` | Which `MODEL_TIER` (`regular` or `premium`, `.env.template` section 16) resolved the judge models for this run. Defaults to `"unknown"` for manifests written before this field existed. |
+| `judge_prompt_shape` | The judge-prompt layout used, e.g. `"segmented_v1"` (rubric/reference/candidate sent as separate message blocks — see [04_llm_judge.md](04_llm_judge.md)). `None`/absent for manifests written before the segmented shape landed. |
 
 > **What "SHA-256 hash" means, in plain language:** a hash is a short
 > fingerprint computed from a file's exact contents. Change even one

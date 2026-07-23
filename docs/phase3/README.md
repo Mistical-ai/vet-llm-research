@@ -7,9 +7,11 @@ This is a hands-on walkthrough for turning your collected PDFs into LLM summarie
 | Doc | Role |
 |-----|------|
 | [phase3/README.md](README.md) (this page) | Beginner walkthrough — the whole `extract → summarize → evaluate → status` pipeline, step by step. |
+| [reporting_and_batch_explained.md](reporting_and_batch_explained.md) | **Confused by `eval-report` vs `--publication` vs `report-figures` vs `stats-engine`, or batch mode for summarize vs evaluate?** Start here — one page, plain language, side-by-side tables. |
 | [run_phase3.md](run_phase3.md) | Full CLI/flag reference for the orchestrator. |
 | [medhelm_evaluation.md](medhelm_evaluation.md) | **Authoritative** rubric definition and jury-score math for the current default judge. |
 | [evaluator.md](evaluator.md) | Operator how-to for `evaluator.py` — CLI, inputs/outputs, troubleshooting. |
+| [eval_report.md](eval_report.md) | Full flag reference for `eval-report` (plain, `--markdown`, `--rich-detail`, `--publication`). |
 | [dev_evaluation_guide.md](dev_evaluation_guide.md) | Step-by-step loop for trying `summarize --mode dev` / `evaluate --mode dev` on a small sample before a real run. |
 | [reading_detail_eval_reports.md](reading_detail_eval_reports.md) | Cell-by-cell guide to `data/dev_detailEval_reports/*.md` — what every heading, table, and number means, and how to open the files in Markdown preview. |
 | [judge_and_rubric.md](judge_and_rubric.md) | Legacy reference for the superseded Vet-Score v2.0 rubric (`judge_v2.txt`). |
@@ -48,8 +50,9 @@ The end product is two data files you'll analyse in Phase 4–5:
 ```
 data/summaries.jsonl      one row per paper, holding all three models' summaries
 data/evaluations.jsonl    one row per (paper, summary, judge) — the scores
-data/results/             timestamped eval-report snapshots (eval_report_<UTC time>.json),
-                          written each time you run `run_phase3.py eval-report`
+data/results/             timestamped eval-report snapshots, written each time you
+                          run `run_phase3.py eval-report` — split into json/, reports/,
+                          and detail/ subfolders (see "8. Where everything ends up")
 ```
 
 Everything you run lives in two folders:
@@ -427,15 +430,25 @@ One-shot helper (not part of the normal flow): [`scripts/migrate_processed_filen
 
 ```
 data/
-├── raw_text/<name>.jsonl           ← extract  : raw column-aware PDF text
-├── processed/<name>.jsonl          ← extract  : cleaned text, one file per PDF
-├── summaries.jsonl                 ← summarize: all 3 models' summaries per paper
-├── evaluations.jsonl               ← evaluate : the judge scores
-├── batch_jobs.jsonl                ← batch    : provider job IDs + status
-├── batch/                          ← batch    : scratch upload files (safe to delete)
-├── verify_extraction_report.txt    ← verify   : the audit table
-└── error_log.jsonl                 ← any step : anything that failed
+├── raw_text/<name>.jsonl           ← extract     : raw column-aware PDF text
+├── processed/<name>.jsonl          ← extract     : cleaned text, one file per PDF
+├── summaries.jsonl                 ← summarize   : all 3 models' summaries per paper
+├── evaluations.jsonl               ← evaluate    : the judge scores
+├── batch_jobs.jsonl                ← batch       : provider job IDs + status
+├── batch/                          ← batch       : scratch upload files (safe to delete)
+├── results/                        ← eval-report : timestamped snapshots, one subfolder per kind
+│   ├── json/eval_report_<UTC>.json         (every run, unless --no-save / zero rows)
+│   ├── reports/eval_report_<UTC>.md        (with --markdown)
+│   ├── detail/eval_report_<UTC>_detail.md  (with --markdown, unless --no-detail)
+│   └── detail_rich/<doi-slug>.md           (with --rich-detail; one file per paper)
+├── verify_extraction_report.txt    ← verify      : the audit table
+└── error_log.jsonl                 ← any step    : anything that failed
 ```
+
+Nothing under `data/results/` is ever overwritten — each run adds its own
+timestamped file(s), so past snapshots survive a later `evaluate` run
+changing `data/evaluations.jsonl`. See [eval_report.md](eval_report.md) for
+the full flag reference.
 
 `summaries.jsonl` is an atomic merged snapshot: each row is JSONL, and successful provider slots are merged back into the matching `(doi, input_source)` row for resume support. `evaluations.jsonl` is append-only, with one new JSON line per completed judge result. Do not edit either file by hand; if a run crashes halfway, completed work remains on disk and the next run can resume.
 

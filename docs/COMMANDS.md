@@ -10,6 +10,7 @@ a methods explanation — for the "why," see the linked doc.
 
 | Topic | Doc |
 |---|---|
+| Confused by `eval-report` vs `--publication` vs `report-figures` vs `stats-engine`, or batch mode for summarize vs evaluate | [docs/phase3/reporting_and_batch_explained.md](phase3/reporting_and_batch_explained.md) — start here |
 | Everything, taught from scratch, for a complete beginner | [docs/booklet/BOOKLET.md](booklet/BOOKLET.md) |
 | Shorter command tables + first-time setup | [README.md](../README.md) — see "The commands you need to know" |
 | Phase 3 (extract/summarize/evaluate) beginner walkthrough | [docs/phase3/README.md](phase3/README.md) |
@@ -81,6 +82,19 @@ python llm-sum/run_phase3.py summarize          # PAID — submits batch jobs, r
 python llm-sum/check_batch_status.py            # collect finished results into data/summaries.jsonl
 ```
 
+`check_batch_status.py` imports the `openai`, `anthropic`, and `google-genai`
+SDKs to poll each provider. If your venv is active but incomplete, it fails
+immediately with `ModuleNotFoundError` before any network call — reinstall
+and verify in the same PowerShell session:
+
+```powershell
+python -m pip install -r requirements.txt
+# or, to target just the three provider SDKs:
+python -m pip install openai anthropic google-genai
+
+python -c "import openai, anthropic; from google import genai; print('ok')"
+```
+
 Batch submissions can be rejected wholesale by a provider's token limit, or
 need resuming/chunking/force-resubmitting after a failure — see
 [docs/phase3/batch_mode.md](phase3/batch_mode.md) for the commands and
@@ -102,10 +116,28 @@ See [docs/phase3/README.md](phase3/README.md) and
 ## 4. Blind judge evaluation (Phase 3 evaluate) — **PAID** outside `test` mode
 
 ```powershell
-python llm-sum/run_phase3.py evaluate           # PAID — blind LLM jury scores every summary
-python llm-sum/run_phase3.py eval-report        # free — scoreboard + snapshot in data/results/
-python llm-sum/run_phase3.py status             # free — read-only counts at every stage
+python llm-sum/run_phase3.py evaluate                # PAID — blind LLM jury scores every summary
+python llm-sum/run_phase3.py eval-report              # free — scoreboard + snapshot under data/results/json/
+python llm-sum/run_phase3.py eval-report --markdown   # free — same report, saved as readable Markdown too
+python llm-sum/run_phase3.py eval-report --rich-detail   # free — one deep-dive Markdown file per paper -> data/results/detail_rich/
+python llm-sum/run_phase3.py status                   # free — read-only counts at every stage
 ```
+
+Batch judging a large backlog can hit a provider's per-submission token cap;
+`evaluate` also accepts `--max-requests N` to cap how many NEW judge requests
+get queued per judge in one call, so `--resume` sweeps the rest across
+repeated invocations:
+
+```powershell
+python llm-sum/run_phase3.py evaluate --mode batch --max-requests 50 --judges openai
+python llm-sum/check_batch_status.py
+#   ... repeat both commands to sweep the remaining backlog in chunks ...
+```
+
+See [docs/phase3/batch_mode.md](phase3/batch_mode.md) for the full chunking
+playbook, and
+[docs/phase3/reporting_and_batch_explained.md](phase3/reporting_and_batch_explained.md)
+for a plain-language walkthrough of every `eval-report` variant.
 
 See [docs/phase3/medhelm_evaluation.md](phase3/medhelm_evaluation.md) (the
 rubric) and
@@ -210,6 +242,8 @@ python llm-sum/check_batch_status.py   # batch mode only, after the provider fin
 # Phase 3 — evaluate (PAID outside test mode)
 python llm-sum/run_phase3.py evaluate
 python llm-sum/run_phase3.py eval-report
+python llm-sum/run_phase3.py eval-report --markdown
+python llm-sum/run_phase3.py eval-report --rich-detail
 python llm-sum/run_phase3.py status
 
 # Phase 5 — human validation (free)

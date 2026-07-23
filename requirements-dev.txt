@@ -1,0 +1,18 @@
+# Development / verification-only dependencies.
+#
+# These are NOT needed to run the study pipeline or to reproduce the published
+# numbers — requirements.txt is the authoritative publication runtime set. This
+# file holds tools used only to AUDIT that pipeline, so a cross-check helper can
+# never silently become a runtime dependency of the results.
+#
+# Install with:
+#     python -m pip install -r requirements-dev.txt
+
+# Independent, widely-used implementation of Krippendorff's alpha, used ONLY by
+# scripts/audit_eval_math.py to cross-check llm-sum/reliability.py's hand-rolled
+# alpha against a second source on the real corpus. The study itself keeps alpha
+# hand-rolled on purpose (scipy has no implementation) and validates it against
+# Krippendorff's own published worked example in tests/test_reliability.py — see
+# the note beside scipy in requirements.txt. This package is a belt-and-braces
+# check, never a runtime dependency of the results.
+krippendorff

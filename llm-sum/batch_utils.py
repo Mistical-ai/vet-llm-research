@@ -33,7 +33,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from models_config import get_model_spec  # noqa: E402
+from models_config import (  # noqa: E402
+    anthropic_cache_control,
+    get_model_spec,
+    openai_prompt_cache_key,
+    PROMPT_CACHE_ENABLED,
+)
 from file_paths import doi_to_slug  # noqa: E402
 from utils import BudgetGuard, log_error  # noqa: E402
 
@@ -48,6 +53,13 @@ MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 # placeholder DOI) produces a custom_id that fails this, so it's checked
 # before a request is ever built — see run_batch_summarisation.
 _VALID_CUSTOM_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Mirrors evaluator.JUDGE_PROMPT_SHAPE exactly (not imported from there, to
+# keep this module's lightweight parsers from pulling in evaluator.py's
+# heavier import graph merely to read one constant string). Both must be
+# bumped together if the judge prompt's block layout ever changes again —
+# see evaluator.py's definition for the full rationale.
+JUDGE_PROMPT_SHAPE = "segmented_v1"
 
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 SEED = int(os.getenv("SEED", "42"))
@@ -91,17 +103,46 @@ def _assert_budget_authorised(stage: str, request_count: int) -> None:
 # Build request payloads
 # ---------------------------------------------------------------------------
 
-def build_openai_request(custom_id: str, user_message: str, model_id: str,
-                          *, for_judge: bool = False) -> dict:
+def build_openai_request(custom_id: str, user_message: str | tuple[str, str, str],
+                          model_id: str, *, for_judge: bool = False,
+                          cache_article_id: str | None = None) -> dict:
     """One row of OpenAI's batch JSONL format.
 
     ``for_judge=True`` builds a judge request instead of a summarisation
     request: plain ``json_object`` mode, matching
     ``evaluator._call_judge_openai`` exactly, rather than the strict
-    ``VeterinarySummary`` schema a judge cannot answer in.
+    ``VeterinarySummary`` schema a judge cannot answer in. In that case
+    ``user_message`` is the 3-tuple returned by
+    ``evaluator.build_judge_prompt_segments`` (rubric_prefix, reference_block,
+    candidate_block), segmented into a system + user message exactly like the
+    real-time path (Phase A1) — never a flat string. Summarisation requests
+    (``for_judge=False``) are unaffected: nothing to cache there (Finding D),
+    so ``user_message`` stays a plain string.
     """
     if for_judge:
+        rubric_prefix, reference_block, candidate_block = user_message  # type: ignore[misc]
         response_format = {"type": "json_object"}
+        body: dict[str, Any] = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": rubric_prefix},
+                {"role": "user", "content": reference_block + candidate_block},
+            ],
+            "temperature": TEMPERATURE,
+            "max_completion_tokens": MAX_OUTPUT_TOKENS,
+            "seed": SEED,
+            "response_format": response_format,
+        }
+        # PROMPT_CACHE_ENABLED toggles ONLY this key — a routing hint, not a
+        # scoring or block-structure change (Phase A3).
+        if PROMPT_CACHE_ENABLED:
+            body["prompt_cache_key"] = openai_prompt_cache_key(cache_article_id)
+        return {
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": body,
+        }
     else:
         from summarizer import VeterinarySummary  # noqa: E402
         # OpenAI's Structured Outputs "strict" mode requires every key in
@@ -145,8 +186,8 @@ def build_openai_request(custom_id: str, user_message: str, model_id: str,
     }
 
 
-def build_gemini_batch_request(custom_id: str, user_message: str, model_id: str,
-                               *, for_judge: bool = False) -> dict:
+def build_gemini_batch_request(custom_id: str, user_message: str | tuple[str, str, str],
+                               model_id: str, *, for_judge: bool = False) -> dict:
     """
     One row of Gemini's Batch Mode JSONL format (ai.google.dev/gemini-api/docs/batch-mode).
 
@@ -174,7 +215,14 @@ def build_gemini_batch_request(custom_id: str, user_message: str, model_id: str,
 
     ``for_judge=True`` drops ``response_schema`` — matching
     ``evaluator._call_judge_gemini``, which asks for JSON mime type but never
-    forces the ``VeterinarySummary`` schema a judge cannot answer in.
+    forces the ``VeterinarySummary`` schema a judge cannot answer in. In that
+    case ``user_message`` is the 3-tuple from
+    ``evaluator.build_judge_prompt_segments``, rendered as three
+    ``contents[0].parts[]`` entries in segment order — matching
+    ``evaluator._call_judge_gemini``'s real-time shape exactly (verification
+    item 3), so the same corpus scored partly by batch and partly real-time
+    never sees two different prompt shapes. Summarisation requests
+    (``for_judge=False``) are unaffected: a single part, unchanged.
     """
     from summarizer import gemini_response_schema, _gemini_output_token_limit  # noqa: E402
 
@@ -193,17 +241,27 @@ def build_gemini_batch_request(custom_id: str, user_message: str, model_id: str,
     if not for_judge:
         config["response_schema"] = gemini_response_schema()
 
+    if for_judge:
+        rubric_prefix, reference_block, candidate_block = user_message  # type: ignore[misc]
+        parts = [
+            {"text": rubric_prefix},
+            {"text": reference_block},
+            {"text": candidate_block},
+        ]
+    else:
+        parts = [{"text": user_message}]
+
     return {
         "key": custom_id,
         "request": {
-            "contents": [{"parts": [{"text": user_message}]}],
+            "contents": [{"parts": parts}],
             "generation_config": config,
         },
     }
 
 
-def build_anthropic_request(custom_id: str, user_message: str, model_id: str,
-                            *, for_judge: bool = False) -> dict:
+def build_anthropic_request(custom_id: str, user_message: str | tuple[str, str, str],
+                            model_id: str, *, for_judge: bool = False) -> dict:
     """
     One row of Anthropic's Message Batches format. The shape differs from
     OpenAI's: the request body is nested under "params" and the URL is
@@ -216,7 +274,33 @@ def build_anthropic_request(custom_id: str, user_message: str, model_id: str,
     ``parse_anthropic_result_line(..., expect_summary_schema=False)`` (what
     the judge merge path uses) only reads ``text``-type blocks — so a forced
     tool call would come back as an empty string, not just a wrong shape.
+
+    In the judge case ``user_message`` is the 3-tuple from
+    ``evaluator.build_judge_prompt_segments``: the rubric goes into its own
+    ``system`` block, and the reference/candidate texts become two content
+    blocks in the one user message — matching
+    ``evaluator._call_judge_anthropic``'s real-time shape exactly. Cache
+    markers (Phase A3, flag-gated) land on the system block and the reference
+    block ONLY, never the candidate block — see that function's docstring.
     """
+    if for_judge:
+        rubric_prefix, reference_block, candidate_block = user_message  # type: ignore[misc]
+        system_block: dict[str, Any] = {"type": "text", "text": rubric_prefix}
+        reference_content_block: dict[str, Any] = {"type": "text", "text": reference_block}
+        candidate_content_block: dict[str, Any] = {"type": "text", "text": candidate_block}
+        if PROMPT_CACHE_ENABLED:
+            marker = anthropic_cache_control()
+            system_block["cache_control"] = marker
+            reference_content_block["cache_control"] = marker
+        params = {
+            "model": model_id,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "temperature": TEMPERATURE,
+            "system": [system_block],
+            "messages": [{"role": "user", "content": [reference_content_block, candidate_content_block]}],
+        }
+        return {"custom_id": custom_id, "params": params}
+
     params: dict[str, Any] = {
         "model": model_id,
         "max_tokens": MAX_OUTPUT_TOKENS,
@@ -506,6 +590,8 @@ def _successful_batch_summary(
     output_tokens: int,
     model_version: str,
     system_fingerprint: str | None = None,
+    cache_read_input_tokens: int | None = None,
+    cache_creation_input_tokens: int | None = None,
 ) -> dict:
     """
     Validate a batch summary through the same Pydantic repair path as real-time.
@@ -513,6 +599,13 @@ def _successful_batch_summary(
     Batch APIs return raw JSONL later, outside the provider SDK's parsed object
     helpers. Validating here prevents unstructured prose from silently entering
     ``summaries.jsonl`` and breaking the blind judge pipeline.
+
+    ``cache_read_input_tokens``/``cache_creation_input_tokens`` default to
+    None (not 0): summarisation has nothing shared to cache (Finding D), so
+    these are normally absent here, but the same three result-line parsers
+    build both summary and judge rows, and forwarding whatever the parser
+    found keeps this one schema shared across data/summaries.jsonl model
+    slots and data/evaluations.jsonl rows.
     """
     from summarizer import coerce_veterinary_summary, veterinary_summary_to_result  # noqa: E402
 
@@ -525,6 +618,8 @@ def _successful_batch_summary(
         "output_tokens": output_tokens,
         "model_version": model_version,
         "system_fingerprint": system_fingerprint,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     return result
@@ -654,7 +749,7 @@ def run_batch_summarisation(
             # actually queued into rows_per_provider for submission this run.
             if resume and slot.get("status") in ("success", "pending"):
                 continue
-            spec = get_model_spec(provider)
+            spec = get_model_spec(provider, role="summarize")
             # Build inside the provider loop so PROMPT_MODE=provider_specific
             # changes only the intended provider's request body.
             user_message = build_user_message(article_text, prompt_templates[provider])
@@ -708,7 +803,7 @@ def run_batch_summarisation(
             elif provider == "anthropic":
                 job_meta = submit_anthropic_batch(jsonl_path)
             else:
-                job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(provider).model_id)
+                job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(provider, role="summarize").model_id)
         except Exception as exc:  # noqa: BLE001
             # The submission never succeeded, so these slots must NOT be left
             # at "pending" — that would strand them exactly like the bug this
@@ -759,6 +854,7 @@ def run_batch_evaluation(
     resume: bool = False,
     force: bool = False,
     doi_filter: set[str] | None = None,
+    max_new_requests: int | None = None,
 ) -> dict:
     """
     Build & submit evaluation batch jobs for whichever judges are passed in —
@@ -785,8 +881,39 @@ def run_batch_evaluation(
     ``_refuse_duplicate_submission`` below) is this function's only
     protection against submitting a second batch job while an earlier one
     for the same judge(s) is still unresolved.
+
+    ``max_new_requests``, when set, caps how many NEW requests get queued
+    per judge in THIS call — not a cap on papers scanned. This exists
+    because OpenAI enforces a hard per-organization "enqueued tokens" ceiling
+    on batch jobs (observed directly: 900,000 tokens for gpt-5.4, see
+    data/error_log.jsonl entries for job batch_6a604fc4eb5c8190bc63c0e66f1e0323
+    and batch_6a60540619d481908fefd10801f1c67d, both of which submitted 720
+    judge requests and were rejected OUTRIGHT — zero processed — with
+    "token_limit_exceeded"). A large remaining backlog (e.g. 672 requests for
+    one judge) cannot safely be submitted in a single call.
+
+    Unlike the CLI's ``--limit`` (which drives per-journal SAMPLING with a
+    fixed seed — see run_phase3._sample_by_journal), this cap is evaluated
+    against ``already_evaluated()`` fresh on every call and simply stops
+    appending to ``rows_per_judge[judge]`` once the cap is hit — it does not
+    change WHICH combinations are considered, only how many make it into
+    this submission. That makes repeated calls with the same
+    ``max_new_requests`` genuinely progressive: run 1 queues the first N
+    not-yet-evaluated combinations it encounters (in the loop's natural,
+    deterministic paper-then-summariser order — see the load-bearing
+    ordering comment below), those get merged, and run 2 finds them now
+    "already evaluated" and naturally advances to the next N. A fixed-seed
+    ``--limit`` sample does NOT have this property — an identical resample
+    finds nothing new to submit, and a larger ``--limit`` is not guaranteed
+    to be a superset of a smaller one (Python's ``random.sample`` is not
+    prefix-stable across different sample sizes), so it cannot be used to
+    sweep a large backlog into safe-sized chunks the way this can.
+
+    The cap is per-judge (a fresh count per entry in ``judges``), matching
+    OpenAI's error message ("Enqueued token limit reached for gpt-5.4" —
+    the limit is scoped to one model/provider, not shared across judges).
     """
-    from evaluator import build_judge_prompt, load_judge_prompt, already_evaluated  # noqa: E402
+    from evaluator import build_judge_prompt_segments, load_judge_prompt, already_evaluated  # noqa: E402
 
     judges = judges or ["openai"]
     _refuse_duplicate_submission("evaluate", judges, force=force)
@@ -794,6 +921,16 @@ def run_batch_evaluation(
 
     rows_per_judge: dict[str, list[dict]] = {j: [] for j in judges}
 
+    # LOAD-BEARING ORDERING: this loop is paper-outer, summariser-inner (and
+    # judge innermost), so a judge's batch JSONL — and therefore its
+    # downloaded result file — reads paperA__openai, paperA__anthropic,
+    # paperA__gemini, paperB__openai, ... one article's three requests
+    # adjacent, before moving to the next article. Prompt caching (Phase A3)
+    # depends on this: Anthropic/OpenAI/Gemini's cache hit chance for the
+    # shared rubric+reference blocks is highest when requests that share a
+    # prefix are near each other in submission order. Reordering this loop
+    # (e.g. to judge-outer) would silently degrade cache locality with no
+    # error — see Finding B in the caching design plan.
     for entry in _iter_summaries():
         doi = str(entry.get("doi", "")).strip()
         if not doi:
@@ -813,34 +950,41 @@ def run_batch_evaluation(
             if slot.get("status") != "success" or not slot.get("summary"):
                 continue
             candidate_summary = slot["summary"]
-            # Build the prompt here — summariser name is NOT in it.
-            user_message = build_judge_prompt(reference_text, candidate_summary,
-                                              prompt_template)
+            # Build the segments here — summariser name is NOT in any of them
+            # (Phase A1: rubric / reference / candidate blocks, same split
+            # every judge path uses — see build_judge_prompt_segments).
+            segments = build_judge_prompt_segments(reference_text, candidate_summary,
+                                                   prompt_template)
             # Summariser encoded only in the custom_id so we can join results later.
             custom_id = f"{slug}__{summariser}"
 
             for judge in judges:
                 if resume and already_evaluated(doi, summariser, judge, input_source):
                     continue
-                spec = get_model_spec(judge)
+                # max_new_requests caps THIS judge's queue only — a different
+                # judge with room left still gets its own combos considered.
+                if max_new_requests is not None and len(rows_per_judge[judge]) >= max_new_requests:
+                    continue
+                spec = get_model_spec(judge, role="judge")
                 if judge == "openai":
                     rows_per_judge["openai"].append(
                         build_openai_request(custom_id=custom_id,
-                                             user_message=user_message,
+                                             user_message=segments,
                                              model_id=spec.model_id,
-                                             for_judge=True)
+                                             for_judge=True,
+                                             cache_article_id=slug)
                     )
                 elif judge == "anthropic":
                     rows_per_judge["anthropic"].append(
                         build_anthropic_request(custom_id=custom_id,
-                                                user_message=user_message,
+                                                user_message=segments,
                                                 model_id=spec.model_id,
                                                 for_judge=True)
                     )
                 elif judge == "gemini":
                     rows_per_judge["gemini"].append(
                         build_gemini_batch_request(custom_id=custom_id,
-                                                   user_message=user_message,
+                                                   user_message=segments,
                                                    model_id=spec.model_id,
                                                    for_judge=True)
                     )
@@ -848,6 +992,13 @@ def run_batch_evaluation(
                     raise ValueError(
                         f"Unknown judge '{judge}'. Valid: openai, anthropic, gemini."
                     )
+
+    if max_new_requests is not None:
+        for judge, rows in rows_per_judge.items():
+            if len(rows) >= max_new_requests:
+                print(f"[phase3:batch] {judge}: hit max_new_requests={max_new_requests} — "
+                      f"more may remain unfilled. Re-run the same command with --resume "
+                      f"(the default) once this job is merged to submit the next chunk.")
 
     submitted: list[dict] = []
     timestamp = _timestamp_slug()
@@ -864,7 +1015,7 @@ def run_batch_evaluation(
         elif judge == "anthropic":
             job_meta = submit_anthropic_batch(jsonl_path)
         else:
-            job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(judge).model_id)
+            job_meta = submit_gemini_batch(jsonl_path, model_id=get_model_spec(judge, role="judge").model_id)
 
         job_meta.update({"stage": "evaluate", "judge": judge, "request_count": len(rows)})
         record_batch_job(job_meta)
@@ -878,6 +1029,14 @@ def run_batch_evaluation(
 # ---------------------------------------------------------------------------
 # Result parsers (used by check_batch_status.py)
 # ---------------------------------------------------------------------------
+
+def _openai_batch_cached_tokens(usage: dict) -> int | None:
+    """Return usage.prompt_tokens_details.cached_tokens from a raw batch
+    result dict, or None if the field is absent (older/pre-caching rows).
+    ``prompt_tokens`` already includes cached tokens — never re-add."""
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    return int(cached) if cached is not None else None
+
 
 def parse_openai_result_line(line: str, *, expect_summary_schema: bool = True) -> dict:
     """
@@ -909,6 +1068,7 @@ def parse_openai_result_line(line: str, *, expect_summary_schema: bool = True) -
                if reasoning_tokens and finish_reason == "length"
                else "Raise MAX_OUTPUT_TOKENS if finish_reason is 'length'."),
         )
+    cache_read_input_tokens = _openai_batch_cached_tokens(usage)
     if not expect_summary_schema:
         return {
             "custom_id": custom_id,
@@ -918,6 +1078,10 @@ def parse_openai_result_line(line: str, *, expect_summary_schema: bool = True) -
             "output_tokens": int(usage.get("completion_tokens", 0)),
             "model_version": str(body.get("model", "")),
             "system_fingerprint": body.get("system_fingerprint"),
+            "cache_read_input_tokens": cache_read_input_tokens,
+            # OpenAI does not report a separate cache-write token count.
+            "cache_creation_input_tokens": None,
+            "judge_prompt_shape": JUDGE_PROMPT_SHAPE,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     try:
@@ -929,6 +1093,7 @@ def parse_openai_result_line(line: str, *, expect_summary_schema: bool = True) -
             output_tokens=int(usage.get("completion_tokens", 0)),
             model_version=str(body.get("model", "")),
             system_fingerprint=body.get("system_fingerprint"),
+            cache_read_input_tokens=cache_read_input_tokens,
         )
     except Exception as exc:
         finish_reason = choices[0].get("finish_reason", "unknown")
@@ -964,6 +1129,13 @@ def parse_anthropic_result_line(line: str, *, expect_summary_schema: bool = True
     message = result.get("message") or {}
     content_blocks = message.get("content") or []
     usage = message.get("usage") or {}
+    # Anthropic's usage.input_tokens is the UNCACHED remainder only — total
+    # input is the sum of all three (Finding C in the caching design plan).
+    # Both cache fields are always present in a real response (0 when no
+    # caching happened), so this is never None for a genuine Anthropic row.
+    cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+    cache_creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    total_input_tokens = int(usage.get("input_tokens", 0)) + cache_read + cache_creation
     if not expect_summary_schema:
         summary_text = "".join(
             b.get("text", "") for b in content_blocks if b.get("type") == "text"
@@ -972,10 +1144,13 @@ def parse_anthropic_result_line(line: str, *, expect_summary_schema: bool = True
             "custom_id": custom_id,
             "status": "success",
             "summary": summary_text,
-            "input_tokens": int(usage.get("input_tokens", 0)),
+            "input_tokens": total_input_tokens,
             "output_tokens": int(usage.get("output_tokens", 0)),
             "model_version": str(message.get("model", "")),
             "system_fingerprint": None,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
+            "judge_prompt_shape": JUDGE_PROMPT_SHAPE,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     try:
@@ -983,9 +1158,11 @@ def parse_anthropic_result_line(line: str, *, expect_summary_schema: bool = True
         return _successful_batch_summary(
             custom_id=custom_id,
             payload=payload,
-            input_tokens=int(usage.get("input_tokens", 0)),
+            input_tokens=total_input_tokens,
             output_tokens=int(usage.get("output_tokens", 0)),
             model_version=str(message.get("model", "")),
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_creation,
         )
     except Exception as exc:
         return _failed_batch_result(custom_id, f"Invalid structured summary: {exc}")
@@ -1041,6 +1218,11 @@ def parse_gemini_result_line(line: str, *, expect_summary_schema: bool = True) -
     usage = response.get("usageMetadata") or response.get("usage_metadata") or {}
     model_version = str(response.get("modelVersion") or response.get("model_version") or "")
     text = _extract_gemini_text(response)
+    # prompt_token_count already includes cached tokens — never re-add.
+    cached = usage.get("cachedContentTokenCount")
+    if cached is None:
+        cached = usage.get("cached_content_token_count")
+    cache_read_input_tokens = int(cached) if cached is not None else None
 
     if not expect_summary_schema:
         return {
@@ -1051,6 +1233,10 @@ def parse_gemini_result_line(line: str, *, expect_summary_schema: bool = True) -
             "output_tokens": int(usage.get("candidatesTokenCount") or usage.get("candidates_token_count") or 0),
             "model_version": model_version,
             "system_fingerprint": None,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            # Gemini's implicit caching has no separate "write" step to report.
+            "cache_creation_input_tokens": None,
+            "judge_prompt_shape": JUDGE_PROMPT_SHAPE,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     try:
@@ -1061,6 +1247,7 @@ def parse_gemini_result_line(line: str, *, expect_summary_schema: bool = True) -
             input_tokens=int(usage.get("promptTokenCount") or usage.get("prompt_token_count") or 0),
             output_tokens=int(usage.get("candidatesTokenCount") or usage.get("candidates_token_count") or 0),
             model_version=model_version,
+            cache_read_input_tokens=cache_read_input_tokens,
         )
     except Exception as exc:
         reason = _gemini_batch_finish_reason(response)

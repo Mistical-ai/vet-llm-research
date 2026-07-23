@@ -28,6 +28,7 @@ from __future__ import annotations
 # quick way to build a throwaway object with whatever attributes you want
 # (used below to fake the shape of a real API response object).
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,6 +48,7 @@ from evaluator import (
     SCORE_SENTINEL_MALFORMED,
     UNWEIGHTED_CRITERION_WEIGHTS,
     build_judge_prompt,
+    build_judge_prompt_segments,
     build_evaluation_row,
     aggregate_jury_scores,
     calculate_composite_score,
@@ -107,6 +109,41 @@ def test_build_judge_prompt_signature_excludes_summariser_name() -> None:
     assert not (set(sig.parameters) & forbidden_params), (
         "build_judge_prompt must not take a summariser identifier parameter."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase A1: build_judge_prompt_segments — the segment invariant
+# "".join(segments) must equal build_judge_prompt(...) byte-for-byte over
+# both the real prompt file and a hand-built whitespace edge case.
+# ---------------------------------------------------------------------------
+
+def test_segments_join_to_build_judge_prompt_over_real_template() -> None:
+    reference = "Reference text body about a clinical trial in dogs."
+    candidate = "Some candidate summary text claiming X and Y."
+    segments = build_judge_prompt_segments(reference, candidate)
+    assert len(segments) == 3
+    assert "".join(segments) == build_judge_prompt(reference, candidate)
+
+
+def test_segments_join_to_build_judge_prompt_whitespace_edge_case() -> None:
+    """No blank lines/whitespace around the placeholders — the split must
+    still reproduce the flat render exactly even in a tight layout."""
+    template = "RUBRIC{REFERENCE_TEXT}MIDDLE{CANDIDATE_SUMMARY}END"
+    reference, candidate = "REF", "CAND"
+    segments = build_judge_prompt_segments(reference, candidate, template)
+    assert segments == ("RUBRIC", "REFMIDDLE", "CANDEND")
+    assert "".join(segments) == build_judge_prompt(reference, candidate, template)
+
+
+def test_segments_preserve_reference_before_candidate_order() -> None:
+    """Finding A: the rubric already puts reference before candidate — the
+    split must not reorder them."""
+    segments = build_judge_prompt_segments("REF_MARKER", "CAND_MARKER")
+    rubric_prefix, reference_block, candidate_block = segments
+    assert "REF_MARKER" in reference_block
+    assert "CAND_MARKER" in candidate_block
+    assert "REF_MARKER" not in rubric_prefix and "REF_MARKER" not in candidate_block
+    assert "CAND_MARKER" not in rubric_prefix and "CAND_MARKER" not in reference_block
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +218,111 @@ def test_completely_malformed_response_triggers_99_sentinel() -> None:
     raw = "Sorry, I cannot evaluate this summary."
     parsed = parse_judge_response(raw)
     assert parsed["quality_score"] == SCORE_SENTINEL_MALFORMED
+    assert parsed["parse_method"] == "sentinel"
+
+
+# ---------------------------------------------------------------------------
+# Trailing-repetition-glitch repair (found live: ~half the "malformed" rows
+# in one real Gemini judge batch were this exact pattern — a complete, valid
+# MedHELM response corrupted only by a bare repeated fragment of the
+# "reasoning" text right after its closing quote, before the final "}").
+# Fixtures below are shortened/redacted real examples, not synthetic.
+# ---------------------------------------------------------------------------
+
+def _medhelm_json_prefix() -> str:
+    """A complete, valid MedHELM object up through confidence_score — the
+    part every fixture below shares, so each test only varies the corrupted
+    tail after "reasoning"."""
+    return (
+        '{\n'
+        '  "criteria_scores": {\n'
+        '    "faithfulness": {"score": 5, "reasoning": "Fully supported."},\n'
+        '    "completeness": {"score": 5, "reasoning": "All elements present."},\n'
+        '    "clinical_usefulness": {"score": 5, "reasoning": "Clear takeaway."},\n'
+        '    "clarity": {"score": 5, "reasoning": "Concise and organized."},\n'
+        '    "safety": {"score": 5, "reasoning": "No misleading claims."}\n'
+        '  },\n'
+        '  "hallucination": {"present": false, "count": 0, "claims": []},\n'
+        '  "confidence_score": 5,\n'
+    )
+
+
+def test_repairs_single_duplicated_trailing_fragment() -> None:
+    # Real pattern: one echoed fragment of the reasoning text after its
+    # closing quote, then the object closes normally.
+    raw = (
+        _medhelm_json_prefix()
+        + '  "reasoning": "Faithful representation of the reference study."\n'
+        + 'reference study."\n'
+        + '}'
+    )
+    parsed = parse_judge_response(raw)
+    # "json_repaired", not "json" — an audit trail distinguishing a row that
+    # needed this repair from one that parsed cleanly on the first try.
+    assert parsed["parse_method"] == "json_repaired"
+    assert parsed["criteria_scores"]["faithfulness"]["score"] == 5
+    assert parsed["confidence_score"] == 5
+    assert parsed["reasoning"] == "Faithful representation of the reference study."
+
+
+def test_repairs_multiple_cascading_duplicated_fragments() -> None:
+    # Real pattern: several repeated/mutating echoes stacked before "}".
+    raw = (
+        _medhelm_json_prefix()
+        + '  "reasoning": "Accurate summary with no hallucinations."\n'
+        + 'without any hallucinations."\n'
+        + 'any hallucinations."\n'
+        + 'or overstatements."\n'
+        + '}'
+    )
+    parsed = parse_judge_response(raw)
+    assert parsed["parse_method"] == "json_repaired"
+    assert parsed["reasoning"] == "Accurate summary with no hallucinations."
+
+
+def test_repairs_truncated_response_missing_closing_brace() -> None:
+    # Real pattern: the response trails off after the reasoning value's
+    # closing quote with NO "}" at all — depth never reaches 0, so this
+    # exercises the for/else "never balanced" repair path, not the
+    # break-on-failed-candidate path the two tests above exercise.
+    raw = (
+        _medhelm_json_prefix()
+        + '  "reasoning": "Excellent, complete representation with zero errors."\n'
+        + 'of the reference study with zero errors."'
+    )
+    parsed = parse_judge_response(raw)
+    assert parsed["parse_method"] == "json_repaired"
+    assert parsed["reasoning"] == "Excellent, complete representation with zero errors."
+
+
+def test_repair_does_not_mistake_nested_per_criterion_reasoning_key() -> None:
+    # The regression this fix could easily reintroduce: "reasoning" appears
+    # once per criterion too (five times) before the real top-level one.
+    # Matching the FIRST occurrence instead of the LAST would truncate the
+    # object right after "faithfulness"'s own reasoning, discarding every
+    # other criterion silently instead of failing loudly.
+    raw = (
+        _medhelm_json_prefix()
+        + '  "reasoning": "Overall assessment text."\n'
+        + 'ssessment text."\n'
+        + '}'
+    )
+    parsed = parse_judge_response(raw)
+    assert parsed["parse_method"] == "json_repaired"
+    # All five criteria must survive — not just the ones before the first
+    # "reasoning" occurrence.
+    assert set(parsed["criteria_scores"]) == {
+        "faithfulness", "completeness", "clinical_usefulness", "clarity", "safety",
+    }
+    assert parsed["reasoning"] == "Overall assessment text."
+
+
+def test_repair_returns_none_when_response_has_no_reasoning_key_at_all() -> None:
+    # Guards the repair function's own None-return path: a response that's
+    # broken for some OTHER reason (no "reasoning" key present) must still
+    # fall through to the existing sentinel path, not raise.
+    raw = '{"criteria_scores": {"faithfulness": {"score": 5' # truncated, no "reasoning" anywhere
+    parsed = parse_judge_response(raw)
     assert parsed["parse_method"] == "sentinel"
 
 
@@ -477,8 +619,9 @@ def test_call_judge_uses_call_time_dry_run(monkeypatch: pytest.MonkeyPatch) -> N
 
     captured = {}
 
-    def _fake_openai(user_message: str) -> dict:
-        captured["message"] = user_message
+    def _fake_openai(segments, *, article_id=None) -> dict:
+        captured["segments"] = segments
+        captured["article_id"] = article_id
         return {
             "raw_text": json.dumps({
                 "quality_score": 8,
@@ -497,7 +640,11 @@ def test_call_judge_uses_call_time_dry_run(monkeypatch: pytest.MonkeyPatch) -> N
         "openai", "Reference body.", "Candidate body.", max_retries=1
     )
     assert response["model_version"] == "gpt-test"
-    assert "Reference body." in captured["message"]
+    # Segmented on every path (Phase A1): the reference text lands in the
+    # reference block, not glued into one flat string.
+    rubric_prefix, reference_block, candidate_block = captured["segments"]
+    assert "Reference body." in reference_block
+    assert "Candidate body." in candidate_block
 
 
 # A "class" is a blueprint for creating objects that bundle together data and
@@ -553,13 +700,251 @@ def test_gemini_judge_uses_google_genai(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(evaluator.importlib, "import_module", _fake_import)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
 
-    result = evaluator._call_judge_gemini("Judge this.")
+    segments = ("Rubric.", "Reference text.", "Candidate summary.")
+    result = evaluator._call_judge_gemini(segments)
 
     assert captured["api_key"] == "test-key"
-    assert captured["kwargs"]["contents"] == "Judge this."
+    # Segmented on every path (Phase A1): three ordered parts, matching
+    # batch_utils.build_gemini_batch_request's for_judge=True shape exactly.
+    assert captured["kwargs"]["contents"] == [{"parts": [
+        {"text": "Rubric."},
+        {"text": "Reference text."},
+        {"text": "Candidate summary."},
+    ]}]
     assert captured["config"]["response_mime_type"] == "application/json"
     assert result["input_tokens"] == 123
     assert result["output_tokens"] == 45
+    assert result["judge_prompt_shape"] == "segmented_v1"
+
+
+# ---------------------------------------------------------------------------
+# Phase A2/A3: Anthropic cache accounting + cache markers (flag-gated)
+# ---------------------------------------------------------------------------
+
+def _fake_anthropic_module(*, cache_creation: int = 0, cache_read: int = 0,
+                           captured: dict) -> SimpleNamespace:
+    """Build a fake `anthropic` module whose Messages.create() records its
+    kwargs and returns a synthetic usage block with the given cache counts."""
+
+    class _FakeContentBlock:
+        def __init__(self, text: str):
+            self.type = "text"
+            self.text = text
+
+    class _FakeMessages:
+        def create(self, **kwargs):
+            captured["kwargs"] = kwargs
+            usage = SimpleNamespace(
+                input_tokens=100,
+                output_tokens=50,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+            )
+            return SimpleNamespace(
+                content=[_FakeContentBlock(json.dumps({
+                    "quality_score": 8, "hallucination_count": 0,
+                    "hallucination_categories": [], "confidence_score": 4,
+                    "reasoning": "ok",
+                }))],
+                usage=usage,
+                model="claude-test",
+            )
+
+    class _FakeAnthropic:
+        def __init__(self, *a, **kw):
+            self.messages = _FakeMessages()
+
+    return SimpleNamespace(Anthropic=_FakeAnthropic)
+
+
+def test_anthropic_judge_cache_accounting_sums_all_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verification #6: synthetic usage {input:100, cache_creation:900,
+    cache_read:8000} must record input_tokens == 9000 (the sum of all
+    three) — Anthropic's usage.input_tokens alone is the UNCACHED remainder."""
+    captured: dict = {}
+    fake_anthropic = _fake_anthropic_module(
+        cache_creation=900, cache_read=8000, captured=captured,
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+
+    segments = ("Rubric.", "Reference text.", "Candidate summary.")
+    result = evaluator._call_judge_anthropic(segments)
+
+    assert result["input_tokens"] == 9000
+    assert result["cache_creation_input_tokens"] == 900
+    assert result["cache_read_input_tokens"] == 8000
+    assert result["judge_prompt_shape"] == "segmented_v1"
+
+
+def test_anthropic_judge_cache_markers_absent_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag off (default): segmented blocks are sent, but with no
+    cache_control marker anywhere — verification #4."""
+    captured: dict = {}
+    fake_anthropic = _fake_anthropic_module(captured=captured)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr(evaluator, "PROMPT_CACHE_ENABLED", False)
+
+    segments = ("Rubric.", "Reference text.", "Candidate summary.")
+    evaluator._call_judge_anthropic(segments)
+
+    system_blocks = captured["kwargs"]["system"]
+    content_blocks = captured["kwargs"]["messages"][0]["content"]
+    assert system_blocks == [{"type": "text", "text": "Rubric."}]
+    assert content_blocks == [
+        {"type": "text", "text": "Reference text."},
+        {"type": "text", "text": "Candidate summary."},
+    ]
+    assert "cache_control" not in system_blocks[0]
+    assert "cache_control" not in content_blocks[0]
+    assert "cache_control" not in content_blocks[1]
+
+
+def test_anthropic_judge_cache_markers_land_only_on_system_and_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag on: exactly two cache_control markers (system, reference) —
+    NEVER on the candidate block. Verification #5. Text and block
+    partitioning are otherwise identical to the flag-off case (verification #4)."""
+    captured: dict = {}
+    fake_anthropic = _fake_anthropic_module(captured=captured)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr(evaluator, "PROMPT_CACHE_ENABLED", True)
+
+    segments = ("Rubric.", "Reference text.", "Candidate summary.")
+    evaluator._call_judge_anthropic(segments)
+
+    system_blocks = captured["kwargs"]["system"]
+    content_blocks = captured["kwargs"]["messages"][0]["content"]
+    # Same text/blocks as the flag-off case — only markers differ.
+    assert [b["text"] for b in system_blocks] == ["Rubric."]
+    assert [b["text"] for b in content_blocks] == ["Reference text.", "Candidate summary."]
+
+    markers = [b for b in (system_blocks + content_blocks) if "cache_control" in b]
+    assert len(markers) == 2
+    assert "cache_control" in system_blocks[0]
+    assert "cache_control" in content_blocks[0]      # reference block
+    assert "cache_control" not in content_blocks[1]  # candidate block — never cached
+
+
+# ---------------------------------------------------------------------------
+# Phase A1: extended blind-protocol scan — walks the ACTUAL structured
+# request each provider receives (Anthropic system list + content blocks,
+# OpenAI system+user messages, every Gemini part), not just a flat string.
+# ---------------------------------------------------------------------------
+
+def _scan_blocks_for_forbidden_tokens(value: object) -> list[str]:
+    text = json.dumps(value).lower()
+    return [token for token in BLIND_FORBIDDEN_TOKENS if token in text]
+
+
+def test_anthropic_judge_request_blocks_carry_no_summariser_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    fake_anthropic = _fake_anthropic_module(captured=captured)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+
+    segments = build_judge_prompt_segments(
+        "Reference text body about a clinical trial in dogs.",
+        "Some candidate summary text claiming X and Y.",
+    )
+    evaluator._call_judge_anthropic(segments)
+
+    assert not _scan_blocks_for_forbidden_tokens(captured["kwargs"]["system"])
+    assert not _scan_blocks_for_forbidden_tokens(captured["kwargs"]["messages"])
+
+
+def test_gemini_judge_request_parts_carry_no_summariser_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    class _FakeModels:
+        def generate_content(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(
+                text=json.dumps({
+                    "quality_score": 7, "hallucination_count": 0,
+                    "hallucination_categories": [], "confidence_score": 4,
+                    "reasoning": "ok",
+                }),
+                usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1),
+            )
+
+    class _FakeClient:
+        def __init__(self, api_key=None):
+            self.models = _FakeModels()
+
+    fake_genai = SimpleNamespace(Client=_FakeClient)
+    fake_types = SimpleNamespace(GenerateContentConfig=lambda **kw: SimpleNamespace(**kw))
+
+    def _fake_import(name: str):
+        if name == "google.genai":
+            return fake_genai
+        if name == "google.genai.types":
+            return fake_types
+        raise ImportError(name)
+
+    monkeypatch.setattr(evaluator.importlib, "import_module", _fake_import)
+
+    segments = build_judge_prompt_segments(
+        "Reference text body about a clinical trial in dogs.",
+        "Some candidate summary text claiming X and Y.",
+    )
+    evaluator._call_judge_gemini(segments)
+
+    assert not _scan_blocks_for_forbidden_tokens(captured["kwargs"]["contents"])
+
+
+# ---------------------------------------------------------------------------
+# Phase A2: absent-vs-zero cache fields on build_evaluation_row
+# ---------------------------------------------------------------------------
+
+def test_build_evaluation_row_cache_fields_absent_when_judge_response_lacks_them() -> None:
+    """Verification #7: a judge_response with no cache keys at all (as every
+    pre-Phase-A2 caller's response shape looked) must load as None on the
+    row, not 0 — None means 'this predates cache-token accounting'."""
+    judge_response = {
+        "raw_text": json.dumps({
+            "quality_score": 8, "hallucination_count": 0,
+            "hallucination_categories": [], "confidence_score": 4, "reasoning": "ok",
+        }),
+        "input_tokens": 100, "output_tokens": 20, "model_version": "gpt-test",
+    }
+    row = build_evaluation_row(
+        doi="10.1111/example", summariser="openai", judge="anthropic",
+        reference_text="Reference.", candidate_summary="Candidate.",
+        judge_response=judge_response,
+    )
+    assert row["cache_read_input_tokens"] is None
+    assert row["cache_creation_input_tokens"] is None
+    assert row["judge_prompt_shape"] is None
+
+
+def test_build_evaluation_row_cache_fields_zero_when_attempted_and_missed() -> None:
+    """A judge_response carrying explicit 0s (caching existed, this call
+    missed) must stay 0 on the row — distinct from the absent case above."""
+    judge_response = {
+        "raw_text": json.dumps({
+            "quality_score": 8, "hallucination_count": 0,
+            "hallucination_categories": [], "confidence_score": 4, "reasoning": "ok",
+        }),
+        "input_tokens": 100, "output_tokens": 20, "model_version": "gpt-test",
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        "judge_prompt_shape": "segmented_v1",
+    }
+    row = build_evaluation_row(
+        doi="10.1111/example", summariser="openai", judge="anthropic",
+        reference_text="Reference.", candidate_summary="Candidate.",
+        judge_response=judge_response,
+    )
+    assert row["cache_read_input_tokens"] == 0
+    assert row["cache_creation_input_tokens"] == 0
+    assert row["judge_prompt_shape"] == "segmented_v1"
 
 
 # ---------------------------------------------------------------------------

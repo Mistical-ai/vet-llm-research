@@ -47,6 +47,16 @@ python llm-sum/run_phase3.py summarize --estimate --input-source raw_text
 | `dev`    | Real-time prices, full corpus tokens but obviously you'd cap papers at run time. |
 | `batch`  | Batch prices for providers where `supports_batch=True` (OpenAI, Anthropic). Gemini stays real-time. |
 
+## Model tiers and roles
+
+Prices and model IDs come from `models_config.get_model_spec(provider, role="summarize"|"judge")`. The summarisation leg calls it with `role="summarize"` (the default) and the judge leg with `role="judge"`, so the two can resolve to different models even for the same provider. Each resolves independently through this chain, first match wins:
+
+```
+{PROVIDER}_{SUMMARY|JUDGE}_MODEL_{TIER} → {PROVIDER}_MODEL_{TIER} → {PROVIDER}_MODEL
+```
+
+`MODEL_TIER` (`.env.template` section 16, default `regular`) picks which tier's env vars get consulted first — set it to `premium` for a sensitivity run on a stronger/pricier lineup (e.g. `ANTHROPIC_MODEL_PREMIUM=claude-opus-4-8`) without touching the regular-tier vars everything else depends on. A blank premium model ID falls back to the regular tier with a printed warning rather than failing. The forecast above reflects whichever tier and role resolve for the run's active `.env`.
+
 ## Common errors and fixes
 
 | Symptom                                                              | Cause                                              | Fix                                                              |

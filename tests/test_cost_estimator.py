@@ -11,7 +11,8 @@ from unittest.mock import patch
 import pytest
 
 import cost_estimator
-from models_config import all_providers, get_model_spec
+import models_config
+from models_config import all_providers, compute_cost, get_model_spec
 
 
 def _write_processed_jsonl(path: Path, text: str) -> None:
@@ -97,3 +98,134 @@ def test_estimate_evaluation_scales_with_summariser_count(tmp_path: Path,
     )
     # 3 summarisers should cost ~3x as much as 1.
     assert abs(cost_3 / cost_1 - 3.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Phase B: tier + role resolution (get_model_spec)
+# ---------------------------------------------------------------------------
+# Table-driven over (tier, role, which override vars are set) — verification
+# item 8. MODEL_TIER/_PREMIUM_PRICES are module globals inside models_config
+# itself (not re-imported elsewhere), so monkeypatch.setattr(models_config, ...)
+# is what actually changes get_model_spec()'s behaviour here.
+
+def test_get_model_spec_no_role_argument_matches_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_model_spec(provider) with NO role argument must return exactly
+    what it always has — the ~20 existing call sites never pass a role."""
+    monkeypatch.setattr(models_config, "MODEL_TIER", "regular")
+    monkeypatch.delenv("OPENAI_SUMMARY_MODEL_REGULAR", raising=False)
+    monkeypatch.delenv("OPENAI_JUDGE_MODEL_REGULAR", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL_REGULAR", raising=False)
+
+    spec = get_model_spec("openai")
+    assert spec.model_id == models_config.MODELS["openai"].model_id
+    assert spec.price_input_per_mtok == models_config.MODELS["openai"].price_input_per_mtok
+
+
+def test_get_model_spec_regular_tier_role_specific_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(models_config, "MODEL_TIER", "regular")
+    monkeypatch.setenv("OPENAI_JUDGE_MODEL_REGULAR", "gpt-judge-only")
+    spec_judge = get_model_spec("openai", role="judge")
+    spec_summarize = get_model_spec("openai", role="summarize")
+    assert spec_judge.model_id == "gpt-judge-only"
+    # Summarise role is untouched by a judge-only override.
+    assert spec_summarize.model_id != "gpt-judge-only"
+
+
+def test_get_model_spec_premium_tier_uses_premium_id_and_price(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anthropic's premium id/prices are live in the registry — this is the
+    'filled in correctly' happy path. (.env.template documents
+    ANTHROPIC_MODEL_PREMIUM=claude-opus-4-8 as the live value; set explicitly
+    here since tests never load .env.template itself.)"""
+    monkeypatch.setattr(models_config, "MODEL_TIER", "premium")
+    monkeypatch.setenv("ANTHROPIC_MODEL_PREMIUM", "claude-opus-4-8")
+    spec = get_model_spec("anthropic")
+    assert spec.model_id == "claude-opus-4-8"
+    assert spec.price_input_per_mtok == models_config._PREMIUM_PRICES["anthropic"].price_input_per_mtok
+    assert spec.price_input_per_mtok != models_config.MODELS["anthropic"].price_input_per_mtok
+
+
+def test_get_model_spec_premium_tier_unset_id_falls_back_to_regular(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    """OpenAI/Gemini's premium ids are blank by default — falls back to the
+    regular tier with a printed warning, never a 404-causing blank model id."""
+    monkeypatch.setattr(models_config, "MODEL_TIER", "premium")
+    monkeypatch.delenv("OPENAI_MODEL_PREMIUM", raising=False)
+    monkeypatch.delenv("OPENAI_JUDGE_MODEL_PREMIUM", raising=False)
+    monkeypatch.delenv("OPENAI_SUMMARY_MODEL_PREMIUM", raising=False)
+
+    spec = get_model_spec("openai")
+    assert spec.model_id == models_config.MODELS["openai"].model_id
+    assert spec.price_input_per_mtok == models_config.MODELS["openai"].price_input_per_mtok
+    captured = capsys.readouterr()
+    assert "falling back to the regular tier" in captured.out
+
+
+def test_get_model_spec_premium_tier_refuses_stale_price_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A premium model id that resolves non-empty, but whose premium price
+    row still matches the regular tier's numbers exactly, must raise rather
+    than let BudgetGuard silently misreport spend."""
+    monkeypatch.setattr(models_config, "MODEL_TIER", "premium")
+    monkeypatch.setenv("OPENAI_MODEL_PREMIUM", "gpt-6-hypothetical")
+    # _PREMIUM_PRICES["openai"] is deliberately still identical to the
+    # regular row (see models_config.py's comment) until someone fills in
+    # real premium pricing alongside a real premium id.
+    with pytest.raises(ValueError, match="premium price row"):
+        get_model_spec("openai")
+
+
+def test_get_model_spec_unknown_role_raises() -> None:
+    with pytest.raises(ValueError):
+        get_model_spec("openai", role="not-a-real-role")
+
+
+# ---------------------------------------------------------------------------
+# Phase A2: compute_cost cache-token pricing (verification #6)
+# ---------------------------------------------------------------------------
+
+def test_compute_cost_zero_cache_args_returns_todays_number() -> None:
+    """cache_read_tokens=cache_write_tokens=0 (the default) must return
+    EXACTLY today's number — every existing caller/test is unaffected."""
+    plain = compute_cost("openai", 1000, 200, batched=False)
+    with_zero_cache = compute_cost("openai", 1000, 200, batched=False,
+                                   cache_read_tokens=0, cache_write_tokens=0)
+    assert with_zero_cache == plain
+
+
+def test_compute_cost_prices_anthropic_cache_reads_and_writes() -> None:
+    """Synthetic Anthropic usage {input:100, cache_creation:900,
+    cache_read:8000} (input_tokens=9000 total, per the parser's summing
+    rule) prices the uncached remainder at the normal rate, reads at 0.1x,
+    and writes at the TTL-appropriate multiplier."""
+    spec = get_model_spec("anthropic")
+    output_tokens = 50
+    cost_5m = compute_cost(
+        "anthropic", 9000, output_tokens, batched=False,
+        cache_read_tokens=8000, cache_write_tokens=900, cache_ttl="5m",
+    )
+    expected_5m = (
+        (100 / 1_000_000) * spec.price_input_per_mtok
+        + (8000 / 1_000_000) * spec.price_input_per_mtok * spec.cache_read_multiplier
+        + (900 / 1_000_000) * spec.price_input_per_mtok * spec.cache_write_multiplier_5m
+        + (output_tokens / 1_000_000) * spec.price_output_per_mtok
+    )
+    assert abs(cost_5m - expected_5m) < 1e-9
+
+    cost_1h = compute_cost(
+        "anthropic", 9000, output_tokens, batched=False,
+        cache_read_tokens=8000, cache_write_tokens=900, cache_ttl="1h",
+    )
+    # A 1h-TTL write costs more than a 5m one (2.0x vs 1.25x) — everything
+    # else about the request is identical.
+    assert cost_1h > cost_5m
+
+
+def test_compute_cost_cache_hit_cheaper_than_no_caching_at_all() -> None:
+    """A cache hit must cost less than the same total tokens with no
+    caching involved — sanity check on the multiplier direction."""
+    uncached = compute_cost("anthropic", 9000, 50, batched=False)
+    cached = compute_cost(
+        "anthropic", 9000, 50, batched=False,
+        cache_read_tokens=8000, cache_write_tokens=0,
+    )
+    assert cached < uncached

@@ -243,10 +243,15 @@ Underneath any paid mode, requests reach the providers one of two ways:
   the only way direct-PDF input works.
 - **Batch.** Many requests are bundled together, uploaded to the provider
   as a job, and processed over the following hours — this is what `batch`
-  mode uses for OpenAI and Anthropic (Gemini's batch API isn't wired into
-  this project, so Gemini always runs real-time, even during a `batch`
-  run). A separate command, `check_batch_status.py`, is run later to
-  collect the finished results once the provider's job completes.
+  mode uses for OpenAI and Anthropic by default. Gemini's batch API *is*
+  wired into this project, but it ships **off by default**
+  (`GEMINI_BATCH_ENABLED=false`), so out of the box Gemini still runs
+  real-time even during a `batch` run — flip that flag once you've
+  smoke-tested it to submit Gemini as a batch job too. A separate command,
+  `check_batch_status.py`, is run later to collect the finished results
+  once the provider's job completes. Full batch-mode reference, every flag,
+  and the troubleshooting playbook for real batch failures:
+  [docs/phase3/batch_mode.md](../phase3/batch_mode.md).
 
 **Why batch for the full run?** Two reasons: batch pricing is roughly
 **half the price** of real-time pricing for the providers that support

@@ -403,6 +403,43 @@ The judge does not see:
 This prevents model-name bias and keeps comparisons fair. The summarizer name is
 attached only after scoring, as metadata in `data/evaluations.jsonl`.
 
+### Prompt shape: segmented, on every path
+
+`evaluator.build_judge_prompt_segments()` splits the same rendered judge
+prompt into three pieces — a rubric prefix, the reference-text block, and
+the candidate-summary block — instead of one flat string.
+`evaluator.build_judge_prompt()` (used wherever only the flat string is
+needed) is a thin join over those same three segments, so the judge reads
+byte-identical text either way; only the block boundaries differ. This
+split is unconditional: it lands the same way for batch and real-time judge
+calls, all three providers, whether or not prompt caching (below) is turned
+on. It is a one-way change made deliberately before collecting judge data,
+not something that co-varies with a billing flag — see
+`docs/phase3/batch_mode.md`'s Prompt caching section for the full per-
+provider block layout.
+
+Every row `evaluate` writes after this landed carries
+`judge_prompt_shape: "segmented_v1"`; a row with no such field predates the
+change. `eval-report` warns (does not error) when a corpus mixes the two —
+see `docs/phase3/eval_report.md`'s Mixed-provenance warnings section — because
+pooling pre- and post-change scores together would average two slightly
+different measurement instruments as if they were one.
+
+### Prompt caching (judge stage only; off by default)
+
+`PROMPT_CACHE_ENABLED` (`.env.template` section 12, default `false`) adds an
+Anthropic `cache_control` marker (on the rubric and reference blocks only,
+never the candidate) and an OpenAI `prompt_cache_key`, on top of the
+segmented shape above. Caching is judge/evaluate-only: summarisation makes
+one call per paper per provider with no meaningfully shared prefix, so there
+is nothing there worth caching. `data/evaluations.jsonl` rows carry
+`cache_read_input_tokens` / `cache_creation_input_tokens` alongside
+`input_tokens` (which is always the TOTAL — uncached + written + read — per
+`models_config.compute_cost`'s pricing). See `docs/phase3/eval_report.md`
+for the "absent vs zero" rule these two fields follow, and
+`docs/phase3/batch_mode.md` for the pilot procedure before turning this on
+for a full run.
+
 ## Why Automatic Metrics Are Secondary
 
 The pipeline also stores local automatic metrics:
@@ -628,6 +665,7 @@ unless `JURY_AGGREGATION_MODE=weighted`.
 | `jury_score` | **Primary score** — aliases `jury_score_unweighted` or `jury_score_weighted` depending on `JURY_AGGREGATION_MODE` (4.0 here, unweighted by default) |
 | `jury_score_weighted` / `jury_score_unweighted` | Both aggregation methods, always stored (4.02 / 4.0 here) — see ["Weighted vs. Unweighted"](#weighted-vs-unweighted) |
 | `quality_score` | Legacy 1–10 alias derived from the primary `jury_score` (8 here) |
+| `factual_accuracy` / `clinical_relevance` / `organization` / `composite_score` | Legacy top-level fields from the superseded `vet_score_v2.0` rubric (see [judge_and_rubric.md](judge_and_rubric.md)), still written for backward compatibility. They are **not** part of the current 5-criterion MedHELM rubric — use `criteria_scores` and `jury_score` instead. |
 | `hallucination_claims` | Quoted evidence when the summary says something the paper does not support |
 | `requires_human_review` | `false` here because confidence is high and the hallucination is minor |
 | `automatic_metrics` | Secondary local checks — useful, but not the main clinical score |
@@ -704,7 +742,7 @@ python llm-sum/run_phase3.py eval-report --json
 ```
 
 Every run also saves the full report JSON to
-`data/results/eval_report_<UTC timestamp>.json` (one file per run, never
+`data/results/json/eval_report_<UTC timestamp>.json` (one file per run, never
 overwritten) — pass `--no-save` to print only, or `--results-dir PATH` to
 save elsewhere for one run. See [eval_report.md](eval_report.md) for the full
 flag reference.

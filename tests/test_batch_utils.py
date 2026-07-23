@@ -123,13 +123,32 @@ def test_build_gemini_batch_request_shape() -> None:
 # what the real-time judge calls actually send.
 # ---------------------------------------------------------------------------
 
-def test_build_openai_request_for_judge_uses_json_object_mode() -> None:
-    row = build_openai_request("slug", "Judge this.", "gpt-5.4", for_judge=True)
+# Judge requests are segmented (Phase A1): a (rubric_prefix, reference_block,
+# candidate_block) 3-tuple, matching evaluator.build_judge_prompt_segments'
+# return shape, not a flat string.
+_JUDGE_SEGMENTS = ("Rubric.", "Reference text.", "Candidate summary.")
+
+
+def test_build_openai_request_for_judge_uses_json_object_mode(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pinned rather than relying on the ambient default: PROMPT_CACHE_ENABLED
+    # is a real .env setting a user may legitimately have flipped on, and
+    # this test's purpose is the request SHAPE, not the flag's live value.
+    monkeypatch.setattr(batch_utils, "PROMPT_CACHE_ENABLED", False)
+    row = build_openai_request("slug", _JUDGE_SEGMENTS, "gpt-5.4", for_judge=True)
     assert row["body"]["response_format"] == {"type": "json_object"}
+    # Segmented: rubric in its own system message, reference+candidate in user.
+    messages = row["body"]["messages"]
+    assert messages[0] == {"role": "system", "content": "Rubric."}
+    assert messages[1] == {"role": "user", "content": "Reference text.Candidate summary."}
+    # With the flag pinned false — no prompt_cache_key present.
+    assert "prompt_cache_key" not in row["body"]
 
 
-def test_build_anthropic_request_for_judge_omits_tools() -> None:
-    row = build_anthropic_request("slug", "Judge this.", "claude-sonnet-4-6", for_judge=True)
+def test_build_anthropic_request_for_judge_omits_tools(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(batch_utils, "PROMPT_CACHE_ENABLED", False)
+    row = build_anthropic_request("slug", _JUDGE_SEGMENTS, "claude-sonnet-4-6", for_judge=True)
     params = row["params"]
     assert "tools" not in params, (
         "a forced tool_choice makes Anthropic return a tool_use block, not a "
@@ -137,14 +156,202 @@ def test_build_anthropic_request_for_judge_omits_tools() -> None:
         "(what the judge merge path uses) would read back an empty string"
     )
     assert "tool_choice" not in params
+    # Segmented: rubric in its own system block, reference+candidate as two
+    # content blocks in the one user message.
+    assert params["system"] == [{"type": "text", "text": "Rubric."}]
+    content = params["messages"][0]["content"]
+    assert content == [
+        {"type": "text", "text": "Reference text."},
+        {"type": "text", "text": "Candidate summary."},
+    ]
+    # With the flag pinned false — no cache_control markers.
+    assert "cache_control" not in params["system"][0]
+    assert "cache_control" not in content[0]
 
 
 def test_build_gemini_batch_request_for_judge_omits_response_schema() -> None:
-    row = build_gemini_batch_request("slug", "Judge this.", "gemini-3.5-flash", for_judge=True)
+    row = build_gemini_batch_request("slug", _JUDGE_SEGMENTS, "gemini-3.5-flash", for_judge=True)
     config = row["request"]["generation_config"]
     assert "response_schema" not in config
     assert config["response_mime_type"] == "application/json"
     assert config["thinking_config"] == {"thinking_budget": 0}
+    # Segmented: three ordered parts, matching evaluator._call_judge_gemini's
+    # real-time shape exactly (verification item 3).
+    parts = row["request"]["contents"][0]["parts"]
+    assert parts == [
+        {"text": "Rubric."},
+        {"text": "Reference text."},
+        {"text": "Candidate summary."},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase A3: cache markers behind PROMPT_CACHE_ENABLED (batch builders)
+# ---------------------------------------------------------------------------
+
+def test_build_anthropic_request_cache_markers_land_only_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag off vs on: identical text/blocks; only cache_control differs, and
+    only on system+reference, never candidate — verification #4 and #5."""
+    monkeypatch.setattr(batch_utils, "PROMPT_CACHE_ENABLED", False)
+    off_row = build_anthropic_request("slug", _JUDGE_SEGMENTS, "claude-sonnet-4-6", for_judge=True)
+
+    monkeypatch.setattr(batch_utils, "PROMPT_CACHE_ENABLED", True)
+    on_row = build_anthropic_request("slug", _JUDGE_SEGMENTS, "claude-sonnet-4-6", for_judge=True)
+
+    # Same text, same block partitioning, both ways.
+    off_system, on_system = off_row["params"]["system"], on_row["params"]["system"]
+    off_content = off_row["params"]["messages"][0]["content"]
+    on_content = on_row["params"]["messages"][0]["content"]
+    assert [b["text"] for b in off_system] == [b["text"] for b in on_system] == ["Rubric."]
+    assert [b["text"] for b in off_content] == [b["text"] for b in on_content] == [
+        "Reference text.", "Candidate summary.",
+    ]
+
+    assert "cache_control" not in off_system[0]
+    assert "cache_control" not in off_content[0]
+    assert "cache_control" not in off_content[1]
+
+    # Exactly two markers when on: system + reference, never candidate.
+    on_markers = [b for b in (on_system + on_content) if "cache_control" in b]
+    assert len(on_markers) == 2
+    assert "cache_control" in on_system[0]
+    assert "cache_control" in on_content[0]
+    assert "cache_control" not in on_content[1]
+
+
+def test_build_openai_request_prompt_cache_key_only_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import models_config
+
+    monkeypatch.setattr(batch_utils, "PROMPT_CACHE_ENABLED", False)
+    off_row = build_openai_request("slug", _JUDGE_SEGMENTS, "gpt-5.4", for_judge=True)
+    assert "prompt_cache_key" not in off_row["body"]
+
+    monkeypatch.setattr(batch_utils, "PROMPT_CACHE_ENABLED", True)
+    monkeypatch.setattr(models_config, "PROMPT_CACHE_KEY_SCOPE", "article")
+    on_row = build_openai_request("slug", _JUDGE_SEGMENTS, "gpt-5.4", for_judge=True,
+                                  cache_article_id="10_1111_jvim_16872")
+    assert on_row["body"]["prompt_cache_key"] == "veteval-judge-10_1111_jvim_16872"
+    # Text/blocks identical either way.
+    assert off_row["body"]["messages"] == on_row["body"]["messages"]
+
+
+# ---------------------------------------------------------------------------
+# Phase A1: extended blind-protocol scan over the ACTUAL batch request shape
+# (Anthropic system list + content blocks, OpenAI system+user messages,
+# every Gemini part) — not just a flat string.
+# ---------------------------------------------------------------------------
+
+def _scan_for_forbidden_tokens(value: object) -> list[str]:
+    from evaluator import BLIND_FORBIDDEN_TOKENS
+    text = json.dumps(value).lower()
+    return [token for token in BLIND_FORBIDDEN_TOKENS if token in text]
+
+
+def test_batch_judge_requests_carry_no_summariser_identity() -> None:
+    from evaluator import build_judge_prompt_segments
+
+    segments = build_judge_prompt_segments(
+        "Reference text body about a clinical trial in dogs.",
+        "Some candidate summary text claiming X and Y.",
+    )
+
+    openai_row = build_openai_request("slug", segments, "gpt-5.4", for_judge=True)
+    assert not _scan_for_forbidden_tokens(openai_row["body"]["messages"])
+
+    anthropic_row = build_anthropic_request("slug", segments, "claude-sonnet-4-6", for_judge=True)
+    assert not _scan_for_forbidden_tokens(anthropic_row["params"]["system"])
+    assert not _scan_for_forbidden_tokens(anthropic_row["params"]["messages"])
+
+    gemini_row = build_gemini_batch_request("slug", segments, "gemini-3.5-flash", for_judge=True)
+    assert not _scan_for_forbidden_tokens(gemini_row["request"]["contents"])
+
+
+def test_blind_scan_actually_catches_a_leak_in_any_block() -> None:
+    """Negative control for the scan above: this is the test most at risk
+    from the restructure (per the caching design plan), so prove the
+    detector itself works — a summariser name planted in ANY block (system,
+    reference, or candidate) for ANY provider must be caught, not just the
+    happy-path absence checked above."""
+    leaky_candidate = "This summary was written by OpenAI's GPT model."
+    segments = ("Rubric.", "Reference text.", leaky_candidate)
+
+    openai_row = build_openai_request("slug", segments, "gpt-5.4", for_judge=True)
+    assert _scan_for_forbidden_tokens(openai_row["body"]["messages"])
+
+    anthropic_row = build_anthropic_request("slug", segments, "claude-sonnet-4-6", for_judge=True)
+    assert _scan_for_forbidden_tokens(anthropic_row["params"]["messages"])
+
+    gemini_row = build_gemini_batch_request("slug", segments, "gemini-3.5-flash", for_judge=True)
+    assert _scan_for_forbidden_tokens(gemini_row["request"]["contents"])
+
+    # A leak in the rubric block specifically (not just the candidate) must
+    # also be caught — this is the block most likely to regress if a future
+    # edit hardcodes a model name into the shared prefix.
+    leaky_rubric_segments = ("Rubric mentions Claude.", "Reference text.", "Candidate.")
+    leaky_anthropic_row = build_anthropic_request(
+        "slug", leaky_rubric_segments, "claude-sonnet-4-6", for_judge=True,
+    )
+    assert _scan_for_forbidden_tokens(leaky_anthropic_row["params"]["system"])
+
+
+# ---------------------------------------------------------------------------
+# Verification #3: batch and real-time carry the SAME segments in the SAME
+# order, for each provider — a corpus split between batch (OpenAI/Anthropic
+# by default) and real-time (Gemini by default) judges must never score two
+# different prompt shapes.
+# ---------------------------------------------------------------------------
+
+def test_batch_and_realtime_openai_share_the_same_segmented_messages() -> None:
+    from evaluator import build_judge_prompt_segments
+
+    segments = build_judge_prompt_segments("Reference body.", "Candidate body.")
+    batch_row = build_openai_request("slug", segments, "gpt-5.4", for_judge=True)
+
+    # Mirrors evaluator._call_judge_openai's message construction exactly.
+    rubric_prefix, reference_block, candidate_block = segments
+    realtime_messages = [
+        {"role": "system", "content": rubric_prefix},
+        {"role": "user", "content": reference_block + candidate_block},
+    ]
+    assert batch_row["body"]["messages"] == realtime_messages
+
+
+def test_batch_and_realtime_anthropic_share_the_same_segmented_blocks(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from evaluator import build_judge_prompt_segments
+
+    # Pinned: this test is about block/text parity, not the caching flag —
+    # with it left at the ambient .env value, a real PROMPT_CACHE_ENABLED=true
+    # would add cache_control markers the realtime_system fixture doesn't have.
+    monkeypatch.setattr(batch_utils, "PROMPT_CACHE_ENABLED", False)
+    segments = build_judge_prompt_segments("Reference body.", "Candidate body.")
+    batch_row = build_anthropic_request("slug", segments, "claude-sonnet-4-6", for_judge=True)
+
+    rubric_prefix, reference_block, candidate_block = segments
+    realtime_system = [{"type": "text", "text": rubric_prefix}]
+    realtime_content = [
+        {"type": "text", "text": reference_block},
+        {"type": "text", "text": candidate_block},
+    ]
+    assert batch_row["params"]["system"] == realtime_system
+    assert batch_row["params"]["messages"][0]["content"] == realtime_content
+
+
+def test_batch_and_realtime_gemini_share_the_same_segmented_parts() -> None:
+    from evaluator import build_judge_prompt_segments
+
+    segments = build_judge_prompt_segments("Reference body.", "Candidate body.")
+    batch_row = build_gemini_batch_request("slug", segments, "gemini-3.5-flash", for_judge=True)
+
+    rubric_prefix, reference_block, candidate_block = segments
+    realtime_parts = [{"parts": [
+        {"text": rubric_prefix}, {"text": reference_block}, {"text": candidate_block},
+    ]}]
+    assert batch_row["request"]["contents"] == realtime_parts
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +421,40 @@ def test_parse_openai_result_line_error() -> None:
     parsed = parse_openai_result_line(line)
     assert parsed["status"] == "failed"
     assert parsed["summary"] is None
+
+
+def test_parse_openai_result_line_captures_cached_tokens() -> None:
+    """usage.prompt_tokens_details.cached_tokens is captured as
+    cache_read_input_tokens; prompt_tokens (which already includes cached
+    tokens) is NOT re-added on top of it."""
+    line = json.dumps({
+        "custom_id": "slug_cache",
+        "response": {
+            "status_code": 200,
+            "body": {
+                "model": "gpt-5.4-preview",
+                "choices": [{"message": {"content": "some judge text"}}],
+                "usage": {
+                    "prompt_tokens": 5000,
+                    "completion_tokens": 200,
+                    "prompt_tokens_details": {"cached_tokens": 4000},
+                },
+            },
+        },
+    })
+    parsed = parse_openai_result_line(line, expect_summary_schema=False)
+    assert parsed["input_tokens"] == 5000
+    assert parsed["cache_read_input_tokens"] == 4000
+    assert parsed["cache_creation_input_tokens"] is None
+    assert parsed["judge_prompt_shape"] == "segmented_v1"
+
+
+def test_parse_openai_result_line_cache_fields_absent_when_no_details() -> None:
+    """No prompt_tokens_details at all (older/pre-caching response shape)
+    loads as None, not 0 — see the absent-vs-zero rule."""
+    line = _openai_success_line("slug_no_cache", json.dumps(_valid_summary_payload()))
+    parsed = parse_openai_result_line(line)
+    assert parsed["cache_read_input_tokens"] is None
 
 
 def test_parse_openai_result_line_truncated_reports_finish_reason() -> None:
@@ -295,6 +536,44 @@ def test_parse_anthropic_result_line_success() -> None:
     assert parsed["model_version"] == "claude-sonnet-4-6-20260101"
 
 
+def test_parse_anthropic_result_line_captures_cache_tokens_and_sums_input() -> None:
+    """Verification #6 at the batch-parser level: usage {input_tokens: 100,
+    cache_creation_input_tokens: 900, cache_read_input_tokens: 8000} must
+    yield input_tokens == 9000 (the sum of all three), not 100."""
+    line = json.dumps({
+        "custom_id": "slug_cache",
+        "result": {
+            "type": "succeeded",
+            "message": {
+                "model": "claude-sonnet-4-6-20260101",
+                "content": [{"type": "text", "text": "some judge text"}],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 900,
+                    "cache_read_input_tokens": 8000,
+                },
+            },
+        },
+    })
+    parsed = parse_anthropic_result_line(line, expect_summary_schema=False)
+    assert parsed["input_tokens"] == 9000
+    assert parsed["cache_creation_input_tokens"] == 900
+    assert parsed["cache_read_input_tokens"] == 8000
+    assert parsed["judge_prompt_shape"] == "segmented_v1"
+
+
+def test_parse_anthropic_result_line_cache_fields_zero_when_absent_from_usage() -> None:
+    """A real Anthropic response always includes both cache fields (0 when
+    caching wasn't used) — so a row with no cache_control markers still
+    parses as an explicit 0, not None."""
+    parsed = parse_anthropic_result_line(_anthropic_success_line("slug_x", "some judge text"),
+                                        expect_summary_schema=False)
+    assert parsed["cache_creation_input_tokens"] == 0
+    assert parsed["cache_read_input_tokens"] == 0
+    assert parsed["input_tokens"] == 800
+
+
 def test_parse_anthropic_result_line_error() -> None:
     line = _anthropic_error_line("slug_d")
     parsed = parse_anthropic_result_line(line)
@@ -334,6 +613,31 @@ def test_parse_gemini_result_line_success() -> None:
     assert parsed["output_tokens"] == 180
     assert parsed["model_version"] == "gemini-3.5-flash"
     assert parsed["custom_id"] == "slug_e"
+
+
+def test_parse_gemini_result_line_captures_cached_content_tokens() -> None:
+    line = json.dumps({
+        "key": "slug_cache",
+        "response": {
+            "candidates": [{"content": {"parts": [{"text": "some judge text"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 900, "candidatesTokenCount": 180,
+                "cachedContentTokenCount": 700,
+            },
+            "modelVersion": "gemini-3.5-flash",
+        },
+    })
+    parsed = parse_gemini_result_line(line, expect_summary_schema=False)
+    assert parsed["input_tokens"] == 900  # already includes cached tokens
+    assert parsed["cache_read_input_tokens"] == 700
+    assert parsed["cache_creation_input_tokens"] is None
+    assert parsed["judge_prompt_shape"] == "segmented_v1"
+
+
+def test_parse_gemini_result_line_cache_field_absent_when_no_cached_content() -> None:
+    line = _gemini_success_line("slug_no_cache", "some judge text")
+    parsed = parse_gemini_result_line(line, expect_summary_schema=False)
+    assert parsed["cache_read_input_tokens"] is None
 
 
 def test_parse_gemini_result_line_error() -> None:
@@ -943,6 +1247,107 @@ def test_run_batch_evaluation_honors_doi_filter(
 
 
 # ---------------------------------------------------------------------------
+# max_new_requests chunks a large backlog safely under a provider's
+# enqueued-token cap, and — unlike --limit's fixed-seed sampling — genuinely
+# ADVANCES across repeated calls instead of resampling the same combinations.
+# Motivated by real OpenAI batch failures: two 720-request evaluate
+# submissions were rejected outright with "token_limit_exceeded: Enqueued
+# token limit reached for gpt-5.4 ... Limit: 900,000 enqueued tokens" (see
+# data/error_log.jsonl), while smaller submissions succeeded.
+# ---------------------------------------------------------------------------
+
+def _setup_evaluate_backlog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int):
+    """4+ DOIs, each with a successful anthropic-written summary, none yet
+    judged by openai — a backlog run_batch_evaluation can chunk through."""
+    import evaluator
+
+    dois = [f"10.9999/backlog.{i}" for i in range(n)]
+    summaries_path = tmp_path / "summaries.jsonl"
+    summaries_path.write_text(
+        "\n".join(json.dumps({
+            "doi": doi, "custom_id": doi_to_slug(doi), "input_source": "processed",
+            "models": {"anthropic": {"status": "success", "summary": f"Candidate for {doi}."}},
+        }) for doi in dois) + "\n",
+        encoding="utf-8",
+    )
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    evaluations_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(batch_utils, "SUMMARIES_PATH", summaries_path)
+    monkeypatch.setattr(batch_utils, "BATCH_DIR", tmp_path / "batch")
+    monkeypatch.setattr(batch_utils, "BATCH_JOBS_PATH", tmp_path / "batch_jobs.jsonl")
+    monkeypatch.setattr(batch_utils, "_read_cached_text", lambda _r: "Reference body.")
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
+    monkeypatch.setattr(
+        batch_utils, "submit_openai_batch",
+        lambda p: {"job_id": "j", "provider": "openai"})
+    monkeypatch.setattr(batch_utils, "record_batch_job", lambda _m: None)
+    return dois, evaluations_path
+
+
+def _queued_dois_from_latest_job(tmp_path: Path) -> set[str]:
+    jsonl_files = sorted((tmp_path / "batch").glob("openai_eval_*.jsonl"))
+    rows = [json.loads(l) for l in jsonl_files[-1].read_text(encoding="utf-8").splitlines() if l.strip()]
+    return {row["custom_id"].split("__")[0] for row in rows}
+
+
+def test_max_new_requests_caps_the_submission(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dois, _ = _setup_evaluate_backlog(tmp_path, monkeypatch, n=5)
+
+    result = batch_utils.run_batch_evaluation(
+        judges=["openai"], resume=True, max_new_requests=2,
+    )
+
+    assert result["submitted"][0]["request_count"] == 2, (
+        "max_new_requests=2 should cap this submission at 2 requests, "
+        f"not queue all {len(dois)} available combinations"
+    )
+
+
+def test_max_new_requests_advances_on_repeated_calls_unlike_limit(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The property --limit's fixed-seed sampling cannot provide: calling
+    run_batch_evaluation again with the same max_new_requests, after the
+    first chunk's results are merged, queues the NEXT chunk — not the same
+    combinations again."""
+    import evaluator
+
+    dois, evaluations_path = _setup_evaluate_backlog(tmp_path, monkeypatch, n=4)
+    slug_to_doi = {doi_to_slug(doi): doi for doi in dois}
+
+    # --- Chunk 1 ---
+    batch_utils.run_batch_evaluation(judges=["openai"], resume=True, max_new_requests=2)
+    chunk_1_slugs = _queued_dois_from_latest_job(tmp_path)
+    assert len(chunk_1_slugs) == 2
+
+    # Simulate check_batch_status.py merging chunk 1's results: append real
+    # evaluation rows for exactly the DOIs that were queued, using the same
+    # key fields already_evaluated() matches on.
+    rows = [
+        {
+            "doi": slug_to_doi[slug], "summarizer": "anthropic", "judge": "openai",
+            "input_source": "processed", "rubric_version": evaluator.RUBRIC_VERSION,
+        }
+        for slug in chunk_1_slugs
+    ]
+    with open(evaluations_path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+    # --- Chunk 2: same max_new_requests, same call shape ---
+    batch_utils.run_batch_evaluation(judges=["openai"], resume=True, max_new_requests=2)
+    chunk_2_slugs = _queued_dois_from_latest_job(tmp_path)
+
+    all_slugs = set(slug_to_doi)
+    assert chunk_2_slugs == all_slugs - chunk_1_slugs, (
+        "the second call should advance to the remaining, not-yet-evaluated "
+        f"DOIs {all_slugs - chunk_1_slugs}, not resubmit chunk 1's {chunk_1_slugs} or stall"
+    )
+    assert chunk_1_slugs.isdisjoint(chunk_2_slugs), "the two chunks must not overlap"
+
+
+# ---------------------------------------------------------------------------
 # A failed judge result must not abort the whole merge
 # ---------------------------------------------------------------------------
 
@@ -1520,3 +1925,164 @@ def test_merge_evaluation_results_produces_correct_schema(
     assert row["requires_human_review"] is False
     assert "judge_model_version" in row
     assert row["judge_model_version"] == "gpt-5.4-eval"
+
+
+def test_merge_evaluation_results_populates_strata_from_manifest(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The batch merge path used to omit strata entirely (defaulting to just
+    {"input_source": ...}), silently leaving journal/species/study_design/
+    clinical_topic unpopulated for every batch-evaluated row — even though
+    that data already exists in summaries.jsonl/manifest.jsonl. Confirms the
+    fix: merge_evaluation_results now builds strata the same way the
+    real-time path does (build_strata + load_manifest_index), pulling
+    journal from the summary record and species/study_design/clinical_topic
+    from the manifest record.
+    """
+    doi = "10.9999/batch.strata.0001"
+    slug = doi_to_slug(doi)
+
+    summaries_path = tmp_path / "summaries.jsonl"
+    summaries_path.write_text(json.dumps({
+        "doi": doi,
+        "custom_id": slug,
+        "journal": "JVIM",  # summary record supplies journal
+        "models": {
+            "anthropic": {
+                "status": "success",
+                "summary": "Candidate summary text.",
+                "model_version": "claude-sonnet-4-6-test",
+                "input_tokens": 400, "output_tokens": 80,
+            }
+        }
+    }) + "\n", encoding="utf-8")
+
+    # Manifest supplies the covariates the summary record doesn't carry.
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps({
+        "doi": doi, "species": ["Canine"], "study_design": "Retrospective Case Series",
+        "clinical_topic": "Cardiology",
+    }) + "\n", encoding="utf-8")
+    manual_manifest_path = tmp_path / "manual_manifest.jsonl"
+    manual_manifest_path.write_text("", encoding="utf-8")
+
+    judge_raw = _make_judge_json_response(quality=8)
+    result_path = tmp_path / "openai_eval_results.jsonl"
+    result_path.write_text(
+        _openai_success_line(f"{slug}__anthropic", judge_raw, model="gpt-5.4-eval"),
+        encoding="utf-8",
+    )
+
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    monkeypatch.setattr(check_batch_status, "EVALUATIONS_PATH", evaluations_path)
+    monkeypatch.setattr(check_batch_status, "SUMMARIES_PATH", summaries_path)
+
+    import check_batch_status as cbs
+
+    def _patched_load():
+        out: dict = {}
+        with open(summaries_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    out[entry["doi"]] = entry
+        return out
+
+    monkeypatch.setattr(cbs, "_load_summaries", _patched_load)
+
+    import evaluator
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
+
+    # Isolate from the real project manifest — this is the load_manifest_index()
+    # call merge_evaluation_results now makes internally.
+    import eval_instances
+    monkeypatch.setattr(eval_instances, "MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr(eval_instances, "MANUAL_MANIFEST_PATH", manual_manifest_path)
+
+    count = check_batch_status.merge_evaluation_results(result_path, provider="openai", judge="openai")
+    assert count == 1
+
+    row = json.loads(evaluations_path.read_text(encoding="utf-8").strip())
+    strata = row["strata"]
+    assert strata["journal"] == "JVIM", "journal from the summary record was not carried into strata"
+    assert strata["species"] == ["Canine"], "species from the manifest record was not carried into strata"
+    assert strata["study_design"] == "Retrospective Case Series"
+    assert strata["clinical_topic"] == "Cardiology"
+
+
+def test_merge_evaluation_results_computes_real_automatic_metrics(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The batch merge path used to pass reference_text="" to
+    build_evaluation_row, which calculate_automatic_metrics() then compared
+    the candidate summary against — an empty reference makes ROUGE recall,
+    compression_ratio, and extractive_coverage mathematically always 0,
+    regardless of the candidate's actual quality. Confirms the fix: merge_
+    evaluation_results now looks up the real cached article text (the same
+    _read_cached_text() helper run_batch_evaluation already uses to build
+    the original judge request), so these stats reflect real overlap.
+    """
+    doi = "10.9999/batch.metrics.0001"
+    slug = doi_to_slug(doi)
+
+    summaries_path = tmp_path / "summaries.jsonl"
+    summaries_path.write_text(json.dumps({
+        "doi": doi,
+        "custom_id": slug,
+        "models": {
+            "anthropic": {
+                "status": "success",
+                # Shares real words with the reference text below, so a
+                # correctly-wired ROUGE computation has genuine overlap to find.
+                "summary": "The dog study found significant improvement in outcomes.",
+                "model_version": "claude-sonnet-4-6-test",
+                "input_tokens": 400, "output_tokens": 80,
+            }
+        }
+    }) + "\n", encoding="utf-8")
+
+    judge_raw = _make_judge_json_response(quality=8)
+    result_path = tmp_path / "openai_eval_results.jsonl"
+    result_path.write_text(
+        _openai_success_line(f"{slug}__anthropic", judge_raw, model="gpt-5.4-eval"),
+        encoding="utf-8",
+    )
+
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    monkeypatch.setattr(check_batch_status, "EVALUATIONS_PATH", evaluations_path)
+    monkeypatch.setattr(check_batch_status, "SUMMARIES_PATH", summaries_path)
+
+    import check_batch_status as cbs
+
+    def _patched_load():
+        out: dict = {}
+        with open(summaries_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    out[entry["doi"]] = entry
+        return out
+
+    monkeypatch.setattr(cbs, "_load_summaries", _patched_load)
+    # The real reference article text — this is what _read_cached_text()
+    # would normally fetch from data/processed/*.jsonl.
+    monkeypatch.setattr(
+        cbs, "_read_cached_text",
+        lambda entry: "A retrospective study of dogs found significant improvement in clinical outcomes.")
+
+    import evaluator
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
+
+    count = check_batch_status.merge_evaluation_results(result_path, provider="openai", judge="openai")
+    assert count == 1
+
+    row = json.loads(evaluations_path.read_text(encoding="utf-8").strip())
+    metrics = row["automatic_metrics"]
+    assert metrics["rouge_1"] > 0, (
+        "rouge_1 is 0 — reference_text is still not reaching calculate_automatic_metrics(), "
+        "the exact degenerate behavior this fix addresses"
+    )
+    assert metrics["rouge_l"] > 0
+    assert metrics["compression_ratio"] > 0
