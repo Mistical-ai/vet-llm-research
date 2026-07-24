@@ -424,6 +424,8 @@ Full workflow: **[docs/phase5/human_validation.md](docs/phase5/human_validation.
 
 ## Phase 6 — Publication reporting
 
+The day-to-day `eval-report` / `eval-report --markdown` report from Phase 3/4 above **never includes significance tests or TF-IDF/cosine similarity** — that's intentional, so the daily dashboard stays short. Those numbers live behind three separate, free, offline commands instead:
+
 One command turns evaluation rows into paper-ready quantitative results:
 
 ```powershell
@@ -444,6 +446,7 @@ python llm-sum/run_phase3.py eval-report --publication
 - Per-stratum breakdowns (species, study design, clinical topic, journal)
 - Input-channel comparison (processed text vs direct PDF)
 - Inter-judge reliability (Krippendorff's α)
+- TF-IDF/cosine information-density check (also available standalone, see `stats-engine` below)
 
 **Figures and leaderboard:**
 
@@ -452,6 +455,16 @@ python llm-sum/run_phase3.py report-figures
 ```
 
 Writes PNG/SVG charts and a VetHELM-style leaderboard to `data/results/`.
+
+**Standalone deep-dive — information density, inter-rater Kappa, cost economics:**
+
+```powershell
+python llm-sum/run_phase3.py stats-engine
+```
+
+Writes `data/results/stats_engine_report_<ts>.{json,md}`: TF-IDF/cosine similarity of each summary vs. its abstract, Cohen's Kappa (LLM judge vs. human agreement — needs `data/human_reviews.jsonl` to have rows; degrades gracefully to `null`/underpowered until then), subscription cost-per-quality tables, and provider × species/study-design/journal breakdowns.
+
+Not sure which of `eval-report` / `--publication` / `report-figures` / `stats-engine` to run for a given question? **[docs/phase3/reporting_and_batch_explained.md](docs/phase3/reporting_and_batch_explained.md)** has a side-by-side "which command do I run?" table and a section mapping each statistic to its exact command and output section heading — start there.
 
 Full details: **[docs/phase6/reporting.md](docs/phase6/reporting.md)** and **[docs/statistics_explained.md](docs/statistics_explained.md)**
 

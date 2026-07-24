@@ -1329,7 +1329,11 @@ def render_packet_index_markdown(
     for item in items:
         k, n = versions.get(item.item_id, (1, 1))
         version_cell = f"{k} of {n}" if n > 1 else "1 of 1"
-        title = item.title.strip() or "(untitled)"
+        # Collapse embedded newlines/whitespace runs (some scraped titles carry
+        # a raw line-break, e.g. from an italicized taxon name wrapping in the
+        # source HTML) — a literal newline here would split this Markdown
+        # table row across two lines and break table parsing downstream.
+        title = " ".join(item.title.split()) or "(untitled)"
         lines.append(f"| `{item.item_id}` | {title} | {version_cell} | `{item.item_id}/` |")
     lines.append("")
     return "\n".join(lines) + "\n"
