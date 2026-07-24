@@ -762,6 +762,7 @@ Both run against mock fixtures — `PHASE3_MODE=test`, `$0`, no network.
 ## 11. Related reading
 
 - [pilot_human_review.md](pilot_human_review.md) — trial this whole workflow on the dev pool first (incremental `humanN/` folders, `.xlsx` scoresheet, copied source PDFs)
+- [review_ui.md](review_ui.md) — the local offline web app reviewers use to score packets (`review-ui/`), instead of opening the PDF/markdown/Excel files by hand: access guide, accessibility notes, and how it works
 - [phase3/README.md](../phase3/README.md) — Phase 3 doc map and pipeline overview
 - [phase3/medhelm_evaluation.md](../phase3/medhelm_evaluation.md) — the jury rubric being validated
 - [phase4/README.md](../phase4/README.md) — taxonomy, scenarios, run manifests
