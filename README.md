@@ -115,6 +115,8 @@ That guide explains how the folders connect, how data moves from PDF to summary 
 | Stats | [docs/statistics_explained.md](docs/statistics_explained.md) — Friedman, Wilcoxon, bootstrap CIs in plain English |
 | Booklet | [docs/booklet/BOOKLET.md](docs/booklet/BOOKLET.md) — full teaching booklet, start to finish, for a complete beginner (plus a standalone chapter for veterinarian reviewers) |
 | Commands | [docs/COMMANDS.md](docs/COMMANDS.md) — every command in the pipeline, in order, one page, copy-paste ready |
+| Extend | [docs/extending_the_pipeline.md](docs/extending_the_pipeline.md) — reuse & handoff guide: which variable/file to change for a new study, starter project ideas, and the v1-release checklist |
+| Future direction | [docs/incorporating_obsidian_llm_wiki.md](docs/incorporating_obsidian_llm_wiki.md) — VRU LLM-wiki (Obsidian) design blueprint: read papers → maintain an interlinked markdown knowledge base |
 
 ---
 

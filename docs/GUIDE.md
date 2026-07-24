@@ -855,3 +855,11 @@ Find evaluation scores:
 data/evaluations.jsonl
 ```
 
+---
+
+## 16. Reusing And Extending This Pipeline
+
+Once you understand how the pipeline works, [docs/extending_the_pipeline.md](extending_the_pipeline.md) is the guide for making it your own: which single variable or file to change for a new study (swap models, change the corpus, retune the judge), worked project ideas (a cheap flagship-vs-human sanity check, human-validation overlap design), and a v1-release checklist for handing the project to the next student.
+
+For a future direction that reuses the same corpus in a different way, [docs/incorporating_obsidian_llm_wiki.md](incorporating_obsidian_llm_wiki.md) is a planning blueprint for an Obsidian "LLM wiki" over the VRU journal — having the LLM read papers and maintain an interlinked markdown knowledge base instead of re-running RAG on every question.
+
