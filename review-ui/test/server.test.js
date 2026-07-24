@@ -131,3 +131,28 @@ test("POST save writes an ingest-shaped scoresheet_human1.xlsx", async () => {
   // Progress file written for resume, and it is NOT a scoresheet (ingest ignores it).
   assert.ok(fs.existsSync(path.join(TMP, "human1", "progress_human1.json")));
 });
+
+test("resume: saved idx (last-viewed item) round-trips through GET /api/pack", async () => {
+  const res1 = await fetch(base + "/api/pack/human1/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reviewerLabel: "human1", items: {}, idx: 0 }),
+  });
+  assert.equal(res1.status, 200);
+
+  const progress = JSON.parse(fs.readFileSync(path.join(TMP, "human1", "progress_human1.json"), "utf-8"));
+  assert.equal(progress.idx, 0);
+
+  const get1 = await (await fetch(base + "/api/pack/human1")).json();
+  assert.equal(get1.progress.idx, 0);
+
+  // A malformed/missing idx in the request body must not crash the save.
+  const res2 = await fetch(base + "/api/pack/human1/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reviewerLabel: "human1", items: {} }),
+  });
+  assert.equal(res2.status, 200);
+  const get2 = await (await fetch(base + "/api/pack/human1")).json();
+  assert.equal(get2.progress.idx, 0, "missing idx should default to 0, not crash or persist garbage");
+});

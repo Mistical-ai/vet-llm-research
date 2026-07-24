@@ -65,11 +65,13 @@ async function loadPacks() {
     for (const pack of data.packs) {
       const preview = el("ul", { className: "preview" });
       for (const title of pack.articles) preview.append(el("li", {}, title));
+      const articleCount = pack.articles.length;
       const card = el("div", { className: "pack-card" },
         el("h2", {}, pack.name),
+        el("p", { className: "pack-counts" },
+          `${articleCount} article${articleCount === 1 ? "" : "s"} · ${pack.itemCount} items to score`),
         preview,
         el("div", { className: "card-foot" },
-          el("span", { className: "count" }, `${pack.itemCount} items to score`),
           el("button", { className: "primary", onclick: () => openPack(pack.name) },
             `Review as ${pack.name} →`)));
       list.append(card);
@@ -87,9 +89,14 @@ async function openPack(pack) {
   const data = await res.json();
   state.pack = pack;
   state.items = data.items || [];
-  state.idx = 0;
   state.scores = (data.progress && data.progress.items) || {};
   state.guideMarkdown = data.guideMarkdown || "";
+
+  // Resume where they left off: restore the last-viewed item, not just the
+  // scores. Clamped in case the pack's item count changed since the save
+  // (e.g. re-exported) so a stale index can never point past the end.
+  const savedIdx = data.progress && Number.isInteger(data.progress.idx) ? data.progress.idx : 0;
+  state.idx = Math.min(Math.max(savedIdx, 0), Math.max(state.items.length - 1, 0));
 
   $("#intro-identity").textContent = pack;
   $("#scoring-identity").textContent = pack;
@@ -203,8 +210,12 @@ async function fetchText(url) {
   catch { return "_(could not load file)_"; }
 }
 
-function goNext() { if (state.idx < state.items.length - 1) { state.idx++; renderItem(); } }
-function goPrev() { if (state.idx > 0) { state.idx--; renderItem(); } }
+// Next/Prev also schedule a save (debounced, same as a score edit) purely so
+// the LAST-VIEWED ITEM is remembered too — resuming a pack should drop the
+// reviewer back where they were, not always at item 1, even if they hadn't
+// typed a score yet on the item they were reading.
+function goNext() { if (state.idx < state.items.length - 1) { state.idx++; renderItem(); scheduleSave(); } }
+function goPrev() { if (state.idx > 0) { state.idx--; renderItem(); scheduleSave(); } }
 
 // ---- saving ----
 function scheduleSave() {
@@ -218,7 +229,7 @@ async function saveNow() {
     const res = await fetch("/api/pack/" + encodeURIComponent(state.pack) + "/save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reviewerLabel: state.pack, items: state.scores }),
+      body: JSON.stringify({ reviewerLabel: state.pack, items: state.scores, idx: state.idx }),
     });
     if (!res.ok) throw new Error("save failed (" + res.status + ")");
     setSaveStatus("saved");
@@ -238,6 +249,22 @@ function setSaveStatus(kind) {
 function openHelp() { $("#help-modal").classList.add("open"); }
 function closeHelp() { $("#help-modal").classList.remove("open"); }
 
+// ---- switching packs mid-review ----
+// Confirms first (a fixed toolbar button is an easy accidental click), then
+// flushes the pending save immediately (rather than waiting on the 800ms
+// debounce) before leaving the scoring screen, so nothing typed in the last
+// second is lost. Native confirm() is used deliberately over a custom modal:
+// it's keyboard- and screen-reader-accessible by default, no extra work
+// needed (see the accessibility notes in docs/phase5/review_ui.md).
+async function switchPack() {
+  if (!confirm("Leave this pack and go back to all packs?\n\nYour progress is saved automatically — you can resume right where you left off.")) {
+    return;
+  }
+  if (state.pack) await saveNow();
+  showScreen("screen-packs");
+  loadPacks();
+}
+
 // ---- wire up ----
 window.addEventListener("DOMContentLoaded", () => {
   loadPacks();
@@ -246,6 +273,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#next-btn").onclick = goNext;
   $("#prev-btn").onclick = goPrev;
   $("#save-btn").onclick = () => { saveNow(); toast("Saved"); };
+  $("#switch-pack-btn").onclick = switchPack;
   $("#help-btn").onclick = openHelp;
   $("#help-close").onclick = closeHelp;
   $("#help-modal").onclick = (e) => { if (e.target.id === "help-modal") closeHelp(); };

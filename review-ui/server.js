@@ -273,14 +273,18 @@ app.post("/api/pack/:pack/save", async (req, res) => {
   const pack = req.params.pack;
   const scores = (req.body && req.body.items) || {};
   const reviewerLabel = (req.body && req.body.reviewerLabel) || pack;
+  // Which item the reviewer was looking at, so reopening this pack resumes
+  // there instead of always at item 1. UI-only bookkeeping — never touches
+  // the scoresheet, so it can't affect anything ingest reads.
+  const idx = Number.isInteger(req.body && req.body.idx) ? req.body.idx : 0;
   const items = packItems(dir);
   try {
     const outPath = await writeScoresheet(dir, pack, items, scores);
-    // Autosave the raw scores for resume (invisible to ingest — the scoresheet
-    // discovery globs only match scoresheet_human*.{xlsx,csv}).
+    // Autosave the raw scores + position for resume (invisible to ingest —
+    // the scoresheet discovery globs only match scoresheet_human*.{xlsx,csv}).
     await fsp.writeFile(
       progressPath(dir, pack),
-      JSON.stringify({ reviewerLabel, savedAt: new Date().toISOString(), items: scores }, null, 2),
+      JSON.stringify({ reviewerLabel, savedAt: new Date().toISOString(), idx, items: scores }, null, 2),
       "utf-8",
     );
     res.json({ ok: true, scoresheet: path.basename(outPath) });
