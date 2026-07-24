@@ -12,34 +12,46 @@ the app works internally, see [review_ui.md](review_ui.md).
 From `review-ui/`, run:
 
 ```powershell
+# one specific pack
 .\make-reviewer-package.ps1 -Pack human1
+
+# let the reviewer choose among several — they see a card for each and pick
+.\make-reviewer-package.ps1 -Pack human1,human2,human3
+
+# include every pack currently exported, whatever that turns out to be
+.\make-reviewer-package.ps1 -AllPacks
 ```
 
 This does everything for you:
 
 - Copies `review-ui/` (app code + already-installed `node_modules/`) into a
   throwaway staging folder — your real `review-ui/` folder is never modified.
-- Copies **only** the pack you named (e.g. `human1/`) into a sibling `packs/`
-  folder — never the `unblinding_key_human1.json` that lives outside it.
+- Copies **only the pack(s) you named** (or discovered via `-AllPacks`) into a
+  sibling `packs/` folder — never any `unblinding_key_*.json`, which lives
+  outside every pack folder.
 - Points the shipped `config.js` at that sibling `packs/` folder, so it works
   out of the box wherever your supervisor unzips it.
-- Writes a plain-language `START_HERE.md` at the top of the zip.
+- Writes a plain-language `START_HERE.md` at the top of the zip, listing
+  exactly which packs are included.
 - Zips everything, then **checks the zip's actual contents** for any stray
   `unblinding_key_*.json` and refuses to produce the zip (deletes it and
   throws) if it finds one. This is a real safety net, not just a promise —
   it inspects the finished archive, not just the source folders.
 - Cleans up the staging folder either way.
 
-Output lands at `review-ui/dist/review-ui-human1.zip`.
+**The reviewer is not restricted to one pack unless you only include one.**
+The app's pack picker already lists every pack it finds — bundling more than
+one just means there's more than one to find. Whichever `-Pack` names (or
+`-AllPacks`) you give it are the *only* ones physically present in the zip;
+anything you don't include genuinely isn't there, not just hidden by the UI.
 
-**Sending a different pack, or the real study once it's exported:**
+Output lands at `review-ui/dist/review-ui-<packs>.zip` (e.g.
+`review-ui-human1-human2.zip`, or `review-ui-6packs.zip` for more than four).
+
+**Pointing at the real study once it's exported:**
 
 ```powershell
-# another pilot pack
-.\make-reviewer-package.ps1 -Pack human2
-
-# the real study export (once you've run export-human-review yourself)
-.\make-reviewer-package.ps1 -Pack human1 -SourceRoot "..\data\human_review"
+.\make-reviewer-package.ps1 -AllPacks -SourceRoot "..\data\human_review"
 ```
 
 `node_modules/` must already exist in `review-ui/` (`npm install`, one time)
@@ -53,10 +65,11 @@ The script's own guard already checked for a leaked key, but it's cheap
 insurance to look yourself:
 
 ```powershell
-# List everything in the zip; eyeball it — should be review-ui/, packs/humanN/,
-# START_HERE.md, and NOTHING named unblinding_key_*.
-Expand-Archive -Path .\dist\review-ui-human1.zip -DestinationPath .\dist\_peek -Force
-Get-ChildItem .\dist\_peek -Recurse -Name | Select-String -Pattern "unblinding" 
+# List everything in the zip; eyeball it — should be review-ui/, one packs/humanN/
+# per pack you included, START_HERE.md, and NOTHING named unblinding_key_*.
+$zip = Get-ChildItem .\dist\review-ui-*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+Expand-Archive -Path $zip.FullName -DestinationPath .\dist\_peek -Force
+Get-ChildItem .\dist\_peek -Recurse -Name | Select-String -Pattern "unblinding"
 # ^ should print NOTHING
 Remove-Item .\dist\_peek -Recurse -Force
 ```
@@ -106,13 +119,18 @@ a sign of anything actually wrong with the app, and `start.bat`'s own
 
 ## 4. When they send it back
 
-They'll return their `packs/humanN/` folder (or just the `humanN/` folder —
-either is fine), now containing a filled `scoresheet_humanN.xlsx`.
+`START_HERE.md` tells them to zip and return the whole `packs` folder, since
+that's simplest for a non-technical reviewer regardless of how many packs you
+bundled or how many they actually got to. So you'll get back `packs.zip`
+containing one `humanN/` folder per pack you sent — some may still be blank
+if they only worked on one of several offered, which is fine.
 
-1. **Drop that `humanN/` folder into your original export root** — the one
-   that still has the matching `unblinding_key_humanN.json` sitting next to
-   it (`data/pilot_human_review/` for pilot data, `data/human_review/` for
-   the real study). Ingest needs the key alongside the folder — it can't
+1. Unzip it, and for **each `humanN/` folder inside** (skip any that are
+   still blank — nothing to ingest there): **drop it into your original
+   export root** — the one that still has the matching
+   `unblinding_key_humanN.json` sitting next to it
+   (`data/pilot_human_review/` for pilot data, `data/human_review/` for the
+   real study). Ingest needs the key alongside the folder — it can't
    un-blind scores without it. Overwrite the blank folder that's already
    there with their filled one (or just copy their `scoresheet_humanN.xlsx`
    over the blank one — that's the only file that changed).

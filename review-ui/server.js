@@ -15,7 +15,7 @@ const path = require("path");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const ExcelJS = require("exceljs");
-const { REVIEW_ROOT, PORT } = require("./config");
+const { REVIEW_ROOT, PORT, SENDER_CONTACT } = require("./config");
 
 // The scoresheet columns, in the exact order and spelling ingest expects
 // (mirrors llm-sum/human_review.py SCORESHEET_FIELDS). Ingest maps cells to
@@ -227,7 +227,7 @@ app.get("/api/packs", (req, res) => {
     const items = packItems(dir);
     return { name, articles: distinctArticles(items), itemCount: items.length };
   });
-  res.json({ reviewRoot: REVIEW_ROOT, packs });
+  res.json({ reviewRoot: REVIEW_ROOT, packs, senderContact: SENDER_CONTACT });
 });
 
 // One pack's full detail: items, the guide (raw markdown), and any saved progress.

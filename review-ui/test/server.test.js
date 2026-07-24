@@ -17,6 +17,7 @@ const ExcelJS = require("exceljs");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "review-ui-test-"));
 process.env.REVIEW_ROOT = TMP;
 process.env.PORT = "0";
+process.env.SENDER_CONTACT = "Test Sender <sender@example.com>";
 
 function writeFixture() {
   // A sibling key that the server must refuse to serve.
@@ -57,6 +58,8 @@ test("GET /api/packs lists human1 with its article preview", async () => {
   const h1 = data.packs.find((p) => p.name === "human1");
   assert.deepEqual(h1.articles, ["A study of cats"]);
   assert.equal(h1.itemCount, 1);
+  assert.equal(data.senderContact, "Test Sender <sender@example.com>",
+    "senderContact from config.js SENDER_CONTACT should be exposed for the finished screen");
 });
 
 test("GET /api/pack/human1 returns items + guide", async () => {

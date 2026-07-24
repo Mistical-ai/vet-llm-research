@@ -50,6 +50,7 @@
       <div class="toolbar-right">
         <span id="save-status" class="save-status"></span>
         <button id="save-btn" class="ghost">Save</button>
+        <button id="finish-btn" class="ghost">✓ I'm finished</button>
         <button id="prev-btn" class="ghost" title="Previous item">‹ Prev</button>
         <button id="next-btn" class="primary" title="Next item">Next ›</button>
         <button id="help-btn" class="ghost round" title="How to score (help)">?</button>
@@ -76,6 +77,34 @@
           <thead></thead>
           <tbody></tbody>
         </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== SCREEN 4: finished / send-back instructions ===================== -->
+  <section id="screen-finished" class="screen">
+    <div class="wrap">
+      <h1>Nice work!</h1>
+      <p class="lead">
+        Your progress on <strong id="finished-pack">human?</strong> has been saved. Here's how to
+        send your results back:
+      </p>
+      <ol class="finish-steps">
+        <li>Open the <code>packs</code> folder — it's a folder sitting next to the <code>review-ui</code>
+          folder, in the same place you unzipped everything.</li>
+        <li>Right-click the <code>packs</code> folder and choose <strong>"Send to" → "Compressed
+          (zipped) folder"</strong>. Windows will create a file named <code>packs.zip</code> right
+          next to it.</li>
+        <li id="finished-send-line">Send that <code>packs.zip</code> file back the same way you
+          received this one (email attachment, or the shared link you were sent).</li>
+      </ol>
+      <p class="muted">
+        Don't rename anything or move files around inside the <code>packs</code> folder before
+        zipping it.
+      </p>
+      <div class="finish-actions">
+        <button id="finished-back-btn" class="ghost">← Back to scoring</button>
+        <button id="finished-allpacks-btn" class="primary">⌂ All packs</button>
       </div>
     </div>
   </section>

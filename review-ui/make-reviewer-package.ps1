@@ -1,17 +1,25 @@
 <#
 .SYNOPSIS
-  Build a self-contained zip to send a reviewer: the review-ui app + their one
-  humanN/ pack, with the unblinding key defensively excluded and a plain-
-  language start-here file dropped in for them.
+  Build a self-contained zip to send a reviewer: the review-ui app + one or
+  more humanN/ packs (their choice of which to work on), with unblinding
+  keys defensively excluded and a plain-language start-here file dropped in.
 
 .DESCRIPTION
-  Never packages an unblinding_key_*.json (it lives outside the pack folder
-  anyway, but this script double-checks). Never touches your original
-  data/*/humanN/ folder — everything is copied into a temp staging area, then
-  zipped, then the staging area is removed.
+  Never packages an unblinding_key_*.json (it lives outside every pack
+  folder anyway, but this script double-checks). Never touches your original
+  data/*/humanN/ folders — everything is copied into a temp staging area,
+  then zipped, then the staging area is removed.
+
+  The reviewer sees one card per pack you include and picks whichever they
+  want from the app's pack-picker screen — they are not limited to a single
+  pack unless you only include one.
 
 .PARAMETER Pack
-  Which reviewer pack to send, e.g. "human1".
+  Which reviewer pack(s) to send, e.g. "human1" or "human1","human2","human3".
+
+.PARAMETER AllPacks
+  Include every humanN/ pack folder found directly under -SourceRoot,
+  instead of naming them individually with -Pack.
 
 .PARAMETER SourceRoot
   The folder that directly contains humanN/ pack folders. Defaults to
@@ -23,12 +31,14 @@
 
 .EXAMPLE
   .\make-reviewer-package.ps1 -Pack human1
-  .\make-reviewer-package.ps1 -Pack human1 -SourceRoot "..\data\human_review"
+  .\make-reviewer-package.ps1 -Pack human1,human2,human3
+  .\make-reviewer-package.ps1 -AllPacks
+  .\make-reviewer-package.ps1 -AllPacks -SourceRoot "..\data\human_review"
 #>
 param(
-  [Parameter(Mandatory = $true)]
-  [ValidatePattern('^human\d+$')]
-  [string]$Pack,
+  [string[]]$Pack,
+
+  [switch]$AllPacks,
 
   [string]$SourceRoot = (Join-Path $PSScriptRoot "..\data\pilot_human_review"),
 
@@ -38,10 +48,35 @@ param(
 $ErrorActionPreference = "Stop"
 
 $SourceRoot = (Resolve-Path $SourceRoot).Path
-$packDir = Join-Path $SourceRoot $Pack
 
-if (-not (Test-Path $packDir)) {
-  throw "Pack folder not found: $packDir`nCheck -Pack and -SourceRoot."
+# ---------------------------------------------------------------------------
+# Resolve which packs to include.
+# ---------------------------------------------------------------------------
+if ($AllPacks) {
+  $resolvedPacks = Get-ChildItem -Path $SourceRoot -Directory |
+    Where-Object { $_.Name -match '^human\d+$' } |
+    Select-Object -ExpandProperty Name |
+    Sort-Object { [int]($_ -replace 'human', '') }
+  if (-not $resolvedPacks) {
+    throw "No humanN/ pack folders found under $SourceRoot."
+  }
+} elseif ($Pack) {
+  foreach ($p in $Pack) {
+    if ($p -notmatch '^human\d+$') {
+      throw "Invalid pack name '$p' - must look like 'human1', 'human2', etc."
+    }
+  }
+  $resolvedPacks = $Pack
+} else {
+  throw ("Specify which pack(s) to include: -Pack human1,human2  " +
+    "or  -AllPacks to include every pack found under -SourceRoot ($SourceRoot).")
+}
+
+foreach ($p in $resolvedPacks) {
+  $pd = Join-Path $SourceRoot $p
+  if (-not (Test-Path $pd)) {
+    throw "Pack folder not found: $pd`nCheck -Pack / -AllPacks and -SourceRoot."
+  }
 }
 if (-not (Test-Path (Join-Path $PSScriptRoot "node_modules"))) {
   throw "review-ui\node_modules is missing. Run 'npm install' in review-ui\ first, " +
@@ -49,8 +84,8 @@ if (-not (Test-Path (Join-Path $PSScriptRoot "node_modules"))) {
 }
 
 Write-Host ""
-Write-Host "Packaging $Pack from:" -ForegroundColor Cyan
-Write-Host "  $packDir"
+Write-Host ("Packaging {0} pack(s): {1}" -f $resolvedPacks.Count, ($resolvedPacks -join ", ")) -ForegroundColor Cyan
+Write-Host "  from: $SourceRoot"
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -70,18 +105,22 @@ try {
       Copy-Item -Path $_.FullName -Destination (Join-Path $appDest $_.Name) -Recurse -Force
     }
 
-  # 2. Copy ONLY the chosen pack folder, into a sibling packs/ folder — never
-  #    the unblinding key (which lives one level up from packDir, so a plain
-  #    folder-copy of packDir can never pick it up in the first place).
+  # 2. Copy EACH chosen pack folder, into a sibling packs/ folder — never an
+  #    unblinding key (which lives one level up from each pack folder, so a
+  #    plain folder-copy of a pack directory can never pick one up).
   $packsDest = Join-Path $stage "packs"
   New-Item -ItemType Directory -Path $packsDest | Out-Null
-  Copy-Item -Path $packDir -Destination (Join-Path $packsDest $Pack) -Recurse -Force
+  foreach ($p in $resolvedPacks) {
+    Copy-Item -Path (Join-Path $SourceRoot $p) -Destination (Join-Path $packsDest $p) -Recurse -Force
+  }
 
-  # Defensive check: fail loudly if a key somehow ended up inside the pack
-  # folder (should never happen, but this is the guard that matters).
+  # Defensive check: fail loudly if a key somehow ended up inside a pack
+  # folder (should never happen, but this is the guard that matters). Checks
+  # the WHOLE packs/ tree at once, so it covers every pack copied above with
+  # no per-pack loop needed.
   $leakedKeys = Get-ChildItem -Path $packsDest -Recurse -Filter "unblinding_key_*.json" -ErrorAction SilentlyContinue
   if ($leakedKeys) {
-    throw "REFUSING TO PACKAGE: found an unblinding key inside the pack folder: $($leakedKeys.FullName -join ', ')"
+    throw "REFUSING TO PACKAGE: found an unblinding key inside a pack folder: $($leakedKeys.FullName -join ', ')"
   }
 
   # 3. Point the shipped config at the sibling packs/ folder.
@@ -100,7 +139,7 @@ try {
   # earlier version of this script shipped "eview-ui" — the "r" got eaten as
   # an escape). Single-quoted = no escape processing at all, so backticks
   # survive as plain text. Variables can't interpolate inside a single-quoted
-  # here-string, so {{PACK}} is substituted afterward with -replace instead.
+  # here-string, so {{PACK_LIST}} is substituted afterward with -replace.
   $startHereTemplate = @'
 # Start here
 
@@ -126,28 +165,58 @@ not need to install anything except Node.js (one-time, see below).
    to a page titled "Human Validation". (If your browser doesn't open by
    itself after a few seconds, open it yourself and go to
    http://localhost:5173)
-4. Click the card for your pack ({{PACK}}) to begin.
+4. You'll see a card for each pack that's available to you: {{PACK_LIST}}.
+   Click whichever one you'd like to start with - if you're not sure which
+   is meant for you, check with the person who sent you this.
 5. Read the guide, click "I'm ready", and score each item using the panel
    at the bottom of the screen. Your answers save automatically as you go.
 6. When you're done for the session, just close the browser tab and the
-   black window - your progress is saved and will be there when you reopen it.
+   black window - your progress is saved and will be there when you reopen
+   the same pack. You can click the "All packs" button at the top of the
+   scoring screen at any time to go back and choose a different pack.
 
 ## When you're completely finished
 
-1. Open the `packs` folder (a sibling of `review-ui`, in the same place you
-   unzipped everything).
-2. Right-click the `{{PACK}}` folder inside it.
-3. Choose "Send to" -> "Compressed (zipped) folder". Windows will create a
-   file named `{{PACK}}.zip` right next to it.
-4. Send that `{{PACK}}.zip` file back the same way you received this one
-   (email attachment, or the shared link you were sent).
+1. Right-click the `packs` folder (a sibling of `review-ui`, in the same
+   place you unzipped everything).
+2. Choose "Send to" -> "Compressed (zipped) folder". Windows will create a
+   file named `packs.zip` right next to it.
+3. {{SEND_BACK_LINE}}
 
-Do not rename anything or move files around inside the `{{PACK}}` folder
+Do not rename anything or move files around inside the `packs` folder
 before zipping it.
 
-Questions? Contact the person who sent you this.
+{{QUESTIONS_LINE}}
 '@
-  $startHere = $startHereTemplate -replace '\{\{PACK\}\}', $Pack
+
+  # SENDER_CONTACT is read from config.js's own default (single source of
+  # truth shared with the in-app "I'm finished" screen, which reads the same
+  # value at runtime via server.js's /api/packs — see public/app.js
+  # finishReview()). Read it BEFORE the REVIEW_ROOT patch above changes
+  # $configPath's content, though the two edits target different lines so
+  # order doesn't actually matter here — kept after for clarity of intent.
+  $senderContactMatch = [regex]::Match(
+    (Get-Content $configPath -Raw),
+    'SENDER_CONTACT:\s*process\.env\.SENDER_CONTACT\s*\|\|\s*"([^"]*)"'
+  )
+  $senderContact = if ($senderContactMatch.Success) { $senderContactMatch.Groups[1].Value } else { "" }
+
+  if ($senderContact) {
+    $sendBackLine = "Send that ``packs.zip`` file back to **$senderContact** the same way you received this one (email attachment, or the shared link you were sent)."
+    $questionsLine = "Questions? Contact $senderContact."
+  } else {
+    $sendBackLine = "Send that ``packs.zip`` file back the same way you received this one (email attachment, or the shared link you were sent)."
+    $questionsLine = "Questions? Contact the person who sent you this."
+  }
+
+  # .Replace() (literal string replace), not -replace (regex), for the last
+  # two: -replace treats a literal '$' in the REPLACEMENT text as a regex
+  # backreference marker (e.g. '$1'), which could silently corrupt an email
+  # address or contact string containing one. Plain .Replace() has no such
+  # special-character interpretation.
+  $startHere = $startHereTemplate -replace '\{\{PACK_LIST\}\}', ($resolvedPacks -join ", ")
+  $startHere = $startHere.Replace('{{SEND_BACK_LINE}}', $sendBackLine)
+  $startHere = $startHere.Replace('{{QUESTIONS_LINE}}', $questionsLine)
 
   # Guard rail: -Encoding ascii below silently replaces any non-ASCII
   # character with '?' rather than erroring, which is exactly how an em-dash
@@ -175,7 +244,8 @@ Questions? Contact the person who sent you this.
   #    normalizes to forward slashes, so the archive is portable regardless
   #    of what OS the reviewer unzips it on.
   if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
-  $zipPath = Join-Path $OutputDir "review-ui-$Pack.zip"
+  $packsLabel = if ($resolvedPacks.Count -le 4) { $resolvedPacks -join "-" } else { "{0}packs" -f $resolvedPacks.Count }
+  $zipPath = Join-Path $OutputDir "review-ui-$packsLabel.zip"
   if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [System.IO.Compression.ZipFile]::CreateFromDirectory(
@@ -185,7 +255,6 @@ Questions? Contact the person who sent you this.
   )
 
   # 6. Final safety check on the ZIP CONTENTS themselves, not just the staged folder.
-  Add-Type -AssemblyName System.IO.Compression.FileSystem
   $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
   $keyEntries = $zip.Entries | Where-Object { $_.FullName -match 'unblinding_key' }
   $zip.Dispose()
@@ -196,11 +265,12 @@ Questions? Contact the person who sent you this.
 
   $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
   Write-Host "Done." -ForegroundColor Green
-  Write-Host "  Zip:  $zipPath"
-  Write-Host "  Size: $sizeMB MB"
+  Write-Host "  Zip:    $zipPath"
+  Write-Host "  Size:   $sizeMB MB"
+  Write-Host ("  Packs:  {0}" -f ($resolvedPacks -join ", "))
   Write-Host "  Verified: no unblinding_key_*.json in the zip."
   Write-Host ""
-  Write-Host "Send this zip to your reviewer. They just need to unzip it and read START_HERE.md."
+  Write-Host "Send this zip to your reviewer. They'll see a card for each pack and can choose which to work on."
 }
 finally {
   Remove-Item -Path $stage -Recurse -Force -ErrorAction SilentlyContinue

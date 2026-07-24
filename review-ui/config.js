@@ -14,6 +14,13 @@
 //
 // Override without editing this file:  set REVIEW_ROOT=...  (PowerShell:
 //   $env:REVIEW_ROOT="C:\path\to\packs"; node server.js)
+//
+// SENDER_CONTACT (optional) — shown to the reviewer on the "I'm finished"
+// screen's send-back instructions, e.g. "Send that packs.zip file back to
+// Jane (jane@example.com)". Leave blank to use the generic "the same way
+// you received this one" wording instead. Set it here before packaging with
+// make-reviewer-package.ps1 if you want the zip you send to name you
+// specifically.
 
 const path = require("path");
 
@@ -28,4 +35,5 @@ function resolveReviewRoot() {
 module.exports = {
   REVIEW_ROOT: resolveReviewRoot(),
   PORT: process.env.PORT ? Number(process.env.PORT) : 5173,
+  SENDER_CONTACT: process.env.SENDER_CONTACT || "Pranav Shah <pshah10@uoguelph.ca>",
 };

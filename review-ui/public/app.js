@@ -23,6 +23,7 @@ const state = {
   scores: {}, // item_id -> { field: value }
   guideMarkdown: "",
   saveTimer: null,
+  senderContact: "", // optional, from config.js SENDER_CONTACT — see finishReview()
 };
 
 // ---- tiny DOM helpers ----
@@ -54,6 +55,7 @@ async function loadPacks() {
   try {
     const res = await fetch("/api/packs");
     const data = await res.json();
+    state.senderContact = data.senderContact || "";
     if (!data.packs || !data.packs.length) {
       list.innerHTML = "";
       list.append(el("p", { className: "muted" },
@@ -265,6 +267,27 @@ async function switchPack() {
   loadPacks();
 }
 
+// ---- "I'm finished" send-back screen ----
+// Flushes the pending save (same reasoning as switchPack), then shows the
+// same send-back instructions that also ship as START_HERE.md inside the
+// zip (docs/phase5/sending_the_review_ui.md walks through building that
+// zip) — kept in this app too so the reviewer sees them again at the exact
+// moment they need them, not only once at the very start.
+async function finishReview() {
+  if (state.pack) await saveNow();
+  $("#finished-pack").textContent = state.pack || "this pack";
+  $("#finished-send-line").innerHTML = state.senderContact
+    ? `Send that <code>packs.zip</code> file back to <strong>${escapeHtml(state.senderContact)}</strong> ` +
+      `the same way you received this one (email attachment, or the shared link you were sent).`
+    : `Send that <code>packs.zip</code> file back the same way you received this one ` +
+      `(email attachment, or the shared link you were sent).`;
+  showScreen("screen-finished");
+  window.scrollTo(0, 0);
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 // ---- wire up ----
 window.addEventListener("DOMContentLoaded", () => {
   loadPacks();
@@ -274,6 +297,9 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#prev-btn").onclick = goPrev;
   $("#save-btn").onclick = () => { saveNow(); toast("Saved"); };
   $("#switch-pack-btn").onclick = switchPack;
+  $("#finish-btn").onclick = finishReview;
+  $("#finished-back-btn").onclick = () => { showScreen("screen-scoring"); };
+  $("#finished-allpacks-btn").onclick = () => { showScreen("screen-packs"); loadPacks(); };
   $("#help-btn").onclick = openHelp;
   $("#help-close").onclick = closeHelp;
   $("#help-modal").onclick = (e) => { if (e.target.id === "help-modal") closeHelp(); };
