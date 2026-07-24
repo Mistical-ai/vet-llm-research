@@ -125,10 +125,26 @@ try {
 
   # 3. Point the shipped config at the sibling packs/ folder.
   $configPath = Join-Path $appDest "config.js"
-  (Get-Content $configPath -Raw) `
-    -replace 'return path\.resolve\(__dirname, "\.\.", "data", "pilot_human_review"\);', `
-             'return path.resolve(__dirname, "..", "packs");' |
-    Set-Content $configPath -NoNewline
+  $configRaw = Get-Content $configPath -Raw
+  $configPatched = $configRaw -replace 'return path\.resolve\(__dirname, "\.\.", "data", "\w+"\);', `
+                                        'return path.resolve(__dirname, "..", "packs");'
+  # Guard rail: if config.js's default REVIEW_ROOT line ever changes shape
+  # (e.g. a different default folder, reworded code), this -replace would
+  # silently match nothing and ship a zip whose config.js still points at
+  # YOUR local data/ folder instead of the packs/ folder that travels in the
+  # zip — a real, silent failure that would only surface as a confusing "no
+  # packs found" on the reviewer's machine. Fail loud at build time instead.
+  if ($configPatched -eq $configRaw) {
+    # Single-quoted strings below on purpose: PowerShell has no backslash
+    # escaping (\" is NOT valid PowerShell and previously broke this exact
+    # line's parsing) — single-quoted strings need no escaping at all for the
+    # double quotes in this message, only '' for a literal single quote.
+    throw ('REFUSING TO PACKAGE: could not find/patch the REVIEW_ROOT default line in ' +
+      'config.js (looked for a ''return path.resolve(__dirname, "..", "data", "...");'' ' +
+      'line). config.js''s default may have changed shape - update the -replace pattern ' +
+      'in this script to match.')
+  }
+  Set-Content -Path $configPath -Value $configPatched -NoNewline
 
   # 4. Drop in the plain-language instructions for the reviewer.
   #

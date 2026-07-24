@@ -5,12 +5,13 @@
 // not a parent of them — if it points somewhere else the app will report
 // "no packs found."
 //
-//   - In this repo (developing / testing), it defaults to
-//     data/pilot_human_review, which already has human1/ and human2/.
-//   - For the REAL study, set REVIEW_ROOT to data/human_review once you have
-//     run `export-human-review` (env var, or edit the default below).
+//   - Defaults to data/human_review — the REAL study export (set once
+//     `export-human-review` had produced data/human_review/human1/).
+//   - To go back to rehearsing on the pilot dev pool instead, set
+//     REVIEW_ROOT to data/pilot_human_review (env var, or edit below).
 //   - In the zip you send a supervisor, it points at the sibling `packs/`
-//     folder that travels inside the zip.
+//     folder that travels inside the zip (make-reviewer-package.ps1 patches
+//     this line automatically — see the regex it matches against, below).
 //
 // Override without editing this file:  set REVIEW_ROOT=...  (PowerShell:
 //   $env:REVIEW_ROOT="C:\path\to\packs"; node server.js)
@@ -28,8 +29,8 @@ function resolveReviewRoot() {
   if (process.env.REVIEW_ROOT && process.env.REVIEW_ROOT.trim()) {
     return path.resolve(process.env.REVIEW_ROOT.trim());
   }
-  // Default: the pilot packs that already exist in this repo.
-  return path.resolve(__dirname, "..", "data", "pilot_human_review");
+  // Default: the real study export.
+  return path.resolve(__dirname, "..", "data", "human_review");
 }
 
 module.exports = {
