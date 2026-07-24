@@ -3,3 +3,7 @@ node_modules/
 
 # Local run artifacts, if any land here.
 *.log
+
+# Built reviewer zips (recreate with make-reviewer-package.ps1).
+dist/
+

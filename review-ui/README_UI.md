@@ -57,29 +57,22 @@ $env:REVIEW_ROOT = "C:\...\vet-llm-research\data\human_review"; npm start
 
 ## Sending a pack to a reviewer (e.g. a supervisor)
 
-Package a zip like this:
+Build the zip with the packaging script — it handles the folder layout,
+points the shipped config at the right place, writes a plain-language
+`START_HERE.md` for the reviewer, and refuses to produce a zip if it finds an
+unblinding key inside it:
 
+```powershell
+.\make-reviewer-package.ps1 -Pack human1
 ```
-review-ui-for-reviewer.zip
-  review-ui/           (this whole folder, INCLUDING node_modules/)
-  packs/
-    human1/            (the reviewer's pack — REVIEWER_GUIDE.md, packet.md,
-                        scoresheet_human1.xlsx, item_001/ … with article.pdf + summary.md)
-```
 
-Then edit the shipped `review-ui/config.js` (or set `REVIEW_ROOT`) so it points
-at that sibling `packs/` folder.
-
-**Do and don't:**
-- ✅ Include only the `humanN/` pack folder(s) the reviewer should score.
-- ❌ **Never include any `unblinding_key_*.json`** — those live outside the pack
-  folders and stay on your machine. (The app refuses to serve them even if one
-  slips in, but don't ship them.)
-- Reviewer double-clicks `start.bat`, scores, and sends back **only their
-  `humanN/` folder** (now containing the filled `scoresheet_human1.xlsx`).
+Output: `review-ui/dist/review-ui-human1.zip`. Full walkthrough — including
+how to actually send the zip and what to do when it comes back filled in —
+is in [docs/phase5/sending_the_review_ui.md](../docs/phase5/sending_the_review_ui.md).
 
 **Heads-up on size:** the zip carries `node_modules` plus ~15 article PDFs per
-pack, so expect a few MB to a few tens of MB per pack. That's normal.
+pack, so expect a few MB to a few tens of MB per pack. That's normal — email
+attachment limits usually won't fit it, use a shared drive link instead.
 
 ---
 

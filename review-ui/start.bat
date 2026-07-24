@@ -20,9 +20,11 @@ where node >nul 2>nul || set "NODE=%ProgramFiles%\nodejs\node.exe"
 if not exist "%NODE%" (
   if "%NODE%"=="node" goto :run
   echo.
-  echo   Could not find Node.js. Please install it from https://nodejs.org
-  echo   then double-click start.bat again.
+  echo   Could not find Node.js on this computer.
+  echo   Opening the download page for you now - install it, then double-click
+  echo   start.bat again.
   echo.
+  start "" https://nodejs.org
   pause
   exit /b 1
 )
