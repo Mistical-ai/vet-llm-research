@@ -1927,6 +1927,78 @@ def test_merge_evaluation_results_produces_correct_schema(
     assert row["judge_model_version"] == "gpt-5.4-eval"
 
 
+def test_merge_evaluation_results_skips_rows_already_in_ledger(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A prior run of this merge can crash partway through (e.g. a transient
+    PermissionError on evaluations.jsonl) after some rows already appended.
+    Re-running the merge against the same downloaded result file must skip
+    whatever's already on disk for that (doi, summariser, judge) rather than
+    appending duplicates -- the ledger is append-only with no in-place dedup.
+    """
+    doi = "10.9999/batch.eval.0002"
+    slug = doi_to_slug(doi)
+
+    summaries_path = tmp_path / "summaries.jsonl"
+    summaries_path.write_text(json.dumps({
+        "doi": doi,
+        "custom_id": slug,
+        "models": {
+            "anthropic": {"status": "success", "summary": "Anthropic's summary."},
+            "openai": {"status": "success", "summary": "OpenAI's summary."},
+        },
+    }) + "\n", encoding="utf-8")
+
+    # Two results in this batch file: anthropic's slot already made it into
+    # the ledger on the earlier, interrupted run; openai's slot didn't.
+    judge_raw = _make_judge_json_response(quality=7)
+    result_path = tmp_path / "openai_eval_results.jsonl"
+    result_path.write_text(
+        _openai_success_line(f"{slug}__anthropic", judge_raw, model="gpt-5.4-eval") + "\n"
+        + _openai_success_line(f"{slug}__openai", judge_raw, model="gpt-5.4-eval"),
+        encoding="utf-8",
+    )
+
+    evaluations_path = tmp_path / "evaluations.jsonl"
+    evaluations_path.write_text(json.dumps({
+        "doi": doi, "summarizer": "anthropic", "judge": "openai", "quality_score": 7,
+    }) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(check_batch_status, "EVALUATIONS_PATH", evaluations_path)
+    monkeypatch.setattr(check_batch_status, "SUMMARIES_PATH", summaries_path)
+
+    import check_batch_status as cbs
+
+    def _patched_load():
+        out: dict = {}
+        with open(summaries_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                d = entry.get("doi", "")
+                if d:
+                    out[d] = entry
+        return out
+
+    monkeypatch.setattr(cbs, "_load_summaries", _patched_load)
+
+    import evaluator
+    monkeypatch.setattr(evaluator, "EVALUATIONS_PATH", evaluations_path)
+
+    count = check_batch_status.merge_evaluation_results(result_path, provider="openai", judge="openai")
+
+    # Only the openai slot is new; the anthropic slot was already there.
+    assert count == 1
+
+    lines = evaluations_path.read_text(encoding="utf-8").strip().splitlines()
+    rows = [json.loads(line) for line in lines]
+    assert len(rows) == 2, "the pre-existing anthropic row must not be duplicated"
+    summarisers = sorted(row["summarizer"] for row in rows)
+    assert summarisers == ["anthropic", "openai"]
+
+
 def test_merge_evaluation_results_populates_strata_from_manifest(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """

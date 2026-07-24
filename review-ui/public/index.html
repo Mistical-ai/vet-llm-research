@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Human Validation — Veterinary Summary Review</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="vendor/marked.umd.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <!-- ===================== SCREEN 1: pack picker ===================== -->
+  <section id="screen-packs" class="screen active">
+    <div class="wrap">
+      <h1>Human Validation</h1>
+      <p class="lead">
+        Choose the reviewer pack assigned to you. Each pack contains 5 articles,
+        each with several summaries to score. Pick yours to begin.
+      </p>
+      <div id="packs-list" class="packs-list">
+        <p class="muted">Loading packs…</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== SCREEN 2: intro / guide ===================== -->
+  <section id="screen-intro" class="screen">
+    <div class="wrap">
+      <div class="identity-banner">
+        You are reviewing as <strong id="intro-identity">human?</strong>
+        <button class="link-btn" id="intro-back">← choose a different pack</button>
+      </div>
+      <h1>Before you start</h1>
+      <p class="lead">Please read this guide once. When you're ready, click the button at the bottom.</p>
+      <div id="guide-content" class="markdown"></div>
+      <div class="ready-bar">
+        <button id="ready-btn" class="primary big">I'm ready — start scoring →</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== SCREEN 3: scoring ===================== -->
+  <section id="screen-scoring" class="screen">
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <span class="pill" id="scoring-identity">human?</span>
+        <span id="item-indicator" class="item-indicator">Item 1 of 15</span>
+      </div>
+      <div class="toolbar-right">
+        <span id="save-status" class="save-status"></span>
+        <button id="save-btn" class="ghost">Save</button>
+        <button id="prev-btn" class="ghost" title="Previous item">‹ Prev</button>
+        <button id="next-btn" class="primary" title="Next item">Next ›</button>
+        <button id="help-btn" class="ghost round" title="How to score (help)">?</button>
+      </div>
+    </div>
+
+    <div class="panes">
+      <div class="pane pane-article">
+        <div class="pane-head">Original article</div>
+        <div id="article-pane" class="pane-body"></div>
+      </div>
+      <div class="pane pane-summary">
+        <div class="pane-head">Candidate summary</div>
+        <div id="summary-pane" class="pane-body markdown"></div>
+      </div>
+    </div>
+
+    <div class="sheet">
+      <div class="sheet-head">
+        Scoresheet — all items (this panel stays put; use Next to change the article &amp; summary above)
+      </div>
+      <div class="sheet-scroll">
+        <table id="scoresheet">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== help modal ===================== -->
+  <div id="help-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-head">
+        <span>How to do the human validation</span>
+        <button id="help-close" class="ghost">Close ✕</button>
+      </div>
+      <div id="help-content" class="modal-body markdown"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+</body>
+</html>

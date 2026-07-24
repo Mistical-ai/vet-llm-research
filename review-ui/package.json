@@ -1,0 +1,15 @@
+{
+  "name": "vet-human-review-ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local offline UI for blind human validation of AI-written veterinary summaries (Phase 5). Reads humanN/ reviewer packs, writes back an ingest-compatible scoresheet_humanN.xlsx.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "marked": "^18.0.7"
+  }
+}

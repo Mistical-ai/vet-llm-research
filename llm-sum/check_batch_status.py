@@ -393,6 +393,31 @@ def _write_batch_readable_outputs(dois: set[str]) -> int:
         return 0
 
 
+def _existing_evaluation_keys(path: Path) -> set[tuple[str, str, str]]:
+    """(doi, summariser, judge) triples already on disk in evaluations.jsonl.
+
+    IN PLAIN ENGLISH: reads the ledger and remembers, for every row already
+    saved, which (paper, AI summariser, judge) combination it represents.
+
+    Lets ``merge_evaluation_results`` skip a result that already made it into
+    the append-only ledger on an earlier, interrupted run of this same merge
+    (e.g. the process died partway through a batch of appends) instead of
+    writing a duplicate row. Returns an empty set if the file doesn't exist
+    yet — nothing merged so far, so nothing to skip.
+    """
+    if not path.exists():
+        return set()
+    keys: set[tuple[str, str, str]] = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            keys.add((row.get("doi", ""), row.get("summarizer", ""), row.get("judge", "")))
+    return keys
+
+
 def merge_evaluation_results(result_path: Path, provider: str, judge: str,
                              guard: BudgetGuard | None = None) -> int:
     """
@@ -426,8 +451,10 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
     summaries = _load_summaries()
     custom_id_to_key = _build_custom_id_to_key(summaries)
     manifest_index = load_manifest_index()
+    already_merged = _existing_evaluation_keys(EVALUATIONS_PATH)
 
     merged = 0
+    skipped_duplicates = 0
     run_cost = 0.0
     # Cache-token totals across this merge, so the pilot's own hit rate is
     # visible right here with no extra tooling (Phase A3) — summed from
@@ -455,6 +482,18 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
             if not summary_key:
                 log_error(cid, "batch_merge",
                           "evaluation slug has no matching DOI in summaries.jsonl")
+                continue
+
+            entry = summaries[summary_key]
+            doi = str(entry.get("doi", "")).strip()
+
+            # Guards against re-processing the same downloaded result file
+            # twice — e.g. a prior run of this merge crashed/lost its
+            # connection partway through (append-only ledger, no in-place
+            # dedup on write) and is now being retried. Without this check a
+            # retry would re-append every already-merged row a second time.
+            if (doi, summariser, judge) in already_merged:
+                skipped_duplicates += 1
                 continue
 
             if parsed.get("status") != "success":
@@ -488,8 +527,6 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
                 "judge_prompt_shape": parsed.get("judge_prompt_shape"),
             }
 
-            entry = summaries[summary_key]
-            doi = str(entry.get("doi", "")).strip()
             input_source = str(entry.get("input_source") or "processed")
             candidate_summary = (entry.get("models") or {}).get(summariser, {}).get("summary", "")
             manifest_record = manifest_index.get(doi, {})
@@ -520,10 +557,11 @@ def merge_evaluation_results(result_path: Path, provider: str, judge: str,
             merged += 1
 
     hit_rate = (run_cache_read / run_input_tokens) if run_input_tokens else 0.0
+    skipped_note = f", skipped {skipped_duplicates} already-merged duplicate(s)" if skipped_duplicates else ""
     print(f"[phase3:batch] appended {merged} evaluations to {EVALUATIONS_PATH.name}"
           f"  (batch cost ${run_cost:.4f}, cache read={run_cache_read} "
           f"write={run_cache_creation} tokens, hit_rate={hit_rate:.1%} of "
-          f"{run_input_tokens} input tokens)")
+          f"{run_input_tokens} input tokens{skipped_note})")
     # Charged only once every row is safely appended — see the note in
     # merge_summarisation_results for why the hard stop must not fire mid-loop.
     guard.add_cost(run_cost)

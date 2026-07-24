@@ -1,0 +1,5 @@
+# Node dependencies — reinstall with `npm install` (pre-bundle into the zip for reviewers).
+node_modules/
+
+# Local run artifacts, if any land here.
+*.log
